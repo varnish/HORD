@@ -108,6 +108,7 @@ The edge cache is the RDMA termination point. It speaks standard HTTP upstream a
 | **ODP** | On-Demand Paging. Allows RDMA operations on memory that is not pinned, with page faults handled transparently by the NIC/driver. |
 | **WR** | Work Request. An instruction posted to a queue pair. |
 | **WC** | Work Completion. A notification on a CQ that a WR has completed. |
+| **FRWR** | Fast Register Work Request. A work request that registers or invalidates a memory region entirely from the send queue, avoiding kernel calls. |
 
 ---
 
@@ -224,13 +225,16 @@ RDMA RC queue pairs deliver messages in order. Combined with the single-producer
 
 ### 6.4 HTTP Pipelining
 
-HTTP/1.1 pipelining — sending multiple requests without waiting for each response — is expected to work well over HORD and is RECOMMENDED. The conditions that made pipelining unreliable over TCP/IP do not apply:
+HTTP/1.1 pipelining — sending multiple requests without waiting for each response — works over HORD. The conditions that made pipelining unreliable over TCP/IP do not apply:
 
-- **Head-of-line blocking** is mitigated by RDMA's low latency and the edge cache serving from registered memory, making response times consistently fast.
 - **Broken intermediaries** are not a concern — HORD operates as a single hop between the edge cache and compute nodes with no middleboxes.
 - **Error recovery ambiguity** is reduced by RDMA RC's reliable delivery — a connection either delivers all messages in order or fails cleanly.
 
-Clients SHOULD pipeline requests when issuing multiple GETs (e.g., prefetching dataset shards). Servers MUST respond to pipelined requests in order per the HTTP/1.1 specification.
+Pipelining is well-suited for sequential prefetching of cached objects (e.g., dataset shards) where response times are uniformly fast. However, pipelining does not eliminate **application-level head-of-line blocking**: HTTP/1.1 mandates strict response ordering, so a slow response (e.g., a cache miss requiring an upstream fetch) blocks all subsequent responses on that connection, even if they are ready.
+
+For concurrent workloads with mixed response times, clients SHOULD open multiple parallel HORD connections rather than relying on pipelining. RDMA QP setup is fast and does not incur TCP handshake or TLS negotiation overhead, making multiple connections inexpensive.
+
+Servers MUST respond to pipelined requests in order per the HTTP/1.1 specification.
 
 ### 6.5 Message Framing
 
@@ -256,7 +260,22 @@ For large response payloads, HORD defines an optional HTTP extension that bypass
 
 Zero-copy is available only when both peers indicated `ZERO_COPY_CAPABLE` in the handshake. It is requested per-HTTP-request via headers and is always optional — the server MAY ignore the zero-copy request and respond normally via the stream.
 
-### 7.2 Request Headers
+### 7.2 Rkey Lifecycle
+
+Implementations MUST use **Fast Register Work Requests (FRWR)** for zero-copy buffer registration rather than `ibv_reg_mr`/`ibv_dereg_mr`. The `ibv_reg_mr` and `ibv_dereg_mr` verbs are kernel control-plane operations that take tens of microseconds — unacceptable on the data path.
+
+The FRWR lifecycle for a zero-copy GET:
+
+1. Client allocates a buffer from its pool (already backed by a pre-registered MR with local access).
+2. Client posts a **REG_MR** work request to the send queue, producing a fresh rkey with remote write permission.
+3. Client sends the HTTP request with the rkey in the `X-HORD-RDMA-Write` header.
+4. Server performs the RDMA write and sends the HTTP response with `status=complete`.
+5. Client receives the response and posts a **LOCAL_INV** work request to invalidate the rkey.
+6. Client returns the buffer to the pool for reuse.
+
+This keeps the rkey window as tight as possible — the remote write permission exists only for the duration of a single request/response exchange. All registration and invalidation happens on the send queue with no kernel transitions.
+
+### 7.3 Request Headers
 
 The client advertises a registered memory region for receiving the response body:
 
@@ -272,7 +291,7 @@ X-HORD-RDMA-Write: addr=0x7f4a2c000000;rkey=0x01ab3f00;len=16777216
 | `rkey` | hex u32 | Remote key authorizing the server to write to this buffer |
 | `len` | decimal u64 | Capacity of the receive buffer in bytes |
 
-### 7.3 Server Behavior
+### 7.4 Server Behavior
 
 If the server elects to use zero-copy:
 
@@ -299,11 +318,11 @@ X-HORD-RDMA-Write: status=too_large;object_size=1073741824
 
 The client may retry with a standard `Range` header or allocate a larger buffer.
 
-### 7.4 Failure Cases
+### 7.5 Failure Cases
 
 If the server cannot perform the RDMA write (invalid rkey, network error), it MUST fall back to a normal stream-based response. The client detects this by the absence of the `X-HORD-RDMA-Write` response header and reads the body from the stream as usual.
 
-### 7.5 GPUDirect RDMA
+### 7.6 GPUDirect RDMA
 
 When the client registers GPU device memory (via `nvidia_p2p_get_pages` or equivalent) and provides its address and rkey, the server's RDMA write targets GPU memory directly. This is transparent to the HORD protocol — the address and rkey are opaque to the server. The NIC and GPU handle the peer-to-peer DMA.
 
@@ -313,7 +332,7 @@ Requirements for GPUDirect RDMA:
 - `nvidia-peermem` kernel module loaded
 - GPU BAR1 size sufficient for the registered region
 
-### 7.6 Interaction with HTTP Range Requests
+### 7.7 Interaction with HTTP Range Requests
 
 Zero-copy and range requests compose naturally. A client may issue:
 
@@ -324,6 +343,10 @@ X-HORD-RDMA-Write: addr=0x7f4a2c000000;rkey=0x01ab3f00;len=16777216
 ```
 
 The server performs the RDMA write of the specified range into the client's buffer.
+
+### 7.8 Future: Zero-Copy PUT
+
+This specification defines zero-copy for GET responses only (server writes to client memory). A future extension may define zero-copy for PUT requests, where the client advertises a buffer containing the request body, and the server pulls the data via RDMA Read. This would benefit write-heavy workloads such as checkpoint storage. The different trust model (server holds the rkey and initiates the read) requires separate security analysis.
 
 ---
 
@@ -445,10 +468,16 @@ The zero-copy extension requires the client to share memory addresses and remote
 
 Mitigations:
 - Clients SHOULD register dedicated, bounded memory regions for HORD receive buffers. These regions should not overlap with other application memory.
-- Clients SHOULD revoke rkeys (`ibv_dereg_mr`) promptly when a connection closes.
+- Clients MUST use FRWR to keep rkey lifetimes tight — rkeys should be valid only for the duration of a single request/response exchange and invalidated immediately upon completion (see [Section 7.2](#72-rkey-lifecycle)).
 - Implementations MUST validate that RDMA write operations stay within the bounds communicated by the client.
 
-### 11.3 Denial of Service
+### 11.3 Rkey Leakage
+
+The `X-HORD-RDMA-Write` request header contains memory addresses and remote keys. If HTTP requests pass through logging middleware, debug proxies, or application-level tracing before reaching the HORD transport termination layer, rkeys may be captured in plain text logs.
+
+Implementations MUST NOT log `X-HORD-RDMA-Write` header values at any log level. HTTP infrastructure components that process HORD traffic (load balancers, observability tools) SHOULD be configured to redact or exclude these headers.
+
+### 11.4 Denial of Service
 
 A malicious client could exhaust server resources by opening many connections (each consuming QPs, CQs, and registered memory) or by not posting receives (stalling the server's sends).
 
@@ -460,6 +489,8 @@ Implementations SHOULD enforce:
 ---
 
 ## 12. Wire Format Reference
+
+All multi-byte integer fields in HORD wire formats (handshake, message envelope) are transmitted in **Network Byte Order (Big Endian)**.
 
 ### 12.1 Handshake (CM Private Data)
 
@@ -479,7 +510,7 @@ Offset  Size    Field
 
 ```
 Offset  Size    Field
-0       4       length (payload bytes)
+0       4       length (payload bytes following this 8-byte header)
 4       2       credits
 6       2       flags
 8       ...     payload (HTTP byte stream)
@@ -627,9 +658,20 @@ for batch in loader:
     model(batch)
 ```
 
-### 13.4 URI Scheme
+### 13.4 URI Scheme and Service Discovery
 
-HORD uses the `hord://` URI scheme to indicate that the connection should use RDMA transport. Implementations SHOULD also support transparent upgrade from `http://` when both client and server are HORD-capable, via a mechanism TBD (e.g., DNS SRV records, Alt-Svc headers on an initial TCP connection, or out-of-band configuration).
+HORD uses the `hord://` URI scheme to indicate that the connection should use RDMA transport.
+
+For environments where clients may not know in advance whether the server supports HORD, implementations SHOULD support discovery and upgrade via HTTP `Alt-Svc`. A client connects to the server over standard HTTP/TCP and receives:
+
+```http
+HTTP/1.1 200 OK
+Alt-Svc: hord=":4791"
+```
+
+The client may then establish a HORD connection for subsequent requests. If the RDMA connection fails at any point, the client MUST fall back gracefully to HTTP/TCP. RDMA connections can fail abruptly (fabric errors, QP state transitions); robust fallback is a requirement, not a nice-to-have.
+
+Out-of-band discovery (DNS SRV records, static configuration) is also valid, particularly in closed clusters where the RDMA topology is known.
 
 ### 13.5 Port
 
