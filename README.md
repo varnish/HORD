@@ -87,6 +87,7 @@ The edge cache is the RDMA termination point. It speaks standard HTTP upstream a
 - **Replacing HTTP.** HORD is not a new application protocol.
 - **Kernel-level integration.** HORD operates in userspace via `libibverbs`.
 - **HTTP/2 or HTTP/3.** HORD transports HTTP/1.1 only. HTTP/2's multiplexing and flow control are redundant over RDMA's native capabilities.
+- **Authentication or authorization.** RDMA provides no built-in auth, but HORD is just HTTP — standard HTTP authentication mechanisms (`Authorization` headers, tokens) work unchanged over HORD. Fabric-level access control (InfiniBand P_Keys, VLAN segmentation) provides the network isolation layer.
 - **Multicast or unreliable transport.** HORD uses Reliable Connected (RC) queue pairs only.
 - **Transport encryption.** See [Security Considerations](#11-security-considerations).
 
