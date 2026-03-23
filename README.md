@@ -117,7 +117,7 @@ HORD is structured as three layers:
 ```
 ┌──────────────────────────────────┐
 │         HTTP Layer               │
-│   (hyper or any HTTP/1.1 impl)  │
+│   (hyper or any HTTP/1.1 impl)   │
 ├──────────────────────────────────┤
 │      Stream Abstraction Layer    │
 │   AsyncRead + AsyncWrite over    │
