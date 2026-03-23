@@ -4,7 +4,7 @@
 
 ## Abstract
 
-HORD defines a method for transporting HTTP/1.1 and HTTP/2 over RDMA (Remote Direct Memory Access) transports, including InfiniBand and RoCE (RDMA over Converged Ethernet). It provides a byte-stream abstraction over RDMA's message-oriented queue pair interface, allowing unmodified HTTP semantics to operate over RDMA with optional extensions for zero-copy data transfer.
+HORD defines a method for transporting HTTP/1.1 over RDMA (Remote Direct Memory Access) transports, including InfiniBand and RoCE (RDMA over Converged Ethernet). It provides a byte-stream abstraction over RDMA's message-oriented queue pair interface, allowing unmodified HTTP/1.1 semantics to operate over RDMA with optional extensions for zero-copy data transfer.
 
 HORD targets environments where HTTP clients and servers are connected by RDMA-capable networks — most notably AI training and inference clusters consuming object storage over InfiniBand or RoCE fabrics.
 
@@ -72,7 +72,7 @@ The edge cache is the RDMA termination point. It speaks standard HTTP upstream a
 
 ### 2.1 Goals
 
-- **Preserve HTTP semantics exactly.** A HORD connection must be indistinguishable from a TCP connection at the HTTP layer. Any valid HTTP/1.1 or HTTP/2 exchange must work identically over HORD.
+- **Preserve HTTP/1.1 semantics exactly.** A HORD connection must be indistinguishable from a TCP connection at the HTTP layer. Any valid HTTP/1.1 exchange must work identically over HORD.
 
 - **Provide a byte-stream interface.** The transport layer presents a reliable, ordered byte stream to the HTTP implementation, abstracting RDMA's message-oriented queue pairs.
 
@@ -86,6 +86,7 @@ The edge cache is the RDMA termination point. It speaks standard HTTP upstream a
 
 - **Replacing HTTP.** HORD is not a new application protocol.
 - **Kernel-level integration.** HORD operates in userspace via `libibverbs`.
+- **HTTP/2 or HTTP/3.** HORD transports HTTP/1.1 only. HTTP/2's multiplexing and flow control are redundant over RDMA's native capabilities.
 - **Multicast or unreliable transport.** HORD uses Reliable Connected (RC) queue pairs only.
 - **Transport encryption.** See [Security Considerations](#11-security-considerations).
 
@@ -116,7 +117,7 @@ HORD is structured as three layers:
 ```
 ┌──────────────────────────────────┐
 │         HTTP Layer               │
-│   (hyper, h2, or any HTTP impl) │
+│   (hyper or any HTTP/1.1 impl)  │
 ├──────────────────────────────────┤
 │      Stream Abstraction Layer    │
 │   AsyncRead + AsyncWrite over    │
@@ -134,7 +135,9 @@ HORD is structured as three layers:
 
 **Stream Abstraction Layer** bridges RDMA's message semantics to a byte-stream interface. It manages pre-posted receive buffers, segments outgoing byte streams into RDMA send operations, and reassembles incoming messages into a contiguous stream. This layer implements `tokio::io::AsyncRead` and `tokio::io::AsyncWrite`.
 
-**HTTP Layer** is an unmodified HTTP implementation (e.g., hyper) operating over the stream. It has no knowledge of RDMA. HORD's zero-copy extension is implemented as HTTP headers interpreted by middleware, not by modifying the HTTP stack itself.
+**HTTP Layer** is an unmodified HTTP/1.1 implementation (e.g., hyper) operating over the stream. It has no knowledge of RDMA. HORD's zero-copy extension is implemented as HTTP headers interpreted by middleware, not by modifying the HTTP stack itself.
+
+HORD is HTTP/1.1 only. HTTP/2's multiplexing and flow control add complexity that provides no benefit over RDMA — RDMA already delivers reliable, ordered, low-latency transport, and HORD's credit-based flow control (Section 9) handles backpressure at the transport level. Connection multiplexing is inexpensive over RDMA (QP setup is fast, and there is no TCP handshake overhead), making HTTP/2's stream multiplexing unnecessary.
 
 ---
 
@@ -178,8 +181,7 @@ HORD Handshake (v1):
 | Bit | Name | Description |
 |-----|------|-------------|
 | 0 | `ZERO_COPY_CAPABLE` | Peer supports the zero-copy extension (Section 7) |
-| 1 | `HTTP2_CAPABLE` | Peer supports HTTP/2 (otherwise HTTP/1.1 only) |
-| 2-15 | Reserved | Must be zero |
+| 1-15 | Reserved | Must be zero |
 
 Both sides MUST agree on the effective `max_message_size` as `min(client, server)`. The `max_recv_buffers` value informs the peer of the initial receive credit (see [Flow Control](#9-flow-control)).
 
@@ -219,9 +221,19 @@ A pool of send staging buffers allows multiple sends to be in flight simultaneou
 
 RDMA RC queue pairs deliver messages in order. Combined with the single-producer staging and reassembly buffers, the stream provides TCP-equivalent ordering guarantees without additional sequence numbering.
 
-### 6.4 Message Framing
+### 6.4 HTTP Pipelining
 
-The stream layer does not impose its own framing. The byte stream is continuous; HTTP's own framing (Content-Length, chunked transfer encoding, HTTP/2 frames) delineates messages at the application layer.
+HTTP/1.1 pipelining — sending multiple requests without waiting for each response — is expected to work well over HORD and is RECOMMENDED. The conditions that made pipelining unreliable over TCP/IP do not apply:
+
+- **Head-of-line blocking** is mitigated by RDMA's low latency and the edge cache serving from registered memory, making response times consistently fast.
+- **Broken intermediaries** are not a concern — HORD operates as a single hop between the edge cache and compute nodes with no middleboxes.
+- **Error recovery ambiguity** is reduced by RDMA RC's reliable delivery — a connection either delivers all messages in order or fails cleanly.
+
+Clients SHOULD pipeline requests when issuing multiple GETs (e.g., prefetching dataset shards). Servers MUST respond to pipelined requests in order per the HTTP/1.1 specification.
+
+### 6.5 Message Framing
+
+The stream layer does not impose its own framing. The byte stream is continuous; HTTP/1.1's own framing (Content-Length, chunked transfer encoding) delineates messages at the application layer.
 
 One exception: each RDMA send message is prefixed with a 4-byte length header to allow the receiver to distinguish message boundaries within the completion:
 
