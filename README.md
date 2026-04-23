@@ -4,7 +4,7 @@
 
 ## Abstract
 
-HORD transports HTTP/1.1 and HTTP/2 over RDMA (InfiniBand and RoCE). It provides a byte-stream abstraction over RDMA's message-oriented queue pairs, allowing unmodified HTTP semantics to operate over RDMA with optional zero-copy data transfer.
+HORD transports HTTP/1.1 over RDMA (InfiniBand and RoCE). It provides a byte-stream abstraction over RDMA's message-oriented queue pairs, allowing unmodified HTTP semantics to operate over RDMA with optional zero-copy data transfer.
 
 HORD targets environments where HTTP clients and servers are connected by RDMA-capable networks — most notably AI training and inference clusters consuming object storage over InfiniBand or RoCE fabrics.
 
@@ -62,7 +62,7 @@ The edge cache is the RDMA termination point. It speaks standard HTTP upstream a
 
 ### 2.1 Goals
 
-- **Preserve HTTP semantics exactly.** Any valid HTTP/1.1 or HTTP/2 exchange must work identically over HORD.
+- **Preserve HTTP semantics exactly.** Any valid HTTP/1.1 exchange must work identically over HORD.
 - **Provide a byte-stream interface** over RDMA's message-oriented queue pairs.
 - **Enable zero-copy data transfer as an optional extension,** including direct placement into GPU memory via GPUDirect RDMA.
 - **Remain transport-agnostic within the RDMA family.** Work over InfiniBand and RoCEv2 without protocol changes.
@@ -71,6 +71,7 @@ The edge cache is the RDMA termination point. It speaks standard HTTP upstream a
 ### 2.2 Non-Goals
 
 - **Replacing HTTP.** HORD is not a new application protocol.
+- **HTTP/2 and HTTP/3 framing.** HORD targets HTTP/1.1 only. HPACK and binary framing add CPU overhead that defeats the purpose of RDMA, and H/2 stream multiplexing is redundant with cheap per-QP parallelism.
 - **Kernel-level integration.** HORD operates in userspace via `libibverbs`.
 - **Multicast or unreliable transport.** HORD uses Reliable Connected (RC) queue pairs only.
 - **Transport encryption.** See [Security Considerations](#11-security-considerations).
@@ -144,9 +145,8 @@ During `rdma_connect()` and `rdma_accept()`, both sides exchange a handshake in 
 | Bit | Name | Description |
 |-----|------|-------------|
 | 0 | `ZERO_COPY_CAPABLE` | Peer supports the zero-copy extension (Section 7) |
-| 1 | `HTTP2_CAPABLE` | Peer supports HTTP/2 (otherwise HTTP/1.1 only) |
-| 2 | `SPLIT_MODE_CAPABLE` | Peer supports protocol splitting (Section 7.7). Requires `ZERO_COPY_CAPABLE`. |
-| 3-15 | Reserved | Must be zero |
+| 1 | `SPLIT_MODE_CAPABLE` | Peer supports protocol splitting (Section 7.7). Requires `ZERO_COPY_CAPABLE`. |
+| 2-15 | Reserved | Must be zero |
 
 Both sides MUST agree on the effective `max_message_size` as `min(client, server)`. The `max_recv_buffers` value informs the peer of the initial receive credit (see [Section 9](#9-flow-control)).
 
@@ -184,7 +184,7 @@ A pool of staging buffers allows multiple in-flight sends.
 
 RDMA RC queue pairs deliver messages in order, providing TCP-equivalent ordering without additional sequence numbering.
 
-The stream layer does not impose application-level framing — HTTP's own framing (Content-Length, chunked encoding, HTTP/2 frames) delineates messages. Internally, each RDMA send is wrapped in a message envelope (see [Section 12.2](#122-message-envelope)) to support credit management and message boundaries.
+The stream layer does not impose application-level framing — HTTP's own framing (Content-Length, chunked encoding) delineates messages. Internally, each RDMA send is wrapped in a message envelope (see [Section 12.2](#122-message-envelope)) to support credit management and message boundaries.
 
 ---
 
