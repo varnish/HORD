@@ -39,10 +39,7 @@ RDMA eliminates these costs through kernel bypass and zero-copy transfers, but h
 
 ### 1.1 Target Environments
 
-- AI training clusters reading datasets from object storage through caching proxies
-- AI inference systems loading model weights and serving predictions
-- High-frequency trading infrastructure accessing market data
-- Any environment with RDMA-capable networking and HTTP-based data access
+Any environment with RDMA-capable networking processing data stored in object storage.
 
 ### 1.2 Expected Topology
 
@@ -62,35 +59,34 @@ The edge cache is the RDMA termination point. It speaks standard HTTP upstream a
 
 ### 2.1 Goals
 
-- **Preserve HTTP semantics exactly.** Any valid HTTP/1.1 exchange must work identically over HORD.
-- **Provide a byte-stream interface** over RDMA's message-oriented queue pairs.
-- **Enable zero-copy data transfer as an optional extension,** including direct placement into GPU memory via GPUDirect RDMA.
-- **Remain transport-agnostic within the RDMA family.** Work over InfiniBand and RoCEv2 without protocol changes.
-- **Support implementation as a library.** Primary delivery is a Rust crate with Python bindings.
+- Preserve HTTP semantics exactly. Any valid HTTP/1.1 exchange must work identically over HORD.
+- Provide a byte-stream interface over RDMA's message-oriented queue pairs.
+- Enable zero-copy data transfer as an optional extension, including direct placement into GPU memory via GPUDirect RDMA.
+- Remain transport-agnostic within the RDMA family. Work over InfiniBand and RoCEv2 without protocol changes.
+- Support implementation as a library. Primary delivery is a Rust crate with Python bindings.
 
 ### 2.2 Non-Goals
 
-- **Replacing HTTP.** HORD is not a new application protocol.
-- **HTTP/2 and HTTP/3 framing.** HORD targets HTTP/1.1 only. HPACK and binary framing add CPU overhead that defeats the purpose of RDMA, and H/2 stream multiplexing is redundant with cheap per-QP parallelism.
-- **Kernel-level integration.** HORD operates in userspace via `libibverbs`.
-- **Multicast or unreliable transport.** HORD uses Reliable Connected (RC) queue pairs only.
-- **Transport encryption.** See [Security Considerations](#11-security-considerations).
+- Replacing HTTP. HORD is not a new application protocol.
+- HTTP/2 and HTTP/3 framing. HORD targets HTTP/1.1 only. HPACK and binary framing add CPU overhead that defeats the purpose of RDMA, and H/2 stream multiplexing is redundant with cheap per-QP parallelism.
+- Kernel-level integration. HORD operates in userspace via `libibverbs`.
+- Transport encryption. See [Security Considerations](#11-security-considerations).
 
 ---
 
 ## 3. Terminology
 
-| Term | Definition |
-|------|-----------|
-| **RC QP** | Reliable Connected Queue Pair. The RDMA connection primitive used by HORD. |
-| **MR** | Memory Region. A contiguous block registered with the RDMA NIC for direct access. |
-| **CQ** | Completion Queue. Receives notifications when RDMA operations complete. |
-| **Send/Recv** | Two-sided RDMA operations. The sender posts a send; the receiver must have pre-posted a matching receive. |
+| Term           | Definition                                                                                                         |
+| -------------- | ------------------------------------------------------------------------------------------------------------------ |
+| **RC QP**      | Reliable Connected Queue Pair. The RDMA connection primitive used by HORD.                                         |
+| **MR**         | Memory Region. A contiguous block registered with the RDMA NIC for direct access.                                  |
+| **CQ**         | Completion Queue. Receives notifications when RDMA operations complete.                                            |
+| **Send/Recv**  | Two-sided RDMA operations. The sender posts a send; the receiver must have pre-posted a matching receive.          |
 | **RDMA Write** | One-sided operation. The initiator writes directly into remote registered memory without involving the remote CPU. |
-| **rkey** | Remote key. Authorizes a remote party to perform RDMA read/write on a memory region. |
-| **GDR** | GPUDirect RDMA. Allows RDMA operations to target GPU device memory directly. |
-| **ODP** | On-Demand Paging. Allows RDMA operations on unpinned memory, with page faults handled by the NIC/driver. |
-| **WR / WC** | Work Request / Work Completion. Instructions posted to a QP and their completion notifications on a CQ. |
+| **rkey**       | Remote key. Authorizes a remote party to perform RDMA read/write on a memory region.                               |
+| **GDR**        | GPUDirect RDMA. Allows RDMA operations to target GPU device memory directly.                                       |
+| **ODP**        | On-Demand Paging. Allows RDMA operations on unpinned memory, with page faults handled by the NIC/driver.           |
+| **WR / WC**    | Work Request / Work Completion. Instructions posted to a QP and their completion notifications on a CQ.            |
 
 ---
 
@@ -99,7 +95,7 @@ The edge cache is the RDMA termination point. It speaks standard HTTP upstream a
 ```
 ┌──────────────────────────────────┐
 │         HTTP Layer               │
-│   (hyper, h2, or any HTTP impl) │
+│ (hyper, or other HTTP/1.1 impl)  │
 ├──────────────────────────────────┤
 │      Stream Abstraction Layer    │
 │   AsyncRead + AsyncWrite over    │
@@ -111,11 +107,11 @@ The edge cache is the RDMA termination point. It speaks standard HTTP upstream a
 └──────────────────────────────────┘
 ```
 
-**RDMA Transport Layer** manages device discovery, protection domain creation, QP lifecycle, memory registration, and completion processing.
+RDMA Transport Layer manages device discovery, protection domain creation, QP lifecycle, memory registration, and completion processing.
 
-**Stream Abstraction Layer** bridges RDMA's message semantics to a byte-stream interface via `tokio::io::AsyncRead` and `AsyncWrite`. It manages pre-posted receive buffers, segments outgoing data into RDMA sends, and reassembles incoming messages.
+Stream Abstraction Layer bridges RDMA's message semantics to a byte-stream interface via `tokio::io::AsyncRead` and `AsyncWrite`. It manages pre-posted receive buffers, segments outgoing data into RDMA sends, and reassembles incoming messages.
 
-**HTTP Layer** is an unmodified HTTP implementation (e.g., hyper) with no knowledge of RDMA. The zero-copy extension is implemented as HTTP headers interpreted by middleware.
+HTTP Layer is an unmodified HTTP implementation (e.g., hyper) with no knowledge of RDMA. The zero-copy extension is implemented as HTTP headers interpreted by middleware.
 
 ---
 
@@ -142,11 +138,11 @@ During `rdma_connect()` and `rdma_accept()`, both sides exchange a handshake in 
 
 **Flags:**
 
-| Bit | Name | Description |
-|-----|------|-------------|
-| 0 | `ZERO_COPY_CAPABLE` | Peer supports the zero-copy extension (Section 7) |
-| 1 | `SPLIT_MODE_CAPABLE` | Peer supports protocol splitting (Section 7.7). Requires `ZERO_COPY_CAPABLE`. |
-| 2-15 | Reserved | Must be zero |
+| Bit  | Name                 | Description                                                                   |
+| ---- | -------------------- | ----------------------------------------------------------------------------- |
+| 0    | `ZERO_COPY_CAPABLE`  | Peer supports the zero-copy extension (Section 7)                             |
+| 1    | `SPLIT_MODE_CAPABLE` | Peer supports protocol splitting (Section 7.7). Requires `ZERO_COPY_CAPABLE`. |
+| 2-15 | Reserved             | Must be zero                                                                  |
 
 Both sides MUST agree on the effective `max_message_size` as `min(client, server)`. The `max_recv_buffers` value informs the peer of the initial receive credit (see [Section 9](#9-flow-control)).
 
@@ -241,6 +237,7 @@ If a write has partially completed, the client's buffer is in an undefined state
 When the client registers GPU device memory and provides its address and rkey, the server's RDMA write targets GPU memory directly. This is transparent to HORD — the address and rkey are opaque to the server.
 
 Requirements:
+
 - NVIDIA GPU with GPUDirect RDMA support
 - Mellanox ConnectX-5+ (or equivalent with peer memory support)
 - `nvidia-peermem` kernel module loaded
@@ -258,7 +255,7 @@ X-HORD-RDMA-Write: addr=0x7f4a2c000000;rkey=0x01ab3f00;len=16777216
 
 ### 7.7 Protocol Splitting
 
-Protocol splitting separates the **control plane** (HTTP exchange) from the **data plane** (payload delivery), allowing the data consumer to receive payloads without parsing HTTP.
+Protocol splitting separates the _control plane_ (HTTP exchange) from the _data plane_ (payload delivery), allowing the data consumer to receive payloads without parsing HTTP.
 
 #### 7.7.1 Motivation
 
@@ -284,6 +281,7 @@ A dispatcher demultiplexes completions by opcode: `IBV_WC_RECV` for stream messa
 #### 7.7.2 Mechanism
 
 RDMA write-with-immediate atomically:
+
 1. Writes payload into the client's registered memory (identical to standard zero-copy).
 2. Delivers a 32-bit immediate value to the client's CQ, consuming one posted receive buffer.
 
@@ -307,11 +305,12 @@ If `id` is omitted, the server uses plain RDMA write (Section 7.3). If present a
 2. Post a final write-with-immediate with `imm_data` set to the client's transfer ID (may carry the last payload portion or be zero-length).
 3. Send the HTTP response on the stream as in Section 7.3.
 
-**Ordering:** The CQ completion will typically arrive *before* the HTTP response. Implementations MUST NOT assume a specific ordering between them.
+**Ordering:** The CQ completion will typically arrive _before_ the HTTP response. Implementations MUST NOT assume a specific ordering between them.
 
 #### 7.7.5 Completion Semantics
 
 When the client's CQ delivers `IBV_WC_RECV_RDMA_WITH_IMM`:
+
 - `wc.imm_data` contains the transfer ID.
 - Payload is guaranteed fully written.
 - The consumed receive buffer contains no data and SHOULD be reposted immediately.
@@ -323,8 +322,9 @@ The data-plane consumer can use the data immediately without waiting for the HTT
 Write-with-immediate consumes one posted receive buffer. Each request with `X-HORD-RDMA-Write` containing `id` constitutes an implicit grant of one additional receive credit. The client MUST post a receive buffer for this before sending the request.
 
 The server tracks two credit types:
-- **Stream credits:** For stream messages (Section 9).
-- **Transfer credits:** One per in-flight split-mode request, implicitly granted, no explicit replenishment needed.
+
+- _Stream credits:_ For stream messages (Section 9).
+- _Transfer credits:_ One per in-flight split-mode request, implicitly granted, no explicit replenishment needed.
 
 #### 7.7.7 Failure Handling
 
@@ -350,23 +350,23 @@ Buffer Pool
 
 ### 8.2 Pool Sizing
 
-| Parameter | Default | Notes |
-|-----------|---------|-------|
-| `max_message_size` | 64 KiB | Balances overhead vs. memory usage |
-| Send pool | 16 buffers | In-flight sends per connection |
-| Recv pool | 32 buffers | Must be >= `max_recv_buffers` from handshake |
-| Cache pool | Impl-defined | Depends on memory and workload |
+| Parameter          | Default      | Notes                                        |
+| ------------------ | ------------ | -------------------------------------------- |
+| `max_message_size` | 64 KiB       | Balances overhead vs. memory usage           |
+| Send pool          | 16 buffers   | In-flight sends per connection               |
+| Recv pool          | 32 buffers   | Must be >= `max_recv_buffers` from handshake |
+| Cache pool         | Impl-defined | Depends on memory and workload               |
 
 ### 8.3 Memory Registration
 
-**Pre-registration (recommended):** Register all pools at startup. No registration on the data path.
+Pre-registration (preferred): Register all pools at startup. No registration on the data path.
 
-**On-Demand Paging (optional):** If the NIC supports ODP, regions can be registered lazily — useful for variable-size cache pools at the cost of slightly higher first-touch latency.
+On-Demand Paging (optional): If the NIC supports ODP, regions can be registered lazily — useful for variable-size cache pools at the cost of slightly higher first-touch latency.
 
 ### 8.4 Large Object Handling
 
-- **Stream path:** Segmented across multiple RDMA sends automatically.
-- **Zero-copy path:** Single large RDMA write (or multiple if constrained by max WR size). The RDMA layer handles MTU segmentation.
+- Stream path: Segmented across multiple RDMA sends automatically.
+- Zero-copy path:\*\* Single large RDMA write (or multiple if constrained by max WR size). The RDMA layer handles MTU segmentation.
 
 ---
 
@@ -392,6 +392,7 @@ When credits reach zero, `AsyncWrite` blocks (`Poll::Pending`) until replenished
 ### 10.1 Transport Errors
 
 RDMA transport errors (QP errors, protection errors) are fatal to the connection:
+
 1. The stream layer returns an error from `AsyncRead`/`AsyncWrite`.
 2. The HTTP layer handles it per its own semantics (e.g., retry on a new connection).
 3. The transport layer destroys the QP and releases resources.
@@ -406,16 +407,18 @@ HTTP-level errors (4xx, 5xx) are handled entirely at the HTTP layer and are invi
 
 ### 11.1 Transport Security
 
-RDMA does not natively support encryption. In most target environments (InfiniBand within a data center), this is acceptable.
+RDMA does not natively support encryption. In most target environments, InfiniBand or RoCEv2 within a data center), this is acceptable.
 
 Mitigations for shared networks:
-- **Network isolation:** Dedicated RDMA VLANs or InfiniBand partitions.
-- **IPsec:** RoCEv2 traffic can be encrypted at the IP layer (may reduce performance).
-- **Application-layer encryption:** Encrypt objects before storage; decrypt after receipt.
+
+- Network isolation: Dedicated RDMA VLANs or InfiniBand partitions.
+- IPsec: RoCEv2 traffic can be encrypted at the IP layer (may reduce performance).
+- Application-layer encryption: Encrypt objects before storage; decrypt after receipt.
 
 ### 11.2 Memory Safety
 
 The zero-copy extension requires sharing memory addresses and rkeys. Mitigations:
+
 - Register dedicated, bounded regions that don't overlap with other application memory.
 - Revoke rkeys (`ibv_dereg_mr`) promptly on connection close.
 - Validate that RDMA writes stay within communicated bounds.
@@ -423,6 +426,7 @@ The zero-copy extension requires sharing memory addresses and rkeys. Mitigations
 ### 11.3 Denial of Service
 
 Implementations SHOULD enforce:
+
 - Maximum connections per client IP/GID.
 - Idle connection timeouts.
 - Limits on total registered memory.
@@ -457,10 +461,10 @@ Offset  Size    Field
 
 **Flags:**
 
-| Bit | Name | Description |
-|-----|------|-------------|
-| 0 | `CREDIT_ONLY` | Payload is empty; message exists only to replenish credits |
-| 1-15 | Reserved | Must be zero |
+| Bit  | Name          | Description                                                |
+| ---- | ------------- | ---------------------------------------------------------- |
+| 0    | `CREDIT_ONLY` | Payload is empty; message exists only to replenish credits |
+| 1-15 | Reserved      | Must be zero                                               |
 
 ### 12.3 X-HORD-RDMA-Write Request Header
 
@@ -468,12 +472,12 @@ Offset  Size    Field
 X-HORD-RDMA-Write: addr=<hex u64>;rkey=<hex u32>;len=<decimal u64>[;id=<decimal u32>]
 ```
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `addr` | hex u64 | Start address of client's registered receive buffer |
-| `rkey` | hex u32 | Remote key authorizing server writes |
-| `len` | decimal u64 | Buffer capacity in bytes |
-| `id` | decimal u32 | Optional. Transfer ID for split-mode (Section 7.7) |
+| Parameter | Type        | Description                                         |
+| --------- | ----------- | --------------------------------------------------- |
+| `addr`    | hex u64     | Start address of client's registered receive buffer |
+| `rkey`    | hex u32     | Remote key authorizing server writes                |
+| `len`     | decimal u64 | Buffer capacity in bytes                            |
+| `id`      | decimal u32 | Optional. Transfer ID for split-mode (Section 7.7)  |
 
 ### 12.4 X-HORD-RDMA-Write Response Header
 
@@ -607,40 +611,12 @@ Implementations SHOULD support loopback mode using software RDMA (`rxe` or `siw`
 
 ## 14. Relationship to Existing Standards
 
-| Standard | Relationship |
-|----------|-------------|
-| **iSER, SRP, NFS/RDMA** | Existing RDMA protocols for other application layers (SCSI, NFS). HORD is the HTTP analog. |
-| **SMB Direct** | Closest precedent — byte-stream over RDMA with optional direct data placement for SMB. HORD follows a similar pattern adapted for HTTP. |
-| **HTTP/3 / QUIC** | Complementary. HTTP/3 targets internet-scale; HORD targets data center fabrics. An edge cache could speak both. |
-| **UCX** | Could serve as HORD's transport layer instead of raw `libibverbs`. Valid implementation strategy, not required. |
-
----
-
-## Appendix A: Configuration Defaults
-
-| Parameter | Default | Range | Description |
-|-----------|---------|-------|-------------|
-| `port` | 4791 | 1-65535 | Listen/connect port |
-| `max_message_size` | 65,536 | 4,096 — 1,048,576 | Max bytes per RDMA send |
-| `recv_pool_size` | 32 | 4 — 256 | Pre-posted receive buffers per connection |
-| `send_pool_size` | 16 | 4 — 256 | Send staging buffers per connection |
-| `max_connections` | 1024 | 1 — 65535 | Server-side connection limit |
-| `idle_timeout` | 60s | 1s — 3600s | Idle connection timeout |
-| `zero_copy` | true | bool | Enable zero-copy extension |
-| `gdr` | false | bool | Enable GPUDirect RDMA buffer registration |
-
-## Appendix B: Performance Expectations
-
-Rough targets for the reference implementation (not normative):
-
-| Metric | TCP Baseline | HORD Stream | HORD Zero-Copy |
-|--------|-------------|-------------|----------------|
-| Latency (small GET) | ~50 us | ~5 us | N/A |
-| Throughput (large GET) | ~10 GB/s | ~20 GB/s | ~24 GB/s (line rate, HDR IB) |
-| CPU usage (per GB) | High | Low | Minimal |
-| GPU load latency | ~100 us | ~30 us | ~10 us (NIC -> GPU) |
-
-*Values are illustrative. Actual performance depends on hardware, MTU, queue depth, and workload.*
+| Standard                | Relationship                                                                                                                            |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| **iSER, SRP, NFS/RDMA** | Existing RDMA protocols for other application layers (SCSI, NFS). HORD is the HTTP analog.                                              |
+| **SMB Direct**          | Closest precedent — byte-stream over RDMA with optional direct data placement for SMB. HORD follows a similar pattern adapted for HTTP. |
+| **HTTP/3 / QUIC**       | Complementary. HTTP/3 targets internet-scale; HORD targets data center fabrics. An edge cache _could_ speak both.                       |
+| **UCX**                 | Could serve as HORD's transport layer instead of raw `libibverbs`. Valid implementation strategy, not required.                         |
 
 ---
 
