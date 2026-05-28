@@ -111,7 +111,45 @@ RDMA Transport Layer manages device discovery, protection domain creation, QP li
 
 Stream Abstraction Layer bridges RDMA's message semantics to a byte-stream interface via `tokio::io::AsyncRead` and `AsyncWrite`. It manages pre-posted receive buffers, segments outgoing data into RDMA sends, and reassembles incoming messages.
 
-HTTP Layer is an unmodified HTTP implementation (e.g., hyper) with no knowledge of RDMA. The zero-copy extension is implemented as HTTP headers interpreted by middleware.
+HTTP Layer. HORD targets a narrow profile of HTTP/1.1 oriented toward bulk object transfer; see [Section 4.1](#41-http-profile). The request/response model, status codes, and common headers are preserved. Implementations MAY reuse an off-the-shelf HTTP/1.1 parser (e.g., hyper) for header processing, but HORD-specific framing — notably the body-on-the-side semantics of [Section 7](#7-zero-copy-extension) and the data-plane bypass of [Section 7.7](#77-protocol-splitting) — is handled by a HORD-aware adapter sitting between the parser and the stream. The data plane in split mode bypasses the HTTP layer entirely.
+
+### 4.1 HTTP Profile
+
+HORD specifies a narrow subset of HTTP/1.1, sufficient for bulk object reads and explicit about what it omits. The profile is read-oriented in v0.1; write methods may be added in a later revision.
+
+#### 4.1.1 Required
+
+- **Methods:** GET, HEAD.
+- **Status codes:** the full 1xx–5xx range as defined by RFC 9110.
+- **Framing:** `Content-Length`, `Content-Type`, `Content-Range`. Every HORD response carries a known length; see [Section 4.1.2](#412-out-of-scope) on chunked.
+- **Range:** single-range `Range` requests and `Content-Range` in 206 responses. Multipart byteranges are not supported.
+- **Conditional requests:** `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `ETag`, `Last-Modified`.
+- **Caching:** `Cache-Control`, `Age`, `Expires`, `Date`.
+- **Authorization:** the `Authorization` header is forwarded opaquely (bearer tokens).
+- **Connection control:** `Connection: close`. Persistent connections are the default per HTTP/1.1.
+- **Identification:** `Server`, `User-Agent` permitted; not interpreted by HORD.
+- **HORD extensions:** `X-HORD-*` (see [Section 7](#7-zero-copy-extension) and [Section 12](#12-wire-format-reference)).
+- **Pipelining:** Multiple in-flight requests on a single connection are supported and expected — prefetch controllers issue many GETs concurrently. Control-plane responses are returned in request order. Data-plane completions in split mode ([Section 7.7](#77-protocol-splitting)) MAY arrive in any order relative to one another and to the control-plane responses; clients demultiplex by transfer `id`.
+
+#### 4.1.2 Out of scope
+
+Clients SHOULD NOT send and servers MAY reject (with 400 or 501) or ignore the following:
+
+- **Write methods:** PUT, POST, DELETE, PATCH.
+- **Other methods:** CONNECT, OPTIONS, TRACE.
+- **Content negotiation:** `Accept`, `Accept-Language`, `Accept-Charset`, `Vary`. HORD assumes the client knows the object's representation by key.
+- **Compression:** `Content-Encoding`, `Accept-Encoding`. Trading CPU for bandwidth runs counter to HORD's purpose; objects are served as stored.
+- **Transfer-Encoding:** `chunked` and other transfer codings. HORD always knows response length, and zero-copy ([Section 7](#7-zero-copy-extension)) requires it.
+- **Trailers:** `TE`, `Trailer`.
+- **Continuation:** `Expect: 100-continue`.
+- **Protocol upgrade:** `Upgrade`, `Connection: upgrade`. There is no upgrade path on a HORD connection.
+- **Authentication challenges:** 401/407 with `WWW-Authenticate` / `Proxy-Authenticate` flows. Bearer tokens via `Authorization` only.
+- **State:** `Cookie`, `Set-Cookie`.
+- **Multipart ranges:** `multipart/byteranges`.
+
+#### 4.1.3 Normalizing upstream content
+
+A HORD server (typically an edge cache) fetching from origins over standard HTTP may receive content that uses out-of-scope features — e.g., `Content-Encoding: gzip` or `Transfer-Encoding: chunked`. The server MUST normalize before serving over HORD: decompress encoded bodies, dechunk transfer-encoded responses, and materialize a known `Content-Length`. The HORD wire MUST NOT carry features the profile excludes.
 
 ---
 
@@ -132,6 +170,19 @@ HORD connections use the RDMA Connection Manager (CM) for setup and teardown, fo
 3. Client receives `RDMA_CM_EVENT_ESTABLISHED`. QP transitions through INIT -> RTR -> RTS automatically via the CM.
 4. Both sides may now post send/recv operations.
 
+#### 5.2.1 RC Parameters
+
+The Reliable Connected QP attributes that govern retry behavior have a material effect on whether transient conditions surface as connection-fatal errors. HORD recommends the following defaults; implementations MAY tune them based on fabric characteristics.
+
+| Attribute        | Recommended | Notes                                                                                            |
+| ---------------- | ----------- | ------------------------------------------------------------------------------------------------ |
+| `retry_count`    | 7           | Maximum per IBA. Number of times the NIC retries a packet on transport NAK.                      |
+| `rnr_retry`      | 7           | Maximum per IBA. Number of RNR (Receiver Not Ready) retries before failing the QP.               |
+| `timeout`        | 14          | Local ACK timeout exponent; ~4.1 ms. Reasonable for intra-DC fabrics.                            |
+| `min_rnr_timer`  | 12          | NAK delay when no receive buffer is posted; ~640 µs. Pairs with `rnr_retry=7` to absorb bursts.  |
+
+These values are passed via `rdma_conn_param` during `rdma_connect()` / `rdma_accept()` and applied during the CM-driven QP transitions in step 3 above.
+
 ### 5.3 Handshake
 
 During `rdma_connect()` and `rdma_accept()`, both sides exchange a handshake in the CM private data field. See [Section 12.1](#121-handshake-cm-private-data) for the wire format.
@@ -145,6 +196,8 @@ During `rdma_connect()` and `rdma_accept()`, both sides exchange a handshake in 
 | 2-15 | Reserved             | Must be zero                                                                  |
 
 Both sides MUST agree on the effective `max_message_size` as `min(client, server)`. The `max_recv_buffers` value informs the peer of the initial receive credit (see [Section 9](#9-flow-control)).
+
+**Version mismatch.** Only version 1 is currently defined. A peer that does not recognize the version in the handshake MUST reject the connection via `rdma_reject()` and SHOULD include its own handshake structure (with its highest supported version) as reject private data. A future revision of HORD MAY define a version-negotiation procedure; v0.1 implementations need only support reject-on-mismatch.
 
 ### 5.4 Connection Teardown
 
@@ -208,29 +261,47 @@ See [Section 12.3](#123-x-hord-rdma-write-request-header) for parameter details.
 
 If the server elects to use zero-copy:
 
-1. If the object fits in the client's buffer: perform an RDMA write into the client's buffer, then send the HTTP response with the body omitted:
+1. **Object fits in the client's buffer.** The server performs an RDMA write into the client's buffer, then sends the HTTP response on the stream with `Content-Length: 0`:
 
 ```http
 HTTP/1.1 200 OK
-Content-Length: 14680064
+Content-Length: 0
 Content-Type: application/octet-stream
 X-HORD-RDMA-Write: status=complete;bytes_written=14680064
 ```
 
-2. If the object exceeds the buffer:
+The payload is delivered out-of-band by the RDMA write; `bytes_written` carries the authoritative payload size. `Content-Length: 0` preserves the HTTP/1.1 framing rule — `Content-Length` describes bytes that follow on the stream, and zero bytes follow — so off-the-shelf HTTP parsers handle the response correctly without HORD-specific framing logic. Application code retrieves the payload size from `bytes_written`, not from `Content-Length`.
+
+2. **Object exceeds the buffer.** The server returns 413 with no body and reports the actual object size:
 
 ```http
 HTTP/1.1 413 Content Too Large
+Content-Length: 0
 X-HORD-RDMA-Write: status=too_large;object_size=1073741824
 ```
 
 The client may retry with a `Range` header or allocate a larger buffer.
 
-### 7.4 Failure Handling
+3. **Response has no body.** For HEAD requests and for responses where HTTP semantics define no message body (204 No Content, 304 Not Modified, and others per RFC 9110), the server MUST NOT perform an RDMA write. Any `X-HORD-RDMA-Write` request header is ignored and not echoed in the response.
 
-If the server cannot perform the RDMA write (invalid rkey, network error, partial write), it MUST fall back to a stream-based response. The client detects this by the absence of the `X-HORD-RDMA-Write` response header.
+### 7.4 Response Outcomes
 
-If a write has partially completed, the client's buffer is in an undefined state — the server MUST NOT send a success response. Instead it closes the connection. The client retries on a new connection.
+A request bearing `X-HORD-RDMA-Write` produces one of three response statuses:
+
+1. **`status=complete`** — payload was placed in the client's buffer via RDMA write. See [Section 7.3](#73-server-behavior) item 1.
+2. **`status=too_large`** — payload exceeds the client's buffer. See [Section 7.3](#73-server-behavior) item 2.
+3. **`status=declined`** — the server elected not to use zero-copy for this request (resource pressure, server policy, payload too small to benefit, or pre-flight rejection of the client's rkey/address). The body is sent on the stream as in a non-HORD response:
+
+```http
+HTTP/1.1 200 OK
+Content-Length: 14680064
+Content-Type: application/octet-stream
+X-HORD-RDMA-Write: status=declined
+```
+
+**Mid-write failure.** Once the server has begun an RDMA write, partial failure leaves the client's buffer in an undefined state. The server MUST NOT signal `complete` unless the entire payload was placed. On mid-write failure (network error, QP transition to error state) the server closes the connection; the client retries on a new connection with a fresh buffer.
+
+**Header presence.** Servers MUST include `X-HORD-RDMA-Write` in any body-bearing response to a request that carried `X-HORD-RDMA-Write`. Bodiless responses ([Section 7.3](#73-server-behavior) item 3) omit it. Absence of the header on a body-bearing response is a protocol violation; clients SHOULD treat it as `declined` and log a warning.
 
 ### 7.5 GPUDirect RDMA
 
@@ -328,7 +399,7 @@ The server tracks two credit types:
 
 #### 7.7.7 Failure Handling
 
-- Write-with-immediate not yet posted: fall back to stream response.
+- Write-with-immediate not yet posted: fall back to stream response with `status=declined` ([Section 7.4](#74-response-outcomes)).
 - Write-with-immediate fails after posting: QP enters error state, connection closes, client retries.
 - The server MUST NOT send `status=complete` unless the write-with-immediate succeeded.
 - Clients SHOULD implement a timeout for data-plane completions.
@@ -350,12 +421,15 @@ Buffer Pool
 
 ### 8.2 Pool Sizing
 
-| Parameter          | Default      | Notes                                        |
-| ------------------ | ------------ | -------------------------------------------- |
-| `max_message_size` | 64 KiB       | Balances overhead vs. memory usage           |
-| Send pool          | 16 buffers   | In-flight sends per connection               |
-| Recv pool          | 32 buffers   | Must be >= `max_recv_buffers` from handshake |
-| Cache pool         | Impl-defined | Depends on memory and workload               |
+| Parameter          | Default      | Notes                                                                              |
+| ------------------ | ------------ | ---------------------------------------------------------------------------------- |
+| `max_message_size` | 64 KiB       | Balances overhead vs. memory usage                                                 |
+| `max_recv_buffers` | 32           | Data credits advertised in this side's handshake ([Section 12.1](#121-handshake-cm-private-data)) |
+| Send pool          | 16 buffers   | In-flight sends per connection                                                     |
+| Recv pool          | 33 buffers   | At least `max_recv_buffers + 1`; the extra is reserved for `CREDIT_ONLY` ([Section 9](#9-flow-control)) |
+| Cache pool         | Impl-defined | Depends on memory and workload                                                     |
+
+Each side's recv pool size is governed by the `max_recv_buffers` value *it* advertised in its handshake, not the peer's. If a side advertises N credits, it MUST keep at least N + 1 recv buffers posted at all times.
 
 ### 8.3 Memory Registration
 
@@ -365,8 +439,8 @@ On-Demand Paging (optional): If the NIC supports ODP, regions can be registered 
 
 ### 8.4 Large Object Handling
 
-- Stream path: Segmented across multiple RDMA sends automatically.
-- Zero-copy path:\*\* Single large RDMA write (or multiple if constrained by max WR size). The RDMA layer handles MTU segmentation.
+- **Stream path:** Segmented across multiple RDMA sends automatically.
+- **Zero-copy path:** Single large RDMA write (or multiple if constrained by max WR size). The RDMA layer handles MTU segmentation.
 
 ---
 
@@ -376,14 +450,20 @@ RDMA RC provides reliable delivery but no application-level flow control. HORD u
 
 ### 9.1 Credits
 
-- At connection setup, each side has `max_recv_buffers` credits (from handshake).
-- Each send consumes one credit.
-- Credits are replenished by piggybacking a count on outgoing messages via the `credits` field in the message envelope ([Section 12.2](#122-message-envelope)).
-- If no outgoing message is pending, a zero-length credit-only message is sent.
+- At connection setup, each side has `max_recv_buffers` data credits — the value advertised by the peer in its handshake.
+- Each data-bearing send consumes one credit on the sender's tally.
+- Credits are replenished by piggybacking a non-zero `credits` value on outgoing messages via the `credits` field in the message envelope ([Section 12.2](#122-message-envelope)).
+- Receivers SHOULD send a replenishment proactively — a `CREDIT_ONLY` message ([Section 12.2](#122-message-envelope)) when more than half of `max_recv_buffers` have been consumed without being advertised back to the peer.
 
-### 9.2 Backpressure
+### 9.2 Reserved Control Credit
 
-When credits reach zero, `AsyncWrite` blocks (`Poll::Pending`) until replenished. This propagates backpressure through the HTTP layer naturally.
+Each side MUST keep at least one recv buffer posted beyond `max_recv_buffers` (see [Section 8.2](#82-pool-sizing)). This buffer is reserved for `CREDIT_ONLY` messages and is replenished immediately upon consumption.
+
+A peer MAY send a single in-flight `CREDIT_ONLY` message regardless of its data-credit tally. This guarantees that credit recovery is always possible: if both peers exhaust their data credits simultaneously, either side can still emit a `CREDIT_ONLY` to break the deadlock. The reserved-credit budget is one per side; a sender MUST NOT have more than one unacknowledged `CREDIT_ONLY` in flight.
+
+### 9.3 Backpressure
+
+When data credits reach zero, `AsyncWrite` blocks (`Poll::Pending`) until replenished. Backpressure propagates through the HTTP layer naturally — pipelined requests stall until the peer drains its receive queue.
 
 ---
 
@@ -407,7 +487,7 @@ HTTP-level errors (4xx, 5xx) are handled entirely at the HTTP layer and are invi
 
 ### 11.1 Transport Security
 
-RDMA does not natively support encryption. In most target environments, InfiniBand or RoCEv2 within a data center), this is acceptable.
+RDMA does not natively support encryption. In most target environments (InfiniBand or RoCEv2 within a data center), this is acceptable.
 
 Mitigations for shared networks:
 
@@ -434,6 +514,8 @@ Implementations SHOULD enforce:
 ---
 
 ## 12. Wire Format Reference
+
+All multi-byte integer fields in HORD wire formats are transmitted in network byte order (big-endian). The handshake magic value `0x484F5244` is the ASCII sequence `H`, `O`, `R`, `D` (bytes `0x48 0x4F 0x52 0x44`) and appears verbatim in packet captures. The `imm_data` field used by RDMA write-with-immediate ([Section 7.7](#77-protocol-splitting)) is presented to applications in host byte order by the verbs API regardless of host architecture; the IBA wire format is big-endian and the verbs implementation handles conversion transparently.
 
 ### 12.1 Handshake (CM Private Data)
 
