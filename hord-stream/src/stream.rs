@@ -66,6 +66,19 @@ fn slot_of(wr_id: u64) -> usize {
     (wr_id & !SEND_FLAG) as usize
 }
 
+/// A received data message whose payload still lives in its receive buffer,
+/// awaiting `read()`. We hold the buffer (rather than copying out and
+/// re-posting on receipt) so the receive buffer is only freed — and a credit
+/// only returned to the peer — once the application has *consumed* the bytes.
+/// That ties the peer's send window to our read progress, giving real
+/// backpressure and a bounded reassembly footprint.
+#[derive(Debug, Clone, Copy)]
+struct ReadyMsg {
+    slot: usize,
+    start: usize, // absolute offset into recv_buf of the next unread byte
+    end: usize,   // absolute offset into recv_buf one past the payload
+}
+
 /// A HORD byte stream over a single RC connection.
 ///
 /// Field order matters for `Drop`: `conn` is declared first so the QP is torn
@@ -93,9 +106,9 @@ pub struct HordStream {
     send_credits: u32,     // messages we may still post to the peer
     grant_pending: u32,    // credits we owe the peer (re-posted recvs not yet announced)
 
-    tx_stage: Vec<u8>,  // bytes buffered by write(), drained into messages
-    rx: VecDeque<u8>,   // reassembled payload awaiting read()
-    peer_closed: bool,  // observed a flush/transport error -> treat as EOF/broken pipe
+    tx_stage: Vec<u8>,        // bytes buffered by write(), drained into messages
+    rx_ready: VecDeque<ReadyMsg>, // received data, still in its recv buffer, awaiting read()
+    peer_closed: bool,        // observed a flush/transport error -> treat as EOF/broken pipe
 }
 
 impl HordStream {
@@ -163,7 +176,7 @@ impl HordStream {
             send_credits: 0,
             grant_pending: 0,
             tx_stage: Vec::new(),
-            rx: VecDeque::new(),
+            rx_ready: VecDeque::new(),
             peer_closed: false,
         };
         s.post_all_recvs()?;
@@ -267,32 +280,48 @@ impl HordStream {
         // Credits the peer granted us.
         self.send_credits = self.send_credits.saturating_add(env.credits as u32);
 
-        if !env.is_credit_only() {
-            let avail = n - ENVELOPE_LEN;
-            let plen = (env.length as usize).min(avail);
-            if plen > 0 {
-                let start = off + ENVELOPE_LEN;
-                self.rx.extend(&self.recv_buf[start..start + plen]);
-            }
-        }
+        let avail = n - ENVELOPE_LEN;
+        let plen = if env.is_credit_only() {
+            0
+        } else {
+            (env.length as usize).min(avail)
+        };
 
-        // Re-post this receive buffer and record that we now owe the peer one
-        // more credit.
+        if plen > 0 {
+            // Hold the payload in place and defer the re-post / credit-return
+            // until `read()` drains it (backpressure — see [`ReadyMsg`]).
+            let start = off + ENVELOPE_LEN;
+            self.rx_ready.push_back(ReadyMsg {
+                slot,
+                start,
+                end: start + plen,
+            });
+        } else {
+            // Nothing to hold (a CREDIT_ONLY top-up, or a zero-length data
+            // message): re-post immediately and return the credit now.
+            self.repost_recv(slot)?;
+            self.grant_pending += 1;
+        }
+        Ok(())
+    }
+
+    /// Re-post the receive WR for `slot`. Re-posting only fails on a dead QP;
+    /// on failure the connection is marked closed so reads/writes fail fast
+    /// instead of silently operating with a shrunken receive window.
+    fn repost_recv(&mut self, slot: usize) -> io::Result<()> {
+        let off = slot * self.msg_size;
         let base = self.recv_buf.as_mut_ptr();
-        // SAFETY: same slot we just consumed; within recv_buf / the MR.
+        // SAFETY: `base + off` is slot `slot` inside recv_buf / the MR, which
+        // outlives the connection (drop order).
         let repost = unsafe {
             let addr = base.add(off);
             self.conn
                 .post_recv(recv_wr_id(slot), addr, self.msg_size as u32, self.recv_lkey)
         };
         if let Err(e) = repost {
-            // Re-posting only fails on a dead QP. Mark the connection closed so
-            // reads/writes fail fast instead of silently operating with a
-            // shrunken receive window.
             self.peer_closed = true;
             return Err(e);
         }
-        self.grant_pending += 1;
         Ok(())
     }
 
@@ -376,26 +405,40 @@ impl Read for HordStream {
         if out.is_empty() {
             return Ok(0);
         }
-        while self.rx.is_empty() {
+        while self.rx_ready.is_empty() {
             if self.peer_closed {
                 return Ok(0); // EOF
             }
             self.pump(true)?;
             self.maybe_flush_credits()?;
         }
-        let n = out.len().min(self.rx.len());
-        // Bulk-copy from the ring buffer's (up to) two contiguous segments
-        // instead of moving bytes one at a time.
-        let (a, b) = self.rx.as_slices();
-        let from_a = a.len().min(n);
-        out[..from_a].copy_from_slice(&a[..from_a]);
-        if from_a < n {
-            out[from_a..n].copy_from_slice(&b[..n - from_a]);
+
+        // Copy payload straight out of the receive buffers (no intermediate
+        // reassembly copy). As each held message is fully drained, re-post its
+        // buffer and record that we now owe the peer one credit — so credit is
+        // returned on *consumption*, not receipt.
+        let mut written = 0;
+        while written < out.len() {
+            let Some(&ReadyMsg { slot, start, end }) = self.rx_ready.front() else {
+                break;
+            };
+            let take = (end - start).min(out.len() - written);
+            out[written..written + take].copy_from_slice(&self.recv_buf[start..start + take]);
+            written += take;
+            if start + take == end {
+                // Message fully drained: free its buffer and owe a credit.
+                self.rx_ready.pop_front();
+                self.repost_recv(slot)?;
+                self.grant_pending += 1;
+            } else {
+                // Partially drained: advance the read cursor and stop (`out` full).
+                self.rx_ready.front_mut().unwrap().start = start + take;
+            }
         }
-        self.rx.drain(..n);
+
         // Returning data frees receive capacity; let the peer know.
         self.maybe_flush_credits()?;
-        Ok(n)
+        Ok(written)
     }
 }
 
