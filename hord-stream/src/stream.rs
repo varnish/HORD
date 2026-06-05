@@ -46,7 +46,9 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
-use hord_core::{Completion, Connection, Listener, Opcode, RegisteredBuffer, ACCESS_LOCAL_WRITE};
+use hord_core::{
+    CmParams, Completion, Connection, Listener, Opcode, RegisteredBuffer, ACCESS_LOCAL_WRITE,
+};
 
 use crate::envelope::{flags as env_flags, Envelope, ENVELOPE_LEN};
 use crate::handshake::{Handshake, HANDSHAKE_LEN};
@@ -61,6 +63,8 @@ pub struct HordConfig {
     pub recv_pool_size: usize,
     /// Send staging buffers per connection.
     pub send_pool_size: usize,
+    /// Connection-manager retry / timeout parameters (#11).
+    pub cm: CmParams,
 }
 
 impl Default for HordConfig {
@@ -69,6 +73,7 @@ impl Default for HordConfig {
             max_message_size: 65536,
             recv_pool_size: 32,
             send_pool_size: 16,
+            cm: CmParams::default(),
         }
     }
 }
@@ -160,6 +165,7 @@ impl HordStream {
             config.send_pool_size + CTRL_SEND_SLOTS,
             config.recv_pool_size + CTRL_RECV_SLACK,
             HANDSHAKE_LEN,
+            config.cm,
         )?;
         let mut s = HordStream::new_common(conn, config)?;
         let peer = Handshake::decode(&peer_bytes)?;
@@ -177,6 +183,7 @@ impl HordStream {
             port,
             config.send_pool_size + CTRL_SEND_SLOTS,
             config.recv_pool_size + CTRL_RECV_SLACK,
+            config.cm,
         )?;
         let mut s = HordStream::new_common(conn, config)?;
         let my = Handshake::new(config.max_message_size as u32, config.recv_pool_size as u16);

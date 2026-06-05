@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,10 +21,19 @@ struct hord_conn {
     struct rdma_event_channel *ec; /* per-connection channel (migrated/owned) */
     struct rdma_cm_id *id;
     struct ibv_pd *pd;
+    struct ibv_comp_channel *comp_channel; /* CQ completion channel (pollable fd) */
     struct ibv_cq *cq;
     struct ibv_qp *qp;
     int disconnected;
 };
+
+/* Set O_NONBLOCK on an fd. Returns 0 on success, -1 on failure. */
+static int set_nonblock(int fd) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0)
+        return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
 
 /* ---- error helpers --------------------------------------------------- */
 
@@ -102,7 +112,22 @@ static int build_endpoint(struct hord_conn *c, int send_wr, int recv_wr,
         set_err(err, errlen, "ibv_alloc_pd");
         return -1;
     }
-    c->cq = ibv_create_cq(c->id->verbs, cqe, NULL, NULL, 0);
+    /* Completion channel: gives the CQ a pollable fd. The async layer arms the
+     * CQ (ibv_req_notify_cq), waits on this fd, then drains — instead of
+     * busy-polling. The sync layer ignores it and just polls the CQ directly,
+     * which works regardless: an un-armed channel never delivers notifications. */
+    c->comp_channel = ibv_create_comp_channel(c->id->verbs);
+    if (!c->comp_channel) {
+        set_err(err, errlen, "ibv_create_comp_channel");
+        return -1;
+    }
+    /* Non-blocking so ibv_get_cq_event() (a read() under the hood) returns
+     * EAGAIN rather than blocking a reactor thread on a spurious wakeup. */
+    if (set_nonblock(c->comp_channel->fd)) {
+        set_err(err, errlen, "fcntl(comp_channel, O_NONBLOCK)");
+        return -1;
+    }
+    c->cq = ibv_create_cq(c->id->verbs, cqe, NULL, c->comp_channel, 0);
     if (!c->cq) {
         set_err(err, errlen, "ibv_create_cq");
         return -1;
@@ -217,6 +242,7 @@ hord_conn *hord_accept_begin(hord_listener *l,
 
 int hord_accept_finish(hord_conn *c,
                        const uint8_t *my_priv, uint32_t my_priv_len,
+                       uint8_t rnr_retry_count,
                        char *err, size_t errlen) {
     if (my_priv_len > 255) {
         /* private_data_len is a uint8_t; reject rather than silently truncate. */
@@ -229,7 +255,7 @@ int hord_accept_finish(hord_conn *c,
     cp.private_data_len = (uint8_t)my_priv_len;
     cp.responder_resources = 1;
     cp.initiator_depth = 1;
-    cp.rnr_retry_count = 7; /* 7 == "infinite" RNR retry */
+    cp.rnr_retry_count = rnr_retry_count; /* caller's choice; 7 == "infinite" */
 
     if (rdma_accept(c->id, &cp)) {
         set_err(err, errlen, "rdma_accept");
@@ -244,6 +270,7 @@ int hord_accept_finish(hord_conn *c,
 
 hord_conn *hord_connect_begin(const char *ip, uint16_t port,
                               int send_wr, int recv_wr, int cqe,
+                              int resolve_timeout_ms,
                               char *err, size_t errlen) {
     struct sockaddr_in sa;
     if (fill_sockaddr(ip, port, &sa, err, errlen))
@@ -263,13 +290,13 @@ hord_conn *hord_connect_begin(const char *ip, uint16_t port,
         set_err(err, errlen, "rdma_create_id");
         goto fail;
     }
-    if (rdma_resolve_addr(c->id, NULL, (struct sockaddr *)&sa, 2000)) {
+    if (rdma_resolve_addr(c->id, NULL, (struct sockaddr *)&sa, resolve_timeout_ms)) {
         set_err(err, errlen, "rdma_resolve_addr");
         goto fail;
     }
     if (expect_event(c->ec, RDMA_CM_EVENT_ADDR_RESOLVED, NULL, err, errlen))
         goto fail;
-    if (rdma_resolve_route(c->id, 2000)) {
+    if (rdma_resolve_route(c->id, resolve_timeout_ms)) {
         set_err(err, errlen, "rdma_resolve_route");
         goto fail;
     }
@@ -287,6 +314,7 @@ fail:
 
 int hord_connect_finish(hord_conn *c,
                         const uint8_t *my_priv, uint32_t my_priv_len,
+                        uint8_t retry_count, uint8_t rnr_retry_count,
                         uint8_t *peer_priv, size_t peer_priv_cap,
                         uint32_t *peer_priv_len,
                         char *err, size_t errlen) {
@@ -301,8 +329,8 @@ int hord_connect_finish(hord_conn *c,
     cp.private_data_len = (uint8_t)my_priv_len;
     cp.responder_resources = 1;
     cp.initiator_depth = 1;
-    cp.retry_count = 7;
-    cp.rnr_retry_count = 7;
+    cp.retry_count = retry_count;
+    cp.rnr_retry_count = rnr_retry_count;
 
     if (rdma_connect(c->id, &cp)) {
         set_err(err, errlen, "rdma_connect");
@@ -402,6 +430,85 @@ int hord_poll(hord_conn *c, uint64_t *wr_id, uint32_t *byte_len,
     return 1;
 }
 
+/* ---- async readiness ------------------------------------------------- */
+
+/* The CQ completion-channel fd. Readable (after arming) when a completion has
+ * been signalled. The async layer registers it with an event loop. */
+int hord_conn_cq_fd(hord_conn *c) {
+    if (!c || !c->comp_channel)
+        return -1;
+    return c->comp_channel->fd;
+}
+
+/* Arm the CQ to signal the completion channel on the next completion. Must be
+ * called before each wait, and re-called after draining (notifications are
+ * one-shot). */
+int hord_cq_arm(hord_conn *c, char *err, size_t errlen) {
+    if (!c || !c->cq) {
+        set_msg(err, errlen, "no CQ");
+        return -1;
+    }
+    if (ibv_req_notify_cq(c->cq, 0)) {
+        set_err(err, errlen, "ibv_req_notify_cq");
+        return -1;
+    }
+    return 0;
+}
+
+/* Drain and acknowledge all pending completion-channel notifications (the fd is
+ * non-blocking, so this returns once the channel is empty). Returns the count
+ * consumed (>= 0); never an error in practice. The caller re-arms with
+ * hord_cq_arm and drains the CQ itself via hord_poll. Acking is required before
+ * the CQ can be destroyed. */
+int hord_cq_consume(hord_conn *c) {
+    if (!c || !c->comp_channel || !c->cq)
+        return 0;
+    struct ibv_cq *ev_cq;
+    void *ev_ctx;
+    int n = 0;
+    while (ibv_get_cq_event(c->comp_channel, &ev_cq, &ev_ctx) == 0)
+        n++;
+    if (n > 0)
+        ibv_ack_cq_events(c->cq, (unsigned int)n);
+    return n;
+}
+
+/* The connection's CM event-channel fd. After the handshake the caller flips it
+ * non-blocking (hord_conn_cm_set_nonblock) and polls it for DISCONNECTED. */
+int hord_conn_cm_fd(hord_conn *c) {
+    if (!c || !c->ec)
+        return -1;
+    return c->ec->fd;
+}
+
+/* Make the CM channel non-blocking. Called only after the handshake completes:
+ * the setup path (expect_event) relies on the channel being blocking. */
+int hord_conn_cm_set_nonblock(hord_conn *c) {
+    if (!c || !c->ec)
+        return -1;
+    return set_nonblock(c->ec->fd);
+}
+
+/* Non-blocking check for a peer-initiated teardown. Returns 1 if a
+ * DISCONNECTED / device-removal / connect-error event is pending (and acks it),
+ * 0 if no event (or an unrelated one, which is acked and ignored), -1 on error.
+ * Requires the CM channel to be non-blocking (see hord_conn_cm_set_nonblock). */
+int hord_conn_check_disconnect(hord_conn *c) {
+    if (!c || !c->ec)
+        return -1;
+    struct rdma_cm_event *ev = NULL;
+    if (rdma_get_cm_event(c->ec, &ev)) {
+        if (errno == EAGAIN)
+            return 0;
+        return -1;
+    }
+    int disc = (ev->event == RDMA_CM_EVENT_DISCONNECTED ||
+                ev->event == RDMA_CM_EVENT_DEVICE_REMOVAL ||
+                ev->event == RDMA_CM_EVENT_CONNECT_ERROR);
+    rdma_ack_cm_event(ev);
+    return disc ? 1 : 0;
+}
+
 /* ---- teardown -------------------------------------------------------- */
 
 void hord_disconnect(hord_conn *c) {
@@ -427,8 +534,15 @@ void hord_conn_shutdown(hord_conn *c) {
         c->qp = NULL;
     }
     if (c->cq) {
+        /* Ack any notification armed-but-not-yet-consumed, or ibv_destroy_cq
+         * fails with EBUSY and the CQ leaks. */
+        hord_cq_consume(c);
         ibv_destroy_cq(c->cq);
         c->cq = NULL;
+    }
+    if (c->comp_channel) {
+        ibv_destroy_comp_channel(c->comp_channel);
+        c->comp_channel = NULL;
     }
 }
 

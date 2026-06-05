@@ -13,11 +13,14 @@
  *      buffers — never the layout-sensitive verbs/CM structs. That removes a
  *      whole class of FFI struct-layout bugs.
  *
- * The shim is intentionally synchronous and single-connection-at-a-time, which
- * is all the first prototype needs. Connection setup is two-phase
- * (begin -> [caller registers MRs and posts receives] -> finish) so the caller
- * can pre-post receive buffers before the QP becomes usable, avoiding an
- * initial receiver-not-ready (RNR) storm.
+ * Connection *setup* is synchronous (the CM handshake uses blocking event
+ * waits) and two-phase (begin -> [caller registers MRs and posts receives] ->
+ * finish) so the caller can pre-post receive buffers before the QP becomes
+ * usable, avoiding an initial receiver-not-ready (RNR) storm. The *data path*
+ * can be driven either by busy-polling the CQ (hord_poll) or asynchronously: the
+ * CQ has a completion channel whose fd (hord_conn_cq_fd) an event loop can wait
+ * on, and the connection's CM fd (hord_conn_cm_fd) can be polled for a
+ * peer-initiated disconnect. See "Async readiness" below.
  *
  * Every fallible call takes an (err, errlen) pair. On failure a human-readable
  * message is written there and the function returns NULL / a negative value.
@@ -67,24 +70,30 @@ hord_conn *hord_accept_begin(hord_listener *l,
                              char *err, size_t errlen);
 
 /* Accept the connection, sending our handshake as CM private data, and block
- * until the connection is ESTABLISHED. */
+ * until the connection is ESTABLISHED. rnr_retry_count is the receiver-not-ready
+ * retry count (7 == infinite, the old hardcoded default). */
 int hord_accept_finish(hord_conn *c,
                        const uint8_t *my_priv, uint32_t my_priv_len,
+                       uint8_t rnr_retry_count,
                        char *err, size_t errlen);
 
 /* ---- Client ---------------------------------------------------------- */
 
 /* Resolve address + route to ip:port and create the PD/CQ/QP. The connection
  * is NOT yet connected — register MRs and post receives, then call
- * hord_connect_finish(). */
+ * hord_connect_finish(). resolve_timeout_ms bounds each of the address/route
+ * resolution steps (old hardcoded default 2000). */
 hord_conn *hord_connect_begin(const char *ip, uint16_t port,
                               int send_wr, int recv_wr, int cqe,
+                              int resolve_timeout_ms,
                               char *err, size_t errlen);
 
 /* Connect, sending our handshake as CM private data, block until ESTABLISHED,
- * and copy the peer's handshake into peer_priv. */
+ * and copy the peer's handshake into peer_priv. retry_count / rnr_retry_count
+ * are the transport and receiver-not-ready retry counts (old default 7 / 7). */
 int hord_connect_finish(hord_conn *c,
                         const uint8_t *my_priv, uint32_t my_priv_len,
+                        uint8_t retry_count, uint8_t rnr_retry_count,
                         uint8_t *peer_priv, size_t peer_priv_cap,
                         uint32_t *peer_priv_len,
                         char *err, size_t errlen);
@@ -112,6 +121,31 @@ int hord_post_send(hord_conn *c, uint64_t wr_id, void *addr, uint32_t length,
  * completion may still carry a non-success status in *status. */
 int hord_poll(hord_conn *c, uint64_t *wr_id, uint32_t *byte_len,
               uint32_t *opcode, uint32_t *status, char *err, size_t errlen);
+
+/* ---- Async readiness ------------------------------------------------- */
+
+/* The CQ completion-channel fd, for registration with an event loop. Readable
+ * (after arming) when a completion has been signalled. */
+int hord_conn_cq_fd(hord_conn *c);
+
+/* Arm the CQ to signal its completion channel on the next completion. One-shot:
+ * re-arm after each drain. */
+int hord_cq_arm(hord_conn *c, char *err, size_t errlen);
+
+/* Drain + acknowledge all pending completion-channel notifications (the fd is
+ * non-blocking). Returns the count consumed. Re-arm and poll the CQ after. */
+int hord_cq_consume(hord_conn *c);
+
+/* The connection's CM event-channel fd. */
+int hord_conn_cm_fd(hord_conn *c);
+
+/* Flip the CM channel non-blocking. Call only after the handshake — setup uses
+ * blocking CM waits. */
+int hord_conn_cm_set_nonblock(hord_conn *c);
+
+/* Non-blocking check for peer-initiated teardown. 1 = disconnect pending (and
+ * acked), 0 = none/unrelated, -1 = error. Needs a non-blocking CM channel. */
+int hord_conn_check_disconnect(hord_conn *c);
 
 /* ---- Teardown -------------------------------------------------------- */
 
