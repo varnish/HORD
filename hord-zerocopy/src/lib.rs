@@ -38,8 +38,10 @@ pub const HEADER: &str = "X-HORD-RDMA-Write";
 
 /// A parsed `X-HORD-RDMA-Write` *request* header: the client's registered
 /// destination region. `addr`/`rkey`/`len` tell the server where it may place
-/// the response body. `id` (optional) requests split mode (§7.7) — not yet
-/// implemented, so a server ignores it and performs a plain write.
+/// the response body. `id` (optional) requests split mode (§7.7): when present
+/// and split mode is negotiated, the server delivers the body with RDMA
+/// write-with-immediate carrying this ID; otherwise it is ignored and the server
+/// performs a plain write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RdmaWriteReq {
     /// Start address of the client's registered receive buffer (its virtual
@@ -180,6 +182,7 @@ fn parse_hex_u32(s: &str) -> Option<u32> {
 /// [`copy_out`](Self::copy_out).
 pub struct ZeroCopyRequest {
     buf: RegisteredBuffer,
+    id: Option<u32>,
 }
 
 impl ZeroCopyRequest {
@@ -194,16 +197,32 @@ impl ZeroCopyRequest {
     /// `register_remote_writable` — so the async client gets the same request
     /// descriptor / verify path as the sync client without re-deriving it.
     pub fn from_buffer(buf: RegisteredBuffer) -> Self {
-        ZeroCopyRequest { buf }
+        ZeroCopyRequest { buf, id: None }
     }
 
-    /// The request descriptor (`addr`/`rkey`/`len`) for this buffer.
+    /// Request split mode (§7.7) for this transfer: the emitted header carries
+    /// `id=<transfer_id>`, and a split-capable server delivers the body via RDMA
+    /// write-with-immediate, signalling `transfer_id` on the data-plane CQ (see
+    /// [`SplitReceiver`]). Gate on [`HordStream::split_mode_negotiated`] before
+    /// using it — on a non-split connection the `id` is simply ignored by the
+    /// server. Chainable on [`new`](Self::new) / [`from_buffer`](Self::from_buffer).
+    pub fn with_id(mut self, transfer_id: u32) -> Self {
+        self.id = Some(transfer_id);
+        self
+    }
+
+    /// The split-mode transfer ID this request advertises, if any.
+    pub fn id(&self) -> Option<u32> {
+        self.id
+    }
+
+    /// The request descriptor (`addr`/`rkey`/`len`[/`id`]) for this buffer.
     pub fn request(&self) -> RdmaWriteReq {
         RdmaWriteReq {
             addr: self.buf.as_mut_ptr() as u64,
             rkey: self.buf.rkey(),
             len: self.buf.len() as u64,
-            id: None,
+            id: self.id,
         }
     }
 
@@ -227,7 +246,8 @@ impl ZeroCopyRequest {
 
 // ---- server orchestration ----------------------------------------------------
 
-/// Perform the server side of a zero-copy response (spec §7.3).
+/// Perform the server side of a zero-copy response (spec §7.3, and §7.7 in split
+/// mode).
 ///
 /// If `object_size` fits the client's advertised buffer (`req.len`), register a
 /// source region, let `fill` populate it, RDMA-write it into the client's
@@ -236,9 +256,16 @@ impl ZeroCopyRequest {
 /// returned status into the HTTP response header — always with `Content-Length:
 /// 0` for `Complete` (the bytes travel out-of-band).
 ///
+/// **Split mode (§7.7).** When `req.id` is present *and*
+/// [`HordStream::split_mode_negotiated`] holds, the body is delivered with RDMA
+/// write-with-immediate carrying `req.id`, so the client's data plane is
+/// signalled on its CQ (the HTTP response is still returned, as §7.7.4 step 3).
+/// Otherwise `req.id` is ignored and a plain write is used. Either way the
+/// returned status is the same — split vs. plain is purely a delivery mechanism.
+///
 /// Gate on [`HordStream::zero_copy_negotiated`] (and your own policy) before
 /// calling. On a transport failure mid-write the stream is closed and an `Err`
-/// is returned; the caller MUST NOT report `complete` in that case (§7.4).
+/// is returned; the caller MUST NOT report `complete` in that case (§7.4/§7.7.7).
 ///
 /// The source region is registered per call and released once the write is
 /// acknowledged. A production server would amortize registration with a pool
@@ -252,19 +279,122 @@ pub fn serve_rdma_write(
     if object_size > req.len {
         return Ok(RdmaWriteStatus::TooLarge { object_size });
     }
-    if object_size == 0 {
-        // Nothing to place; a zero-length MR is not portable, so short-circuit.
-        return Ok(RdmaWriteStatus::Complete { bytes_written: 0 });
+    // Use split mode only if the client asked (id present) and we negotiated it;
+    // otherwise the id is ignored (§7.7.3).
+    let split_id = req.id.filter(|_| stream.split_mode_negotiated());
+
+    match split_id {
+        // --- split mode: deliver via write-with-immediate (§7.7) ---
+        Some(transfer_id) => {
+            // The immediate must always be delivered so the data plane's posted
+            // transfer credit is consumed and its `poll_completion` returns — even
+            // for a zero-length object. A zero-length MR is not portable, so back
+            // an empty body with a 1-byte source (the WR still writes 0 bytes).
+            let n = object_size as usize;
+            let src = stream.register_source(n.max(1))?;
+            if n > 0 {
+                fill(&src);
+            }
+            stream.rdma_write_all_with_imm(&src, 0, req.addr, req.rkey, n, transfer_id)?;
+            Ok(RdmaWriteStatus::Complete {
+                bytes_written: object_size,
+            })
+        }
+        // --- plain zero-copy write (§7.3) ---
+        None => {
+            if object_size == 0 {
+                // Nothing to place; a zero-length MR is not portable, so
+                // short-circuit (no data plane is waiting in plain mode).
+                return Ok(RdmaWriteStatus::Complete { bytes_written: 0 });
+            }
+            let n = object_size as usize;
+            let src = stream.register_source(n)?;
+            fill(&src);
+            stream.rdma_write_all(&src, 0, req.addr, req.rkey, n)?;
+            // `src` drops here: rdma_write_all blocked until the write completed
+            // and was acked, so no DMA references the MR — deregistration is sound.
+            Ok(RdmaWriteStatus::Complete {
+                bytes_written: object_size,
+            })
+        }
     }
-    let n = object_size as usize;
-    let src = stream.register_source(n)?;
-    fill(&src);
-    stream.rdma_write_all(&src, 0, req.addr, req.rkey, n)?;
-    // `src` drops here: rdma_write_all blocked until the write completed and was
-    // acked, so no DMA references the MR — deregistration is sound.
-    Ok(RdmaWriteStatus::Complete {
-        bytes_written: object_size,
-    })
+}
+
+// ---- client data plane (spec §7.7) -------------------------------------------
+
+/// A completed split-mode transfer, identified by the `id` the client placed in
+/// its `X-HORD-RDMA-Write` request ([`ZeroCopyRequest::with_id`]). By the time
+/// this is returned the payload is fully in the client's registered buffer (QP
+/// ordering guarantees the write landed before the immediate's completion,
+/// §7.7.2), so the consumer can use it immediately without the HTTP response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitCompletion {
+    /// The transfer ID, echoed from the write-with-immediate's `imm_data`.
+    pub transfer_id: u32,
+}
+
+/// The client's *data plane* for protocol splitting (§7.7): payload completions
+/// arrive straight off the CQ — keyed by transfer ID, with no HTTP parsing — for
+/// requests issued with [`ZeroCopyRequest::with_id`]. The consumer maps each
+/// returned [`SplitCompletion::transfer_id`] back to the buffer it advertised.
+///
+/// In this prototype the data plane shares the one driver task — and the one
+/// [`HordStream`] — with the control plane (see PROTOTYPE.md, "single-task
+/// driver"), so a `SplitReceiver` *borrows* the stream for a poll rather than
+/// owning an independent CQ waiter. The intended use is: the control plane issues
+/// its requests, then the data plane drains completions. A production split would
+/// run the data plane on its own thread polling the shared CQ directly; that
+/// needs a multi-waiter scheme and is deferred.
+pub struct SplitReceiver<'s> {
+    stream: &'s mut HordStream,
+}
+
+impl<'s> SplitReceiver<'s> {
+    /// Borrow `stream` as a data-plane receiver. Errors if protocol splitting was
+    /// not negotiated on this connection (gate with
+    /// [`HordStream::split_mode_negotiated`]).
+    pub fn new(stream: &'s mut HordStream) -> io::Result<Self> {
+        if !stream.split_mode_negotiated() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "protocol splitting (§7.7) was not negotiated on this connection",
+            ));
+        }
+        Ok(SplitReceiver { stream })
+    }
+
+    /// Block until the next transfer completes, returning its [`SplitCompletion`]
+    /// — or `None` if the connection closed first. Mirrors the spec §13.2
+    /// `poll_completion()` shape (synchronous here; the async stream parks on the
+    /// completion fd instead of busy-polling).
+    pub fn poll_completion(&mut self) -> io::Result<Option<SplitCompletion>> {
+        Ok(self
+            .stream
+            .poll_completed_transfer()?
+            .map(|transfer_id| SplitCompletion { transfer_id }))
+    }
+
+    /// Non-blocking: drain the CQ once and return a transfer if one is already
+    /// complete, else `None`. A `None` here means "nothing ready *yet*" — it does
+    /// NOT signal end-of-stream; a consumer looping on `try_completion` MUST also
+    /// check [`is_closed`](Self::is_closed) to detect a closed connection (unlike
+    /// the blocking [`poll_completion`](Self::poll_completion), whose `None` is
+    /// EOF). This asymmetry is why `is_closed` exists.
+    pub fn try_completion(&mut self) -> io::Result<Option<SplitCompletion>> {
+        self.stream.drain_completions()?;
+        Ok(self
+            .stream
+            .next_completed_transfer()
+            .map(|transfer_id| SplitCompletion { transfer_id }))
+    }
+
+    /// Whether the connection has closed. A non-blocking consumer driving
+    /// [`try_completion`](Self::try_completion) checks this to distinguish EOF
+    /// from "no transfer ready yet" — once `is_closed()` is true and
+    /// `try_completion` returns `None`, no further transfers will arrive.
+    pub fn is_closed(&self) -> bool {
+        self.stream.is_closed()
+    }
 }
 
 #[cfg(test)]

@@ -23,11 +23,12 @@ pub const VERSION: u16 = 1;
 pub const HANDSHAKE_LEN: usize = 16;
 
 /// Capability flags (spec 5.3). Bit 0 (`ZERO_COPY_CAPABLE`) is negotiated as of
-/// Pass 4; split mode (§7.7) is not yet implemented.
+/// Pass 4; bit 1 (`SPLIT_MODE_CAPABLE`) as of Pass 7.
 pub mod flags {
     /// Peer supports the zero-copy extension (spec §7).
     pub const ZERO_COPY_CAPABLE: u16 = 1 << 0;
-    /// Peer supports protocol splitting (spec §7.7). Not yet implemented.
+    /// Peer supports protocol splitting (spec §7.7). Per §5.3 this requires
+    /// `ZERO_COPY_CAPABLE`; a peer MUST NOT set it without bit 0.
     pub const SPLIT_MODE_CAPABLE: u16 = 1 << 1;
 }
 
@@ -62,6 +63,23 @@ impl Handshake {
     /// Whether this handshake advertises the zero-copy extension (spec §7).
     pub fn zero_copy_capable(&self) -> bool {
         self.flags & flags::ZERO_COPY_CAPABLE != 0
+    }
+
+    /// Advertise (or clear) the `SPLIT_MODE_CAPABLE` flag (spec §7.7). Chainable.
+    /// The caller is responsible for the §5.3 dependency — only set this when
+    /// zero-copy is also advertised.
+    pub fn with_split_mode(mut self, on: bool) -> Self {
+        if on {
+            self.flags |= flags::SPLIT_MODE_CAPABLE;
+        } else {
+            self.flags &= !flags::SPLIT_MODE_CAPABLE;
+        }
+        self
+    }
+
+    /// Whether this handshake advertises protocol splitting (spec §7.7).
+    pub fn split_mode_capable(&self) -> bool {
+        self.flags & flags::SPLIT_MODE_CAPABLE != 0
     }
 
     /// Serialise to the 16-byte wire form.
@@ -144,5 +162,23 @@ mod tests {
 
         // Setter is idempotent / clearable.
         assert!(!on.with_zero_copy(false).zero_copy_capable());
+    }
+
+    #[test]
+    fn split_mode_flag_round_trips_independently() {
+        let plain = Handshake::new(65536, 32);
+        assert!(!plain.split_mode_capable());
+
+        // Split mode is a distinct bit from zero-copy: setting one leaves the
+        // other untouched.
+        let both = Handshake::new(65536, 32)
+            .with_zero_copy(true)
+            .with_split_mode(true);
+        let decoded = Handshake::decode(&both.encode()).unwrap();
+        assert!(decoded.zero_copy_capable());
+        assert!(decoded.split_mode_capable());
+
+        assert!(!both.with_split_mode(false).split_mode_capable());
+        assert!(both.with_split_mode(false).zero_copy_capable());
     }
 }

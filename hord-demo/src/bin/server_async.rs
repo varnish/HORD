@@ -174,11 +174,52 @@ async fn serve(req: Request<Incoming>, stream: SharedAsyncStream) -> Result<Resp
 /// Deliver a `/size/<n>` body by RDMA-writing it into the client's buffer, then
 /// return a bodiless response with the outcome. The write is awaited before the
 /// response is built, so the payload has landed by the time the client reads it.
+///
+/// In split mode (§7.7) — the request carries an `id` and we negotiated it — the
+/// body is delivered with RDMA write-with-immediate, signalling the data plane on
+/// the client's CQ; otherwise a plain one-sided write. The HTTP response is the
+/// same either way (split vs. plain is purely the delivery mechanism, §7.7.4).
 async fn serve_zero_copy(stream: &SharedAsyncStream, req: &RdmaWriteReq, n: usize) -> Response<DemoBody> {
     if n as u64 > req.len {
         eprintln!("[server] -> 413 (zero-copy: too_large object_size={n})");
         return zc_response(413, RdmaWriteStatus::TooLarge { object_size: n as u64 });
     }
+    // Use split mode only if the client asked (id present) and we negotiated it
+    // (§7.7.3); otherwise the id is ignored and a plain write is used.
+    let split_id = req.id.filter(|_| stream.split_mode_negotiated());
+
+    if let Some(id) = split_id {
+        // On the *success* path the immediate is delivered (so the data plane's
+        // posted transfer credit is consumed and its poll returns) — even for an
+        // empty body, backed by a 1-byte source (the WR still writes 0 bytes).
+        // NOTE: the 413/too_large early return above and the register_source-500
+        // below do NOT deliver an immediate; per §7.7.7 those are control-plane
+        // fallbacks the client reconciles via the HTTP status, and a data-plane
+        // consumer must bound its wait with a timeout (§7.7.7) rather than assume
+        // every request yields a CQ completion.
+        let src = match stream.register_source(n.max(1)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[server] register_source failed: {e}");
+                return respond(500, "text/plain", full(b"internal error\n"), None);
+            }
+        };
+        if n > 0 {
+            pattern_fill_registered(&src, n);
+        }
+        return match stream.rdma_write_with_imm(&src, 0, req.addr, req.rkey, n, id).await {
+            Ok(()) => {
+                eprintln!("[server] -> 200 (split: complete id={id} bytes_written={n})");
+                zc_response(200, RdmaWriteStatus::Complete { bytes_written: n as u64 })
+            }
+            Err(e) => {
+                eprintln!("[server] rdma_write_with_imm failed: {e}");
+                respond(500, "text/plain", full(b"rdma write failed\n"), None)
+            }
+        };
+    }
+
+    // --- plain zero-copy write (§7.3) ---
     if n == 0 {
         // Nothing to place; a zero-length MR is not portable, so short-circuit
         // (matching the sync hord_zerocopy::serve_rdma_write path) rather than

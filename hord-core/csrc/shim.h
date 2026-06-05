@@ -45,10 +45,11 @@ struct ibv_mr;
 
 /* Work-completion opcode/status values the caller cares about. These mirror
  * the libibverbs enums (stable ABI values) so Rust need not include verbs.h. */
-#define HORD_WC_STATUS_SUCCESS    0u
-#define HORD_WC_OPCODE_SEND       0u   /* IBV_WC_SEND */
-#define HORD_WC_OPCODE_RDMA_WRITE 1u   /* IBV_WC_RDMA_WRITE */
-#define HORD_WC_OPCODE_RECV       128u /* IBV_WC_RECV */
+#define HORD_WC_STATUS_SUCCESS         0u
+#define HORD_WC_OPCODE_SEND            0u   /* IBV_WC_SEND */
+#define HORD_WC_OPCODE_RDMA_WRITE      1u   /* IBV_WC_RDMA_WRITE */
+#define HORD_WC_OPCODE_RECV            128u /* IBV_WC_RECV */
+#define HORD_WC_OPCODE_RECV_RDMA_IMM   129u /* IBV_WC_RECV_RDMA_WITH_IMM */
 
 /* MR access flags. LOCAL_WRITE is all the stream path needs; the zero-copy
  * extension adds REMOTE_WRITE for the client's destination buffer (the server
@@ -129,11 +130,25 @@ int hord_post_write(hord_conn *c, uint64_t wr_id, void *addr, uint32_t length,
                     uint32_t lkey, uint64_t remote_addr, uint32_t rkey,
                     char *err, size_t errlen);
 
+/* Like hord_post_write, but uses RDMA write-with-immediate (§7.7 protocol
+ * splitting): atomically lands the payload and delivers the 32-bit `imm` to the
+ * peer's CQ as a RECV_RDMA_WITH_IMM completion, consuming one of its posted
+ * receive WRs. `imm` is a host-order value (the shim handles the __be32 wire
+ * conversion). `length` may be 0 — the WR then carries only the immediate.
+ * The sender's own completion opcode is still HORD_WC_OPCODE_RDMA_WRITE. */
+int hord_post_write_with_imm(hord_conn *c, uint64_t wr_id, void *addr,
+                             uint32_t length, uint32_t lkey,
+                             uint64_t remote_addr, uint32_t rkey, uint32_t imm,
+                             char *err, size_t errlen);
+
 /* Poll for one completion. Returns 1 and fills the out-params if a completion
  * was available, 0 if the CQ was empty, or -1 on a poll error. A retrieved
- * completion may still carry a non-success status in *status. */
+ * completion may still carry a non-success status in *status. *imm_data
+ * receives the immediate (host order) for a RECV_RDMA_WITH_IMM completion, else
+ * 0; pass NULL if not needed. */
 int hord_poll(hord_conn *c, uint64_t *wr_id, uint32_t *byte_len,
-              uint32_t *opcode, uint32_t *status, char *err, size_t errlen);
+              uint32_t *opcode, uint32_t *status, uint32_t *imm_data,
+              char *err, size_t errlen);
 
 /* ---- Async readiness ------------------------------------------------- */
 

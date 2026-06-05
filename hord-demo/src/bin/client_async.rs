@@ -20,7 +20,7 @@ use http_body_util::{BodyExt, Empty};
 use hyper::Request;
 use hyper_util::rt::TokioIo;
 
-use hord_async::AsyncHordStream;
+use hord_async::{AsyncHordStream, SharedAsyncStream};
 use hord_demo::{size_from_path, verify_stream_body, verify_zero_copy};
 use hord_stream::HordConfig;
 use hord_zerocopy::{RdmaWriteStatus, ZeroCopyRequest, HEADER};
@@ -28,6 +28,7 @@ use hord_zerocopy::{RdmaWriteStatus, ZeroCopyRequest, HEADER};
 const DEFAULT_SERVER: &str = "77.40.251.67";
 const DEFAULT_PORT: u16 = 4791;
 const DEFAULT_ZC_BUF: usize = 1 << 20; // 1 MiB, when the size isn't in the path
+const DEFAULT_SPLIT_COUNT: usize = 4; // transfers issued by --split
 const DEADLINE: Duration = Duration::from_secs(120); // bound the whole exchange (#11)
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -39,6 +40,8 @@ fn main() -> ExitCode {
     let mut quiet = false;
     let mut zero_copy = false;
     let mut zc_buf: Option<usize> = None;
+    let mut split = false;
+    let mut count = DEFAULT_SPLIT_COUNT;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -48,11 +51,15 @@ fn main() -> ExitCode {
             "--path" => path = args.next().unwrap_or(path),
             "--zero-copy" => zero_copy = true,
             "--zc-buf" => zc_buf = args.next().and_then(|n| n.parse().ok()),
+            "--split" => split = true,
+            "--count" => count = args.next().and_then(|n| n.parse().ok()).unwrap_or(count),
             "--quiet" => quiet = true,
             "-h" | "--help" => {
                 eprintln!(
                     "usage: hord-client-async [--server <ip>] [--port <port>] [--path <path>] \
-                     [--zero-copy] [--zc-buf <bytes>] [--quiet]"
+                     [--zero-copy] [--zc-buf <bytes>] [--split] [--count <n>] [--quiet]\n\
+                     \n  --split   issue --count GETs (default {DEFAULT_SPLIT_COUNT}) in split mode (§7.7); \
+                     payloads are collected off the CQ by transfer id, not from the HTTP body."
                 );
                 return ExitCode::SUCCESS;
             }
@@ -76,8 +83,15 @@ fn main() -> ExitCode {
     // A LocalSet lets us spawn_local the hyper connection task (the stream is
     // !Send, so it cannot use tokio::spawn on a multi-thread runtime).
     let local = tokio::task::LocalSet::new();
-    let opts = Opts { server, port, path, zero_copy, zc_buf, quiet };
-    match rt.block_on(local.run_until(run(opts))) {
+    let opts = Opts { server, port, path, zero_copy, zc_buf, split, count, quiet };
+    let fut = async {
+        if opts.split {
+            run_split(opts).await
+        } else {
+            run(opts).await
+        }
+    };
+    match rt.block_on(local.run_until(fut)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("[client] error: {e}");
@@ -92,11 +106,13 @@ struct Opts {
     path: String,
     zero_copy: bool,
     zc_buf: Option<usize>,
+    split: bool,
+    count: usize,
     quiet: bool,
 }
 
 async fn run(opts: Opts) -> Result<(), BoxError> {
-    let Opts { server, port, path, zero_copy, zc_buf, quiet } = opts;
+    let Opts { server, port, path, zero_copy, zc_buf, quiet, .. } = opts;
     let config = HordConfig::default();
     if !quiet {
         eprintln!("[client] connecting to {server}:{port} ...");
@@ -224,6 +240,160 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
     println!("throughput:  {throughput:.1} MiB/s");
     if verified {
         println!("integrity:   OK (byte pattern verified)");
+    }
+    Ok(())
+}
+
+/// Protocol-splitting client (spec §7.7): issue `count` GETs, each advertising a
+/// distinct buffer with a split `id`, then collect the payloads off the CQ — by
+/// transfer id, with no HTTP body parsing.
+///
+/// Driver model (single-task, per hord-async): the `hyper` control plane runs on
+/// its own connection task and reaps every data-plane completion into the
+/// stream's transfer queue while it reads each (empty) HTTP response. Once the
+/// control plane is done, the data plane drains that queue — so the payloads were
+/// already signalled on the CQ, independent of (in fact before) we looked. The
+/// shared handle lets both planes reach the one stream without a second CQ waiter
+/// (which the prototype does not support).
+async fn run_split(opts: Opts) -> Result<(), BoxError> {
+    let Opts { server, port, path, zc_buf, count, quiet, .. } = opts;
+    if count == 0 {
+        return Err("--count must be >= 1".into());
+    }
+    let config = HordConfig::default();
+    if !quiet {
+        eprintln!("[client] connecting to {server}:{port} (split mode) ...");
+    }
+    let stream = AsyncHordStream::connect(&server, port, &config)?;
+    if !stream.zero_copy_negotiated() || !stream.split_mode_negotiated() {
+        return Err(format!(
+            "peer did not negotiate split mode (zero_copy={}, split={})",
+            stream.zero_copy_negotiated(),
+            stream.split_mode_negotiated()
+        )
+        .into());
+    }
+
+    // One destination buffer per transfer, each advertised with a distinct id.
+    // A zero-length MR is not portable, so floor the capacity at 1 (lets
+    // /size/0 still drive a completion).
+    let object_size = size_from_path(&path);
+    let capacity = zc_buf.or(object_size).unwrap_or(DEFAULT_ZC_BUF).max(1);
+    let shared = SharedAsyncStream::new(stream);
+    let mut reqs: Vec<ZeroCopyRequest> = Vec::with_capacity(count);
+    for i in 0..count {
+        let zc = ZeroCopyRequest::from_buffer(shared.register_remote_writable(capacity)?)
+            .with_id(i as u32);
+        reqs.push(zc);
+    }
+    if !quiet {
+        eprintln!("[client] split: {count} transfers, {capacity}-byte buffers, path {path}");
+    }
+
+    // Control plane: hyper over one clone of the shared stream.
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake(TokioIo::new(shared.clone())).await?;
+    let conn_task = tokio::task::spawn_local(async move {
+        if let Err(e) = conn.await {
+            eprintln!("[client] connection task ended: {e}");
+        }
+    });
+
+    // Issue the GETs sequentially (http1 keep-alive). We await each response head
+    // only to confirm status=complete and to free the sender for the next
+    // request; the body is empty (the payload travelled out-of-band).
+    let start = Instant::now();
+    for (i, zc) in reqs.iter().enumerate() {
+        let request = Request::builder()
+            .uri(&path)
+            .header("host", server.as_str())
+            .header("user-agent", "hord-client-async/0.1")
+            .header(HEADER, zc.request().header_value())
+            .body(Empty::<Bytes>::new())?;
+        let (status, zc_status) = tokio::time::timeout(DEADLINE, async {
+            let res = sender.send_request(request).await?;
+            let status = res.status();
+            let zc_status = res
+                .headers()
+                .get(HEADER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(RdmaWriteStatus::parse);
+            res.into_body().collect().await?; // drain the (empty) body
+            Ok::<_, BoxError>((status, zc_status))
+        })
+        .await
+        .map_err(|_| -> BoxError { format!("request {i} timed out").into() })??;
+        match zc_status {
+            Some(RdmaWriteStatus::Complete { .. }) => {
+                if !quiet {
+                    eprintln!("[client] request id={i}: {status} status=complete");
+                }
+            }
+            other => {
+                return Err(format!(
+                    "request id={i}: expected split status=complete, got {status} / {other:?}"
+                )
+                .into());
+            }
+        }
+    }
+
+    // Close the control plane; its task drops its stream clone.
+    drop(sender);
+    let _ = conn_task.await;
+    let control_elapsed = start.elapsed();
+
+    // Data plane: collect `count` completions by id (already reaped above) and
+    // verify each landed payload against the deterministic pattern. Each wait is
+    // bounded by DEADLINE (spec §7.7.7: "Clients SHOULD implement a timeout for
+    // data-plane completions") so a transfer the server reported `complete` over
+    // HTTP but never signalled on the CQ — or any lost immediate — surfaces as a
+    // timeout error instead of hanging forever.
+    let mut seen = std::collections::HashSet::new();
+    let mut verified = 0usize;
+    while seen.len() < count {
+        let next = tokio::time::timeout(DEADLINE, shared.next_split_completion())
+            .await
+            .map_err(|_| -> BoxError {
+                format!(
+                    "data-plane completion timed out after {DEADLINE:?} ({} of {count} received)",
+                    seen.len()
+                )
+                .into()
+            })??;
+        match next {
+            Some(id) => {
+                if !seen.insert(id) {
+                    return Err(format!("transfer id={id} completed twice").into());
+                }
+                let zc = reqs
+                    .get(id as usize)
+                    .ok_or_else(|| -> BoxError { format!("unknown transfer id {id}").into() })?;
+                if let Some(n) = object_size {
+                    let n = n.min(zc.capacity());
+                    if verify_zero_copy(zc, n, &path).map_err(|m: String| -> BoxError { m.into() })? {
+                        verified += 1;
+                    }
+                }
+                if !quiet {
+                    eprintln!("[client] data plane: transfer id={id} landed");
+                }
+            }
+            None => {
+                return Err(format!(
+                    "connection closed; only {} of {count} transfers completed",
+                    seen.len()
+                )
+                .into());
+            }
+        }
+    }
+
+    println!("delivery:    split (RDMA write-with-immediate, §7.7)");
+    println!("transfers:   {count} (collected off the CQ by id)");
+    println!("control:     {control_elapsed:?} (HTTP control plane)");
+    if object_size.is_some() {
+        println!("integrity:   {verified}/{count} payloads verified");
     }
     Ok(())
 }

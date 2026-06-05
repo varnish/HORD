@@ -436,8 +436,42 @@ int hord_post_write(hord_conn *c, uint64_t wr_id, void *addr, uint32_t length,
     return 0;
 }
 
+int hord_post_write_with_imm(hord_conn *c, uint64_t wr_id, void *addr,
+                             uint32_t length, uint32_t lkey,
+                             uint64_t remote_addr, uint32_t rkey, uint32_t imm,
+                             char *err, size_t errlen) {
+    struct ibv_sge sge = {
+        .addr = (uintptr_t)addr,
+        .length = length,
+        .lkey = lkey,
+    };
+    struct ibv_send_wr wr = {
+        .wr_id = wr_id,
+        .sg_list = &sge,
+        .num_sge = 1,
+        .opcode = IBV_WR_RDMA_WRITE_WITH_IMM,
+        .send_flags = IBV_SEND_SIGNALED,
+    };
+    /* imm_data is __be32 on the wire; convert from the caller's host-order value
+     * so the receiver (after the ntohl in hord_poll) reads back the same u32
+     * regardless of either host's endianness (spec §12). A zero-length WR is
+     * legal here — it still delivers the immediate and consumes a recv WR. */
+    wr.imm_data = htonl(imm);
+    wr.wr.rdma.remote_addr = remote_addr;
+    wr.wr.rdma.rkey = rkey;
+    struct ibv_send_wr *bad = NULL;
+    int rc = ibv_post_send(c->qp, &wr, &bad);
+    if (rc) {
+        errno = rc;
+        set_err(err, errlen, "ibv_post_send (rdma write with imm)");
+        return -1;
+    }
+    return 0;
+}
+
 int hord_poll(hord_conn *c, uint64_t *wr_id, uint32_t *byte_len,
-              uint32_t *opcode, uint32_t *status, char *err, size_t errlen) {
+              uint32_t *opcode, uint32_t *status, uint32_t *imm_data,
+              char *err, size_t errlen) {
     struct ibv_wc wc;
     int n = ibv_poll_cq(c->cq, 1, &wc);
     if (n < 0) {
@@ -454,6 +488,10 @@ int hord_poll(hord_conn *c, uint64_t *wr_id, uint32_t *byte_len,
         *opcode = (uint32_t)wc.opcode;
     if (status)
         *status = (uint32_t)wc.status;
+    /* Only meaningful when wc_flags has IBV_WC_WITH_IMM (a RECV_RDMA_WITH_IMM
+     * completion); ntohl mirrors the htonl on the send side. Zero otherwise. */
+    if (imm_data)
+        *imm_data = (wc.wc_flags & IBV_WC_WITH_IMM) ? ntohl(wc.imm_data) : 0u;
     return 1;
 }
 
