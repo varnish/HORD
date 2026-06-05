@@ -35,115 +35,86 @@ async milestone rather than now.
     clean, clippy clean, demo integrity OK over `rxe0`, and the `#[ignore]`d
     `full_duplex_bulk` test passes.
 
-## Pass 3 — Async + hyper milestone  (the big one · absorbs #15, #11, #14)
+## Pass 3 — Async + hyper milestone  (the big one · absorbed #15, #11, #14)  (DONE)
 
-The end state from the spec/README: `tokio::AsyncRead`/`AsyncWrite` feeding
-`hyper`, with the server multiplexing many connections instead of accepting one
-at a time. Today the only things standing in the way are (a) `pump(true)`'s
-`spin_loop` busy-wait and (b) the shim's *synchronous* CM-event waits
-(`expect_event`); the CQ is created with no completion channel
-(`ibv_create_cq(..., NULL, NULL, 0)`), so there is nothing to poll on yet.
+`tokio::AsyncRead`/`AsyncWrite` feeding `hyper`, with the server handling many
+connections at once. `tokio` + `hyper` are the first third-party crates in the
+workspace; they are confined to a **new `hord-async` crate** (and the demo's
+hyper bins), so `hord-core`/`hord-stream` stay dep-free and air-gapped-buildable.
+Verified over `rxe0` at every step; the sync path is unchanged throughout.
 
-Two cross-cutting decisions that shape the whole pass (flagged in **Decisions**
-below — worth settling before 3c):
+### 3a — Shim: pollable fds + tunable CM params  (DONE)
+- [x] **CQ completion channel.** CQ now built against an `ibv_comp_channel`
+      (`hord_conn_cq_fd`), with `hord_cq_arm` (`ibv_req_notify_cq`) and
+      `hord_cq_consume` (`ibv_get_cq_event` + batched `ibv_ack_cq_events`); fd set
+      `O_NONBLOCK`. Transparent to the sync path — it never arms, so an un-armed
+      channel delivers no notifications and `ibv_poll_cq` works as before.
+- [x] **CM fd + half-close hooks.** `hord_conn_cm_fd` / `hord_conn_cm_set_nonblock`
+      / `hord_conn_check_disconnect` (the CM channel stays blocking for the
+      handshake, flipped non-blocking only after). The *listener* fd was **not**
+      needed: the acceptor stays a blocking loop (see 3d), so no `expect_event`
+      split was required.
+- [x] **#11 (params).** `rnr_retry_count` / `retry_count` / `resolve_timeout_ms`
+      threaded out as `hord_core::CmParams` (Default = the old `7`/`7`/`2000`),
+      wired through `HordConfig::cm`.
 
-- **Dependency inflection.** `tokio` + `hyper` are the first third-party crates
-  in the workspace; that breaks the deliberate zero-dep property `hord-core` and
-  `hord-stream` advertise. Plan keeps both of those crates dep-free and confines
-  the runtime to a **new `hord-async` crate**, so the synchronous stream, the
-  demo-less core, and the air-gapped build story all survive intact.
-- **Thread affinity.** A connection's verbs/CM objects are not safe to drive
-  concurrently, and `HordStream` is `!Send` (the buffers hold raw pointers; it
-  holds `Arc<Connection>` where `Connection: Send + !Sync`). RDMA connections are
-  naturally thread-pinned, so the server model is **thread-per-core + a
-  current-thread runtime + `spawn_local`** rather than `tokio::spawn` over the
-  multi-thread runtime. This avoids inventing an unsound `Send`/`Sync` claim.
+### 3b — Non-blocking stream core  (DONE, no behavior change)
+- [x] `send_message` split into `can_send_data()` + the non-blocking
+      `post_data_message()`; new public `try_write` / `try_flush_stage` /
+      `try_read` (`None` = would-block, `Some(0)` = EOF) / `drain_completions` /
+      `sends_outstanding` / `return_owed_credits` / `is_closed` / `mark_closed`.
+      `Read`/`Write`/`flush` are now thin busy-poll facades over them — sync demo
+      still ~698 MiB/s integrity-OK, `full_duplex_bulk` still passes. `accept`
+      split into `accept_begin` (returns the `Send` `Connection`) + `from_accepted`.
 
-Sequenced as five sub-passes, smallest blast radius first; each lands building +
-clippy-clean with the sync demo still passing over `rxe0`.
+### 3c — Async stream wrapper  (`hord-async` · DONE — closes #15)
+- [x] **`AsyncFd` over the CQ fd**, with the arm→drain-again race guard.
+      `AsyncRead`/`AsyncWrite`/`poll_flush`/`poll_shutdown` over the 3b core; no
+      flow-control logic duplicated. **#15 closed.**
+- [x] **#11 (deadlines)** via caller-side `tokio::time::timeout` (a cancelled
+      read/write future drops cleanly); CM params from 3a are the transport half.
+- [x] **Half-close.** CM fd registered; a peer `DISCONNECTED` marks the stream
+      closed → clean EOF. Retires the "no graceful half-close" limitation **on
+      the async path** (the sync path still has none — by design).
+- *Deviation from plan:* the handshake runs **synchronously on the connection's
+  own thread** (each connection gets a thread; see 3d), so `spawn_blocking` was
+  unnecessary. **Driver model:** the stream is driven by one task (as hyper
+  does); two tasks over `tokio::io::split` are *not* supported (both would wait
+  on the single completion fd — documented in the crate).
 
-### 3a — Shim: pollable fds + tunable CM params  (C, foundational)
-- [ ] **CQ completion channel.** Create an `ibv_comp_channel`, build the CQ
-      against it (`ibv_create_cq(ctx, cqe, NULL, channel, 0)`), and expose
-      `hord_conn_cq_fd()`. Add `hord_cq_arm()` (`ibv_req_notify_cq`) and
-      `hord_cq_ack_events()` (`ibv_get_cq_event` + batched `ibv_ack_cq_events`).
-      Set the channel fd `O_NONBLOCK` so a spurious reactor wakeup can't block.
-- [ ] **CM event-channel fds.** Expose `hord_listener_cm_fd()` /
-      `hord_conn_cm_fd()` and set both event channels `O_NONBLOCK`. Split the
-      blocking `expect_event` waits so the Rust side can drive CM transitions on
-      fd-readiness (or keep them blocking behind `spawn_blocking` — see
-      Decisions).
-- [ ] **#11 (params).** Thread `rnr_retry_count` / `retry_count` and the
-      `resolve_addr`/`resolve_route` timeouts (today hardcoded `7` / `2000`) out
-      to the Rust API as a config struct, instead of baking in infinite RNR
-      retry.
+### 3d — Multi-connection server + hyper  (DONE — includes #14)
+- [x] **Thread-per-connection** (not the planned `spawn_local` fan-out): a
+      blocking accept loop hands each `Connection` to a fresh OS thread running a
+      current-thread runtime + `hyper` `serve_connection`. Many connections at
+      once, the `!Send` stream stays on its thread, no unsound `Send`. The
+      *client* uses `spawn_local` under a `LocalSet` to drive the hyper connection
+      task. Verified: 6 concurrent clients × 32 MiB, all integrity-OK.
+- [x] hyper over the async stream (`hord-server-async` / `hord-client-async`);
+      cross-compatible with the sync bins (identical wire protocol, both ways).
+      Sync bins kept as the busy-polled reference.
+- [x] **#14.** `/size/<n>` is a custom `http_body::Body` streaming 256 KiB frames
+      with an exact size_hint (Content-Length, no up-front allocation).
 
-### 3b — Non-blocking stream core  (hord-stream refactor · no behavior change)
-- [ ] Factor `HordStream`'s blocking loops out from its state machine. `pump`,
-      `send_message`, `read`, `flush` today interleave the credit/slot logic with
-      a `spin_loop`. Extract a core exposing non-blocking primitives
-      (`drain_cq()`, `try_send_message() -> WouldBlock`, non-blocking read/flush
-      progress) and re-express the existing `std::io::Read`/`Write`/`flush` as
-      thin busy-poll facades over it. Net effect zero on the sync path — the
-      `#[ignore]`d `full_duplex_bulk` test and the demo keep passing unchanged —
-      but the async wrapper in 3c then shares the *same* state machine instead of
-      duplicating the credit/control-lane logic.
-
-### 3c — Async stream wrapper  (new `hord-async` crate · the core of #15)
-- [ ] **`AsyncFd` over the CQ fd.** Arm → `await` readable → `ack` → re-arm →
-      drain, with the standard re-arm/poll-again guard against the completion
-      that lands between the last drain and the re-arm. Replaces the `spin_loop`;
-      **closes #15** (a blocked connection now parks instead of pinning a core).
-- [ ] **`AsyncRead` + `AsyncWrite`** over the 3b core: on `WouldBlock`, register
-      CQ-fd readiness and yield; a send completion (frees a slot / carries
-      credits) or a recv completion wakes it. `poll_flush` waits on outstanding
-      send completions the same way.
-- [ ] **Async connect/accept** driving the CM fd via `AsyncFd` (handshake leg may
-      stay on `spawn_blocking` to start — see Decisions).
-- [ ] **#11 (deadlines).** Wrap the wait points in `tokio::time::timeout` so a
-      stalled-but-alive peer surfaces an error instead of hanging `read`/`flush`
-      forever.
-- [ ] **Half-close.** With the CM fd now pollable, process `DISCONNECTED` on the
-      data path and map it to clean EOF — retires the "no graceful half-close
-      detection" limitation rather than relying on `Content-Length` +
-      flush-before-disconnect.
-
-### 3d — Multi-connection server + hyper
-- [ ] **Async accept loop, one task per connection.** Thread-per-core: each
-      worker thread runs a current-thread runtime and `spawn_local`s a task per
-      accepted `HordStream` (keeps each connection thread-affine; no `Send`
-      requirement on the stream).
-- [ ] **Validate async transport first** by porting the hand-rolled demo
-      client/server to the async stream, *then* swap in `hyper` over it — hyper
-      changes nothing below the socket, so proving the async byte stream in
-      isolation de-risks the integration.
-- [ ] **#14.** Once handlers are async, stream `/size/<n>` in fixed-size chunks
-      instead of materialising up to 1 GiB up front (the natural shape for an
-      `AsyncWrite` body). Folded here rather than left as a standalone chore.
-
-### 3e — Tests & verification
-- [ ] Async analogue of `full_duplex_bulk` (same standoff, driven by the
-      reactor) + an end-to-end async HTTP round trip.
-- [ ] **#15 evidence:** confirm ~0% CPU while a connection is blocked on I/O
-      (contrast the current 100%-while-blocked busy-poll).
-- [ ] Throughput parity with the sync prototype's ~0.7 GiB/s over `rxe0`.
-- [ ] Timeout behaviour: a peer that stalls mid-transfer now errors on the
-      deadline instead of hanging.
-
-### Decisions to settle before 3c
-- **Crate layout:** new `hord-async` crate (keeps `hord-core`/`hord-stream`
-  dep-free) vs. an `async` feature on `hord-stream`. Plan assumes the former.
-- **Server task model:** thread-per-core + `spawn_local` (no new `unsafe`) vs.
-  an `unsafe impl Send` to allow `tokio::spawn` on the multi-thread runtime. Plan
-  assumes the former.
-- **CM handshake drive:** fully non-blocking via the CM fd vs. `spawn_blocking`
-  for the one-time begin→finish handshake (the per-core busy-poll problem is the
-  *data* path, so blocking the rare handshake is the low-risk fallback). Plan
-  starts with `spawn_blocking` and can tighten later; the CM fd must still be
-  pollable for the live-connection `DISCONNECTED` event regardless.
+### 3e — Tests & verification  (DONE)
+- [x] `async_request_response` (4 MiB, integrity + half-close EOF + timeout).
+- [x] **#15 evidence** (`idle_cpu`): async blocked read = **~90 µs CPU over 1 s**
+      idle vs sync busy-poll = **~800 ms CPU over 800 ms** (~9000×).
+- [x] Throughput parity: hyper bodies ~650–675 MiB/s vs sync ~700 MiB/s.
+- [x] Timeout: an idle-peer read deadlines out instead of hanging.
+- *Not done:* an async `full_duplex_bulk` analogue — it needs two tasks over
+  `split`, the unsupported model above; the sync `full_duplex_bulk` already
+  covers the control-lane / #3 standoff, and the shared 3b state machine means
+  the async path exercises the same logic.
 
 ---
 Fixed in the review pass (reference): #1 #2 #4 #5 #7 #10 #12 #13.
 Fixed in Pass 1 (flow-control credit redesign): #3 #8.
 Fixed in Pass 2 (soundness & ownership): #6 #9.
-Pass 3 absorbs the remaining open issues: #15 #11 #14 + the half-close limitation.
+Fixed in Pass 3 (async + hyper): #15 #11 #14 + async half-close.
+
+## Remaining / future
+- [ ] Concurrent independent read+write on one async stream (two tasks over
+      `tokio::io::split`) needs a multi-waiter scheme on the completion fd.
+- [ ] Half-close detection on the *synchronous* stream (the async path has it).
+- [ ] True thread-per-core server (worker pool + `spawn_local`) instead of one
+      OS thread per connection.
