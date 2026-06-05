@@ -1,7 +1,34 @@
 # HORD prototype — TODO
 
+## Remaining / future
+
 - [ ] **§7.5 GPUDirect** — untestable on this host (no GPU / real NIC); the
       addr/rkey path is opaque, so it should work unchanged on capable hardware.
+- [ ] **§7.6 range requests** — small add-on on top of the zero-copy path.
+- [ ] A zero-copy *source* buffer pool on the server (amortize registration —
+      §8.3) instead of registering per response.
+- [ ] Concurrent independent read+write on one async stream (two tasks over
+      `tokio::io::split`) needs a multi-waiter scheme on the completion fd.
+- [ ] **§5.3 Version-mismatch reject** — a peer that doesn't recognise the handshake
+      version MUST reject with its own handshake (highest supported version) as
+      reject private data. Currently the handshake is parsed but mismatch is not
+      handled.
+- [ ] **§11.2 RDMA write bounds validation** — verify that the server's RDMA
+      write stays within the `addr`/`len` bounds the client advertised. The
+      client trusts the server today; a malicious or buggy server could
+      overwrite unrelated memory.
+- [ ] **§11.3 DoS protections** — max connections per client IP/GID, idle
+      connection timeouts, limits on total registered memory. None implemented.
+- [ ] **§4.1.1 HTTP pipelining** — multiple in-flight GETs on one connection,
+      responses returned in request order. The spec says this is "supported and
+      expected" for prefetch controllers. The stream layer should support it but
+      it has not been tested end-to-end.
+- [ ] **§4.1.3 Upstream content normalization** — a HORD edge-cache server
+      fetching from origins over standard HTTP must decompress
+      (`Content-Encoding`), dechunk (`Transfer-Encoding`), and materialize a
+      known `Content-Length` before serving over HORD. Not implemented.
+- [ ] **§13.3 Python bindings** (`pyhord` crate) — PyO3 wrappers for the client,
+      zero-copy GPU buffers, and a PyTorch `DataLoader` integration. Not started.
 
 ## Deferred from the Pass 7 (§7.7) code review
 
