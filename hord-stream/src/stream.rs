@@ -14,11 +14,33 @@
 //!
 //! ## Flow control
 //!
-//! Each side starts with `peer.max_recv_buffers` send credits. Posting a
-//! message costs one credit. As we drain received messages and re-post their
-//! receive buffers we accrue a *grant debt* to the peer, which we repay by
-//! stamping the envelope `credits` field of outgoing messages — or, if we have
-//! no data to send, via a zero-length `CREDIT_ONLY` message.
+//! Each side starts with `peer.max_recv_buffers` send credits. Posting a *data*
+//! message costs one credit. As we drain received messages (in `read()`) and
+//! re-post their receive buffers we accrue a *grant debt* to the peer, which we
+//! repay by stamping the envelope `credits` field of outgoing messages — or, if
+//! we have no data to send, via a zero-length `CREDIT_ONLY` message.
+//!
+//! ### The control lane
+//!
+//! A `CREDIT_ONLY` credit-return must not itself need a data credit — otherwise
+//! two peers that simultaneously hit zero credits while each owes the other
+//! grants deadlock forever (neither can send the message that would unstick the
+//! other). So credit-returns travel a separate *control lane*:
+//!
+//! - **Receive:** beyond the `recv_pool` data buffers we keep [`CTRL_RECV_SLACK`]
+//!   extra receive buffers permanently posted (re-posted the instant a control
+//!   message lands). Since un-read data occupies at most `recv_pool` buffers,
+//!   at least `CTRL_RECV_SLACK` receive WRs are always posted, so a peer can
+//!   always deliver a credit-return.
+//! - **Send:** a reserved control send buffer carries the `CREDIT_ONLY` message.
+//!   It is bounded by one in-flight message (`ctrl_send_busy`) rather than by a
+//!   data credit, and self-clocks on its own send completion — an RC completion
+//!   means the peer accepted it into one of those always-posted WRs. No data
+//!   credit is consumed, and no credit is returned for it, so there is no
+//!   "credit to return a credit" regress.
+//!
+//! This rests on both ends polling promptly (true here: we busy-poll the CQ
+//! while inside `read`/`write`/`flush`).
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -50,20 +72,42 @@ impl Default for HordConfig {
     }
 }
 
-// wr_id encoding: top bit distinguishes sends from receives; low bits are the
-// buffer slot index.
+// Extra receive buffers, beyond the advertised data pool, kept permanently
+// topped up (re-posted on receipt) to carry control messages. This is the
+// "reserved pool" that breaks the full-duplex credit deadlock (#3): because
+// unconsumed data occupies at most `recv_pool` buffers, at least this many
+// receive WRs are always posted, so a peer can always land a credit-return
+// message even when every data buffer is full of un-read data.
+const CTRL_RECV_SLACK: usize = 2;
+
+// Reserved send buffers for the control lane. One is enough: a credit-return is
+// bounded to a single in-flight message and self-clocks on its completion.
+const CTRL_SEND_SLOTS: usize = 1;
+
+// wr_id encoding: top bit distinguishes sends from receives; the next bit marks
+// the reserved control send (so its completion frees the control slot rather
+// than a data slot); low bits are the buffer slot index. Control *receives* are
+// recognised by the CREDIT_ONLY envelope flag, not by wr_id (the NIC consumes
+// receive WRs FIFO regardless of message type, so the slot carries no lane).
 const SEND_FLAG: u64 = 1 << 63;
+const CTRL_FLAG: u64 = 1 << 62;
 fn recv_wr_id(slot: usize) -> u64 {
     slot as u64
 }
 fn send_wr_id(slot: usize) -> u64 {
     SEND_FLAG | slot as u64
 }
+fn ctrl_send_wr_id(slot: usize) -> u64 {
+    SEND_FLAG | CTRL_FLAG | slot as u64
+}
 fn is_send(wr_id: u64) -> bool {
     wr_id & SEND_FLAG != 0
 }
+fn is_ctrl_send(wr_id: u64) -> bool {
+    wr_id & CTRL_FLAG != 0
+}
 fn slot_of(wr_id: u64) -> usize {
-    (wr_id & !SEND_FLAG) as usize
+    (wr_id & !(SEND_FLAG | CTRL_FLAG)) as usize
 }
 
 /// A received data message whose payload still lives in its receive buffer,
@@ -102,9 +146,11 @@ pub struct HordStream {
     recv_lkey: u32,
     send_lkey: u32,
 
-    send_free: Vec<usize>, // free send slot indices
-    send_credits: u32,     // messages we may still post to the peer
-    grant_pending: u32,    // credits we owe the peer (re-posted recvs not yet announced)
+    send_free: Vec<usize>, // free *data* send slot indices (the control slot is separate)
+    send_credits: u32,     // data messages we may still post to the peer
+    grant_pending: u32,    // data credits we owe the peer (consumed recvs not yet announced)
+    ctrl_slot: usize,      // reserved send slot index for control (CREDIT_ONLY) messages
+    ctrl_send_busy: bool,  // a control message is in flight on `ctrl_slot`
 
     tx_stage: Vec<u8>,        // bytes buffered by write(), drained into messages
     rx_ready: VecDeque<ReadyMsg>, // received data, still in its recv buffer, awaiting read()
@@ -115,8 +161,12 @@ impl HordStream {
     /// Server side: accept the next connection on `listener` and complete the
     /// HORD handshake.
     pub fn accept(listener: &Listener, config: &HordConfig) -> io::Result<HordStream> {
-        let (conn, peer_bytes) =
-            listener.accept(config.send_pool_size, config.recv_pool_size, HANDSHAKE_LEN)?;
+        // The QP must hold the control lane's extra WRs on top of the data pools.
+        let (conn, peer_bytes) = listener.accept(
+            config.send_pool_size + CTRL_SEND_SLOTS,
+            config.recv_pool_size + CTRL_RECV_SLACK,
+            HANDSHAKE_LEN,
+        )?;
         let mut s = HordStream::new_common(conn, config)?;
         let peer = Handshake::decode(&peer_bytes)?;
         s.apply_peer(&peer)?;
@@ -127,7 +177,13 @@ impl HordStream {
 
     /// Client side: connect to `ip:port` and complete the HORD handshake.
     pub fn connect(ip: &str, port: u16, config: &HordConfig) -> io::Result<HordStream> {
-        let conn = Connection::connect(ip, port, config.send_pool_size, config.recv_pool_size)?;
+        // The QP must hold the control lane's extra WRs on top of the data pools.
+        let conn = Connection::connect(
+            ip,
+            port,
+            config.send_pool_size + CTRL_SEND_SLOTS,
+            config.recv_pool_size + CTRL_RECV_SLACK,
+        )?;
         let mut s = HordStream::new_common(conn, config)?;
         let my = Handshake::new(config.max_message_size as u32, config.recv_pool_size as u16);
         let peer_bytes = s.conn.connect_finish(&my.encode(), HANDSHAKE_LEN)?;
@@ -145,8 +201,13 @@ impl HordStream {
         let send_pool = config.send_pool_size;
         assert!(msg_size > ENVELOPE_LEN, "max_message_size too small");
 
-        let mut recv_buf = vec![0u8; recv_pool * msg_size].into_boxed_slice();
-        let mut send_buf = vec![0u8; send_pool * msg_size].into_boxed_slice();
+        // recv_buf carries the data pool plus the always-posted control slack;
+        // send_buf carries the data pool plus the reserved control send slot
+        // (the highest index, `send_pool`).
+        let recv_slots = recv_pool + CTRL_RECV_SLACK;
+        let send_slots = send_pool + CTRL_SEND_SLOTS;
+        let mut recv_buf = vec![0u8; recv_slots * msg_size].into_boxed_slice();
+        let mut send_buf = vec![0u8; send_slots * msg_size].into_boxed_slice();
         // SAFETY: recv_buf/send_buf are `Box<[u8]>` whose heap storage stays put
         // for the life of the stream (moving the box moves only the pointer).
         // They are dropped after the MRs are deregistered and the QP destroyed —
@@ -175,6 +236,8 @@ impl HordStream {
             send_free: (0..send_pool).rev().collect(),
             send_credits: 0,
             grant_pending: 0,
+            ctrl_slot: send_pool,
+            ctrl_send_busy: false,
             tx_stage: Vec::new(),
             rx_ready: VecDeque::new(),
             peer_closed: false,
@@ -187,7 +250,9 @@ impl HordStream {
         let base = self.recv_buf.as_mut_ptr();
         let msg = self.msg_size;
         let lkey = self.recv_lkey;
-        for slot in 0..self.recv_pool {
+        // Post the data pool *and* the control slack; both are needed before the
+        // QP can carry traffic.
+        for slot in 0..self.recv_pool + CTRL_RECV_SLACK {
             // SAFETY: `base + slot*msg` lies within recv_buf (a single MR with
             // `lkey`); the buffer outlives the connection (drop order).
             unsafe {
@@ -251,14 +316,12 @@ impl HordStream {
             // disconnects and our outstanding recvs are flushed). Treat as a
             // closed connection rather than a hard error so reads see EOF.
             self.peer_closed = true;
-            if is_send(wc.wr_id) {
-                self.send_free.push(slot_of(wc.wr_id));
-            }
+            self.reclaim_send(wc.wr_id);
             return Ok(());
         }
 
         if is_send(wc.wr_id) {
-            self.send_free.push(slot_of(wc.wr_id));
+            self.reclaim_send(wc.wr_id);
             return Ok(());
         }
 
@@ -296,13 +359,29 @@ impl HordStream {
                 start,
                 end: start + plen,
             });
+        } else if env.is_credit_only() {
+            // Control message: re-post immediately to keep the control slack
+            // topped up, but DON'T return a data credit — the peer self-clocks
+            // its control lane on send completions and spent no data credit for
+            // this, so granting one back would inflate its window.
+            self.repost_recv(slot)?;
         } else {
-            // Nothing to hold (a CREDIT_ONLY top-up, or a zero-length data
-            // message): re-post immediately and return the credit now.
+            // Zero-length data message: it did consume a data credit, so
+            // re-post and return the credit now (no payload to hold).
             self.repost_recv(slot)?;
             self.grant_pending += 1;
         }
         Ok(())
+    }
+
+    /// Reclaim a completed send: a control send frees the reserved control
+    /// slot; any other send returns its slot to the data free list.
+    fn reclaim_send(&mut self, wr_id: u64) {
+        if is_ctrl_send(wr_id) {
+            self.ctrl_send_busy = false;
+        } else {
+            self.send_free.push(slot_of(wr_id));
+        }
     }
 
     /// Re-post the receive WR for `slot`. Re-posting only fails on a dead QP;
@@ -327,9 +406,12 @@ impl HordStream {
 
     // ---- sending -----------------------------------------------------------
 
-    /// Post one message carrying `payload` (<= payload_cap). Blocks until a
-    /// send slot and a credit are available, processing completions meanwhile.
-    fn send_message(&mut self, payload: &[u8], credit_only: bool) -> io::Result<()> {
+    /// Post one *data* message carrying `payload` (<= payload_cap). Blocks until
+    /// a send slot and a data credit are available, processing completions
+    /// meanwhile. While blocked on credits, returns any owed grants via the
+    /// control lane so a peer waiting on us can make progress — this is what
+    /// breaks the full-duplex deadlock (#3).
+    fn send_message(&mut self, payload: &[u8]) -> io::Result<()> {
         debug_assert!(payload.len() <= self.payload_cap);
         loop {
             if self.peer_closed {
@@ -341,36 +423,23 @@ impl HordStream {
             if !self.send_free.is_empty() && self.send_credits > 0 {
                 break;
             }
+            // We can't send data (no credit and/or no slot). Return whatever we
+            // owe the peer now, over the control lane (no data credit needed),
+            // so the peer can grant us credits back. Then wait for a completion.
+            self.maybe_return_credits(1)?;
             self.pump(true)?;
         }
 
         let slot = self.send_free.pop().unwrap();
-        let off = slot * self.msg_size;
         let grant = self.grant_pending.min(u16::MAX as u32);
-        let flags = if credit_only {
-            env_flags::CREDIT_ONLY
-        } else {
-            0
-        };
         let env = Envelope {
             length: payload.len() as u32,
             credits: grant as u16,
-            flags,
+            flags: 0,
         };
-        env.encode(&mut self.send_buf[off..off + ENVELOPE_LEN]);
-        let pstart = off + ENVELOPE_LEN;
-        self.send_buf[pstart..pstart + payload.len()].copy_from_slice(payload);
-        let total = (ENVELOPE_LEN + payload.len()) as u32;
-
-        let base = self.send_buf.as_ptr();
-        // SAFETY: `base + off` is the start of this slot inside send_buf / the
-        // send MR; the buffer stays put until the send completion is reaped.
-        let post = unsafe {
-            let addr = base.add(off);
-            self.conn
-                .post_send(send_wr_id(slot), addr, total, self.send_lkey)
-        };
-        if let Err(e) = post {
+        // SAFETY (post): the slot lives in send_buf / the send MR and stays put
+        // until the completion is reaped.
+        if let Err(e) = unsafe { self.post_into(slot, send_wr_id(slot), &env, payload) } {
             // The message never went out: return the slot to the free list and
             // mark the connection closed (post_send only fails on a dead QP).
             // Leave send_credits / grant_pending untouched — nothing was spent
@@ -384,19 +453,73 @@ impl HordStream {
         Ok(())
     }
 
-    /// If we owe the peer a meaningful number of credits and have nothing else
-    /// to send, return them proactively via a CREDIT_ONLY message. Keeps a
-    /// one-directional bulk transfer from stalling.
-    fn maybe_flush_credits(&mut self) -> io::Result<()> {
-        let threshold = (self.recv_pool as u32 / 4).max(1);
-        if self.grant_pending >= threshold
-            && self.send_credits > 0
-            && self.tx_stage.is_empty()
-            && !self.peer_closed
-        {
-            self.send_message(&[], true)?;
+    /// Stamp `env` + `payload` into send slot `slot` and post it with `wr_id`.
+    ///
+    /// # Safety
+    /// `slot` must be a valid send slot whose backing storage stays pinned in
+    /// the send MR until the matching completion is reaped (the stream owns
+    /// `send_buf` for its whole life, so this holds for any slot index < the
+    /// allocated count).
+    unsafe fn post_into(
+        &mut self,
+        slot: usize,
+        wr_id: u64,
+        env: &Envelope,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let off = slot * self.msg_size;
+        env.encode(&mut self.send_buf[off..off + ENVELOPE_LEN]);
+        let pstart = off + ENVELOPE_LEN;
+        self.send_buf[pstart..pstart + payload.len()].copy_from_slice(payload);
+        let total = (ENVELOPE_LEN + payload.len()) as u32;
+        let base = self.send_buf.as_ptr();
+        unsafe {
+            let addr = base.add(off);
+            self.conn.post_send(wr_id, addr, total, self.send_lkey)
+        }
+    }
+
+    /// Return owed data credits to the peer over the control lane: a
+    /// `CREDIT_ONLY` message on the reserved control slot. Costs no data credit
+    /// and is bounded to one in-flight message (`ctrl_send_busy`), which
+    /// self-clocks on its send completion. Non-blocking: if the control slot is
+    /// busy we simply skip and let the in-flight message carry the grant.
+    fn send_credit_return(&mut self) -> io::Result<()> {
+        if self.ctrl_send_busy || self.peer_closed || self.grant_pending == 0 {
+            return Ok(());
+        }
+        let grant = self.grant_pending.min(u16::MAX as u32);
+        let env = Envelope {
+            length: 0,
+            credits: grant as u16,
+            flags: env_flags::CREDIT_ONLY,
+        };
+        let slot = self.ctrl_slot;
+        // SAFETY (post): the control slot lives in send_buf / the send MR and
+        // stays put until the completion is reaped.
+        if let Err(e) = unsafe { self.post_into(slot, ctrl_send_wr_id(slot), &env, &[]) } {
+            self.peer_closed = true;
+            return Err(e);
+        }
+        self.ctrl_send_busy = true;
+        self.grant_pending -= grant;
+        Ok(())
+    }
+
+    /// Return owed credits if we owe at least `threshold` of them. Callers pass
+    /// a high threshold for proactive top-ups (avoid chatty credit-only traffic)
+    /// and `1` when something is actually blocked on the peer granting back.
+    fn maybe_return_credits(&mut self, threshold: u32) -> io::Result<()> {
+        if self.grant_pending >= threshold {
+            self.send_credit_return()?;
         }
         Ok(())
+    }
+
+    /// Proactive credit-return threshold: a quarter of the data pool keeps a
+    /// one-directional bulk transfer flowing without a credit-only storm.
+    fn proactive_threshold(&self) -> u32 {
+        (self.recv_pool as u32 / 4).max(1)
     }
 }
 
@@ -410,7 +533,7 @@ impl Read for HordStream {
                 return Ok(0); // EOF
             }
             self.pump(true)?;
-            self.maybe_flush_credits()?;
+            self.maybe_return_credits(self.proactive_threshold())?;
         }
 
         // Copy payload straight out of the receive buffers (no intermediate
@@ -437,7 +560,7 @@ impl Read for HordStream {
         }
 
         // Returning data frees receive capacity; let the peer know.
-        self.maybe_flush_credits()?;
+        self.maybe_return_credits(self.proactive_threshold())?;
         Ok(written)
     }
 }
@@ -463,7 +586,7 @@ impl Write for HordStream {
             staged.extend_from_slice(&input[..take]);
             input = &input[take..];
             if staged.len() == cap {
-                self.send_message(&staged, false)?;
+                self.send_message(&staged)?;
                 staged.clear();
             }
             self.tx_stage = staged;
@@ -472,7 +595,7 @@ impl Write for HordStream {
         // Send whole messages straight from the caller's buffer — no per-message
         // front-draining, so the write path is O(n) in the body size.
         while input.len() >= cap {
-            self.send_message(&input[..cap], false)?;
+            self.send_message(&input[..cap])?;
             input = &input[cap..];
         }
 
@@ -488,7 +611,7 @@ impl Write for HordStream {
     fn flush(&mut self) -> io::Result<()> {
         if !self.tx_stage.is_empty() {
             let chunk = std::mem::take(&mut self.tx_stage);
-            self.send_message(&chunk, false)?;
+            self.send_message(&chunk)?;
         }
         while self.send_free.len() < self.send_pool {
             if self.peer_closed {
