@@ -17,3 +17,6 @@ tokio = { version = "1", features = ["net", "io-util", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros", "sync"] }
+# Test-only: per-thread CPU accounting (CLOCK_THREAD_CPUTIME_ID) for the #15
+# busy-poll-vs-park measurement in tests/idle_cpu.rs.
+libc = "0.2"

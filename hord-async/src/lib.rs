@@ -24,6 +24,19 @@
 //! [`Connection`](hord_stream::Connection)) and builds + runs each stream on the
 //! thread that will drive it — see [`AsyncHordStream::from_accepted`].
 //!
+//! ## Driver model
+//!
+//! The stream is meant to be driven by a **single task** — one state machine
+//! that reads and writes in turn. That is exactly how `hyper` drives a
+//! connection (read the request, write the response), so it is the case that
+//! matters. Splitting the stream with [`tokio::io::split`] and driving the read
+//! and write halves from two *independent* tasks is **not** supported: both
+//! halves would wait on the one completion-channel fd, and a single completion
+//! stream carries events for both directions, so waking the correct half would
+//! need a multi-waiter scheme this prototype does not implement. Concurrent
+//! bidirectional traffic from one task (the busy-poll path's
+//! `full_duplex_bulk`) is fine; two tasks over `split` can stall.
+//!
 //! ## Timeouts
 //!
 //! Per-operation deadlines are applied the idiomatic tokio way — wrap a call in
