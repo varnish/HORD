@@ -643,3 +643,169 @@ impl Drop for HordStream {
         self.send_mr.take();
     }
 }
+
+#[cfg(test)]
+mod fullduplex_tests {
+    //! Full-duplex bulk transfer over a real RC connection.
+    //!
+    //! The half-duplex HTTP demo can never reach the credit-return paths that
+    //! matter for flow-control correctness: it only ever has data flowing one
+    //! way at a time. This test drives a large body in *both* directions at
+    //! once, which is the only way to reach the simultaneous-zero-credit
+    //! standoff that the control lane exists to break (#3), and to keep a
+    //! receiver's buffers full of un-read data while the peer still needs to
+    //! send (the backpressure path of #8).
+    //!
+    //! It needs the host's Soft-RoCE device (see CLAUDE.md), so it is
+    //! `#[ignore]`d by default. Run it with:
+    //!
+    //! ```sh
+    //! cargo test -p hord-stream -- --ignored --nocapture full_duplex_bulk
+    //! ```
+
+    use super::*;
+    use std::io::Read;
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+    const PORT: u16 = 18519; // a free port distinct from the demo's 4791
+    const BODY: usize = 16 * 1024 * 1024; // 16 MiB each way — far exceeds the pipe
+    const STALL: Duration = Duration::from_secs(15); // no-progress watchdog
+
+    /// A position-sensitive byte pattern, distinct per `seed` so each side can
+    /// verify exactly what the peer sent.
+    fn pattern(len: usize, seed: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut x = seed as u32 | 1;
+        for _ in 0..len {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            out.push((x >> 16) as u8);
+        }
+        out
+    }
+
+    /// Drive one endpoint to completion: send `to_send` and receive exactly
+    /// `expect_len` bytes. Everything is non-blocking (we only call the blocking
+    /// primitives once their precondition already holds), so a single thread
+    /// keeps both directions moving. Returns the bytes received.
+    ///
+    /// `standoff` deterministically manufactures the #3 deadlock condition. In
+    /// full-duplex bulk traffic both sides almost always have data queued, so
+    /// credits ride home piggybacked on data messages and the control lane is
+    /// rarely the *only* way to return them. The exception — and the whole point
+    /// of the control lane — is when both sides are at zero credits at once with
+    /// more to send: then neither can send a data message to piggyback on, so a
+    /// credit-return must travel the control lane. We force exactly that: phase
+    /// one fills the peer's window without draining, and the barrier releases
+    /// both sides only once they are jointly wedged at zero credits.
+    fn drive(s: &mut HordStream, to_send: &[u8], expect_len: usize, standoff: &Barrier) -> Vec<u8> {
+        let cap = s.payload_capacity();
+        let mut sent = 0;
+        let mut got = Vec::with_capacity(expect_len);
+        let mut scratch = vec![0u8; 64 * 1024];
+
+        // Phase one: write greedily, never reading, until our credits run out
+        // (the body dwarfs the window, so they will). Pump only to recycle send
+        // slots. No credit-return is needed — we are spending our initial grant.
+        let mut last = Instant::now();
+        while s.send_credits > 0 && sent < to_send.len() {
+            if !s.send_free.is_empty() {
+                let end = (sent + cap).min(to_send.len());
+                s.send_message(&to_send[sent..end]).expect("send_message");
+                sent = end;
+                last = Instant::now();
+            } else if !s.pump(false).expect("pump") && last.elapsed() > STALL {
+                panic!("phase-one stalled at {sent}/{} bytes", to_send.len());
+            }
+        }
+
+        // Both sides are now wedged at zero credits with undrained windows and
+        // plenty left to send: the exact #3 standoff. Only the control lane can
+        // break it.
+        standoff.wait();
+
+        // Phase two: full interleave to completion.
+        let mut last_progress = Instant::now();
+        while sent < to_send.len() || got.len() < expect_len {
+            let mut progressed = false;
+
+            while sent < to_send.len() && !s.send_free.is_empty() && s.send_credits > 0 {
+                let end = (sent + cap).min(to_send.len());
+                s.send_message(&to_send[sent..end]).expect("send_message");
+                sent = end;
+                progressed = true;
+            }
+
+            // Drain whatever has arrived (re-posts buffers + returns credits).
+            while got.len() < expect_len && !s.rx_ready.is_empty() {
+                let n = s.read(&mut scratch).expect("read");
+                got.extend_from_slice(&scratch[..n]);
+                progressed = true;
+            }
+
+            if s.pump(false).expect("pump") {
+                progressed = true;
+            }
+
+            // Return owed credits over the control lane even at zero data
+            // credits — the path that breaks the deadlock.
+            s.maybe_return_credits(1).expect("credit return");
+
+            if s.peer_closed && got.len() < expect_len {
+                panic!("peer closed early: got {}/{expect_len} bytes", got.len());
+            }
+
+            if progressed {
+                last_progress = Instant::now();
+            } else if last_progress.elapsed() > STALL {
+                panic!(
+                    "stalled for {STALL:?} (sent {sent}/{}, got {}/{expect_len}) — \
+                     likely a credit deadlock",
+                    to_send.len(),
+                    got.len(),
+                );
+            }
+        }
+
+        // All bytes exchanged; make sure our sends are acknowledged.
+        s.flush().expect("flush");
+        got
+    }
+
+    #[test]
+    #[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+    fn full_duplex_bulk() {
+        let config = HordConfig::default();
+
+        // Each stream is created and used entirely within its own thread, so
+        // HordStream need not be Send. `standoff` releases both sides only once
+        // both are wedged at zero credits (forcing the #3 deadlock); `teardown`
+        // holds both QPs open until both have flushed, so neither tears down
+        // mid-flush.
+        let standoff = Arc::new(Barrier::new(2));
+        let teardown = Arc::new(Barrier::new(2));
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let srv_config = config.clone();
+        let srv_standoff = Arc::clone(&standoff);
+        let srv_teardown = Arc::clone(&teardown);
+        let server = std::thread::spawn(move || {
+            let listener = Listener::bind(IP, PORT).expect("bind");
+            ready_tx.send(()).expect("signal ready");
+            let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
+            let got = drive(&mut s, &pattern(BODY, 0xA5), BODY, &srv_standoff);
+            assert_eq!(got, pattern(BODY, 0x5A), "server received corrupt data");
+            srv_teardown.wait();
+            // s drops here, after the client has also flushed.
+        });
+
+        ready_rx.recv().expect("server ready");
+        let mut client = HordStream::connect(IP, PORT, &config).expect("connect");
+        let got = drive(&mut client, &pattern(BODY, 0x5A), BODY, &standoff);
+        assert_eq!(got, pattern(BODY, 0xA5), "client received corrupt data");
+        teardown.wait();
+        drop(client);
+
+        server.join().expect("server thread panicked");
+    }
+}
