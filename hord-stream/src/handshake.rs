@@ -22,12 +22,13 @@ pub const VERSION: u16 = 1;
 /// Wire size of the handshake we actually transmit.
 pub const HANDSHAKE_LEN: usize = 16;
 
-/// Capability flags (spec 5.3). The prototype advertises none of these: it is
-/// stream-only (no zero-copy), HTTP/1.1-only, no split mode.
+/// Capability flags (spec 5.3). Bit 0 (`ZERO_COPY_CAPABLE`) is negotiated as of
+/// Pass 4; split mode (§7.7) is not yet implemented.
 pub mod flags {
+    /// Peer supports the zero-copy extension (spec §7).
     pub const ZERO_COPY_CAPABLE: u16 = 1 << 0;
-    pub const HTTP2_CAPABLE: u16 = 1 << 1;
-    pub const SPLIT_MODE_CAPABLE: u16 = 1 << 2;
+    /// Peer supports protocol splitting (spec §7.7). Not yet implemented.
+    pub const SPLIT_MODE_CAPABLE: u16 = 1 << 1;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +47,21 @@ impl Handshake {
             max_message_size,
             max_recv_buffers,
         }
+    }
+
+    /// Advertise (or clear) the `ZERO_COPY_CAPABLE` flag. Chainable on [`new`].
+    pub fn with_zero_copy(mut self, on: bool) -> Self {
+        if on {
+            self.flags |= flags::ZERO_COPY_CAPABLE;
+        } else {
+            self.flags &= !flags::ZERO_COPY_CAPABLE;
+        }
+        self
+    }
+
+    /// Whether this handshake advertises the zero-copy extension (spec §7).
+    pub fn zero_copy_capable(&self) -> bool {
+        self.flags & flags::ZERO_COPY_CAPABLE != 0
     }
 
     /// Serialise to the 16-byte wire form.
@@ -114,5 +130,19 @@ mod tests {
         let mut b = Handshake::new(65536, 32).encode();
         b[0] = 0;
         assert!(Handshake::decode(&b).is_err());
+    }
+
+    #[test]
+    fn zero_copy_flag_round_trips() {
+        let off = Handshake::new(65536, 32);
+        assert!(!off.zero_copy_capable());
+        assert!(!Handshake::decode(&off.encode()).unwrap().zero_copy_capable());
+
+        let on = Handshake::new(65536, 32).with_zero_copy(true);
+        assert!(on.zero_copy_capable());
+        assert!(Handshake::decode(&on.encode()).unwrap().zero_copy_capable());
+
+        // Setter is idempotent / clearable.
+        assert!(!on.with_zero_copy(false).zero_copy_capable());
     }
 }
