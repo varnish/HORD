@@ -1,0 +1,15 @@
+[package]
+name = "hord-core"
+description = "HORD RDMA transport: RC queue-pair lifecycle, MR registration, completion polling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+# Links against librdmacm + libibverbs via a C shim (see build.rs). The shim is
+# required because the verbs data-path calls (ibv_post_send, ibv_poll_cq, ...)
+# are `static inline` in the rdma-core headers and therefore not exported
+# symbols we could bind to directly.
+
+[dependencies]

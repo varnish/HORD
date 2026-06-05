@@ -1,0 +1,18 @@
+[package]
+name = "hord-demo"
+description = "HORD prototype demo: a minimal HTTP/1.1 client and server over RDMA"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+hord-stream = { path = "../hord-stream" }
+
+[[bin]]
+name = "hord-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "hord-client"
+path = "src/bin/client.rs"
