@@ -147,6 +147,12 @@ impl AsyncHordStream {
         self.stream.zero_copy_negotiated()
     }
 
+    /// Whether protocol splitting (spec §7.7) was negotiated on this connection.
+    /// See [`HordStream::split_mode_negotiated`].
+    pub fn split_mode_negotiated(&self) -> bool {
+        self.stream.split_mode_negotiated()
+    }
+
     /// Register a destination buffer the peer may RDMA-write into (client side).
     /// See [`HordStream::register_remote_writable`].
     pub fn register_remote_writable(&self, len: usize) -> io::Result<RegisteredBuffer> {
@@ -171,9 +177,16 @@ impl AsyncHordStream {
         w: &mut PendingWrite<'_>,
     ) -> Poll<io::Result<()>> {
         if w.post_outcome.is_none() {
-            w.post_outcome = Some(self.stream.begin_rdma_write(
-                w.src, w.src_off, w.peer_addr, w.peer_rkey, w.len,
-            ));
+            // Split mode (§7.7) rides the immediate on the final WR; plain
+            // zero-copy posts an ordinary write. Both reap as one-sided writes.
+            w.post_outcome = Some(match w.imm {
+                Some(id) => self.stream.begin_rdma_write_with_imm(
+                    w.src, w.src_off, w.peer_addr, w.peer_rkey, w.len, id,
+                ),
+                None => self
+                    .stream
+                    .begin_rdma_write(w.src, w.src_off, w.peer_addr, w.peer_rkey, w.len),
+            });
         }
         // Drain EVERY write that posted before resolving — even on a post error or
         // a closed stream. Otherwise an error return would let the caller drop
@@ -195,6 +208,29 @@ impl AsyncHordStream {
         } else {
             Ok(())
         })
+    }
+
+    /// Data-plane driver for protocol splitting (§7.7): drive the completion fd
+    /// until the next split-mode transfer ID is available, returning it — or
+    /// `None` once the connection has closed with nothing left queued. Already
+    /// reaped transfers (e.g. drained while the control plane read an HTTP
+    /// response) are returned immediately without parking. Mirrors `poll_read` /
+    /// `poll_rdma_write`: same reactor, no flow-control logic duplicated.
+    fn poll_split_completion(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<u32>>> {
+        loop {
+            // Queued completions win even after a half-close — the payload landed
+            // before the peer went away.
+            if let Some(id) = self.stream.next_completed_transfer() {
+                return Poll::Ready(Ok(Some(id)));
+            }
+            if self.stream.is_closed() {
+                return Poll::Ready(Ok(None));
+            }
+            match self.poll_events(cx)? {
+                Poll::Ready(()) => continue,
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 
     /// Best-effort, non-blocking half-close check via the CM fd. Returns `true`
@@ -357,6 +393,9 @@ struct PendingWrite<'a> {
     peer_addr: u64,
     peer_rkey: u32,
     len: usize,
+    /// `Some(id)` for split mode (§7.7): the final WR is a write-with-immediate
+    /// carrying `id`. `None` for a plain zero-copy write.
+    imm: Option<u32>,
     post_outcome: Option<io::Result<()>>,
 }
 
@@ -403,6 +442,12 @@ impl SharedAsyncStream {
         self.0.borrow().zero_copy_negotiated()
     }
 
+    /// Whether protocol splitting (§7.7) was negotiated. See
+    /// [`AsyncHordStream::split_mode_negotiated`].
+    pub fn split_mode_negotiated(&self) -> bool {
+        self.0.borrow().split_mode_negotiated()
+    }
+
     /// Register a source buffer to RDMA-write from (server side).
     pub fn register_source(&self, len: usize) -> io::Result<RegisteredBuffer> {
         self.0.borrow().register_source(len)
@@ -436,9 +481,46 @@ impl SharedAsyncStream {
             peer_addr,
             peer_rkey,
             len,
+            imm: None,
             post_outcome: None,
         };
         std::future::poll_fn(|cx| self.0.borrow_mut().poll_rdma_write(cx, &mut w)).await
+    }
+
+    /// Split-mode (§7.7) counterpart of [`rdma_write`](Self::rdma_write): deliver
+    /// the body with RDMA write-with-immediate carrying `transfer_id`, so the
+    /// peer's data plane is signalled on its CQ. On `Ok(())` the payload landed
+    /// and the immediate was delivered; the caller then sends the HTTP response
+    /// (still `Content-Length: 0`). `len` may be `0` — an empty WR still carries
+    /// the immediate. Borrows the shared stream afresh on each poll.
+    pub async fn rdma_write_with_imm(
+        &self,
+        src: &RegisteredBuffer,
+        src_off: usize,
+        peer_addr: u64,
+        peer_rkey: u32,
+        len: usize,
+        transfer_id: u32,
+    ) -> io::Result<()> {
+        let mut w = PendingWrite {
+            src,
+            src_off,
+            peer_addr,
+            peer_rkey,
+            len,
+            imm: Some(transfer_id),
+            post_outcome: None,
+        };
+        std::future::poll_fn(|cx| self.0.borrow_mut().poll_rdma_write(cx, &mut w)).await
+    }
+
+    /// Receive the next split-mode (§7.7) transfer completion off the CQ,
+    /// returning its transfer ID — or `None` when the connection has closed with
+    /// none left queued. The data-plane primitive: no HTTP parsing, demultiplexed
+    /// by the ID the client put in `X-HORD-RDMA-Write`. Borrows the shared stream
+    /// afresh on each poll (no borrow held across the await).
+    pub async fn next_split_completion(&self) -> io::Result<Option<u32>> {
+        std::future::poll_fn(|cx| self.0.borrow_mut().poll_split_completion(cx)).await
     }
 }
 

@@ -126,3 +126,132 @@ fn rdma_write_round_trip() {
     drop(dst);
     server.join().expect("server thread panicked");
 }
+
+/// Smoke test for RDMA write-with-immediate ([`Connection::post_write_with_imm`])
+/// — the verb protocol splitting (§7.7) rests on. Unlike a plain write, this
+/// delivers a 32-bit immediate to the *receiver's* CQ as a
+/// `RecvRdmaWithImm` completion, consuming one of its posted receive WRs. So the
+/// client learns the payload landed from its **own** CQ — no out-of-band signal,
+/// no HTTP — which is the entire point of the split data plane.
+///
+/// We pick an immediate with bytes set across all four octets so a byte-order
+/// bug in the `htonl`/`ntohl` round-trip (shim) would corrupt it visibly.
+#[test]
+#[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+fn rdma_write_with_imm_round_trip() {
+    const PORT_IMM: u16 = 18521; // distinct from rdma_write_round_trip (18520)
+    const TRANSFER_ID: u32 = 0xA5C3_1234; // all four octets distinct
+
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (target_tx, target_rx) = mpsc::channel::<(u64, u32)>();
+    let teardown = Arc::new(Barrier::new(2));
+
+    let srv_teardown = Arc::clone(&teardown);
+    let server = std::thread::spawn(move || {
+        let listener = Listener::bind(IP, PORT_IMM).expect("bind");
+        ready_tx.send(()).expect("signal ready");
+        let (conn, _peer) = listener
+            .accept(4, 4, HS.len(), CmParams::default())
+            .expect("accept");
+        let conn = Arc::new(conn);
+        let src = conn
+            .register_buffer(LEN, ACCESS_LOCAL_WRITE)
+            .expect("register src");
+        src.copy_in(0, &pattern(LEN, 0x5A));
+        conn.accept_finish(HS).expect("accept_finish"); // -> RTS
+
+        let (raddr, rkey) = target_rx.recv().expect("recv target");
+        // One write-with-immediate for the whole region: lands the payload AND
+        // signals completion with the transfer ID.
+        unsafe {
+            conn.post_write_with_imm(
+                1,
+                src.as_mut_ptr(),
+                LEN as u32,
+                src.lkey(),
+                raddr,
+                rkey,
+                TRANSFER_ID,
+            )
+            .expect("post_write_with_imm");
+        }
+        // The sender still reaps an ordinary RdmaWrite completion.
+        let start = Instant::now();
+        let wc = loop {
+            if let Some(wc) = conn.poll().expect("poll") {
+                break wc;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "RDMA write-with-imm never completed (sender)"
+            );
+            std::hint::spin_loop();
+        };
+        assert!(wc.is_success(), "sender completion status {}", wc.status);
+        assert_eq!(wc.opcode, Opcode::RdmaWrite, "sender opcode");
+        assert_eq!(wc.wr_id, 1, "sender wr_id");
+
+        srv_teardown.wait();
+        conn.shutdown();
+    });
+
+    ready_rx.recv().expect("server ready");
+    let conn = Connection::connect(IP, PORT_IMM, 4, 4, CmParams::default()).expect("connect");
+    let conn = Arc::new(conn);
+    // Destination for the payload (remote-writable), plus a small receive buffer
+    // that the immediate will consume — the payload itself goes to `dst` via the
+    // remote address, not into this recv slot.
+    let dst = conn
+        .register_buffer(LEN, ACCESS_LOCAL_WRITE | ACCESS_REMOTE_WRITE)
+        .expect("register dst");
+    let rx = conn
+        .register_buffer(64, ACCESS_LOCAL_WRITE)
+        .expect("register rx");
+    // Pre-post the receive before the QP goes live, so the peer's
+    // write-with-imm never hits a receiver-not-ready.
+    unsafe {
+        conn.post_recv(7, rx.as_mut_ptr(), rx.len() as u32, rx.lkey())
+            .expect("post_recv");
+    }
+    let _peer = conn.connect_finish(HS, HS.len()).expect("connect_finish"); // -> RTS
+
+    target_tx
+        .send((dst.as_mut_ptr() as u64, dst.rkey()))
+        .expect("send target");
+
+    // Wait on our OWN CQ for the immediate — this is the data-plane signal.
+    let start = Instant::now();
+    let wc = loop {
+        if let Some(wc) = conn.poll().expect("poll") {
+            break wc;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "write-with-imm completion never arrived (receiver)"
+        );
+        std::hint::spin_loop();
+    };
+    assert!(wc.is_success(), "receiver completion status {}", wc.status);
+    assert_eq!(
+        wc.opcode,
+        Opcode::RecvRdmaWithImm,
+        "receiver opcode (expected RECV_RDMA_WITH_IMM)"
+    );
+    assert_eq!(wc.wr_id, 7, "consumed our posted recv WR");
+    assert_eq!(
+        wc.imm_data, TRANSFER_ID,
+        "transfer ID corrupted in flight (byte order?)"
+    );
+
+    // QP ordering guarantees the payload is fully landed by the time the
+    // immediate's completion surfaces (§7.7.2).
+    let mut got = vec![0u8; LEN];
+    dst.copy_out(0, &mut got);
+    assert_eq!(got, pattern(LEN, 0x5A), "write-with-imm payload mismatch");
+
+    teardown.wait();
+    conn.shutdown();
+    drop(dst);
+    drop(rx);
+    server.join().expect("server thread panicked");
+}

@@ -1,107 +1,96 @@
 # HORD prototype — TODO
 
-Work is tackled as focused passes (different kinds of work, different risk),
-each verified on the host's Soft-RoCE device (`rxe0`, see CLAUDE.md) and
-recorded in PROTOTYPE.md. Earlier passes are summarised here; the current pass
-is detailed.
-
-## Earlier passes (DONE — see PROTOTYPE.md for details)
-
-- **Code review pass** — fixed clear-cut correctness/soundness bugs (#1 #2 #4 #5
-  #7 #10 #12 #13).
-- **Pass 1 — Flow-control correctness** — full-duplex credit deadlock via a
-  self-clocked control lane (#3); receipt → consumption credit return, bounding
-  reassembly (#8).
-- **Pass 2 — Soundness & ownership** — aliasing UB closed with
-  `Box<[UnsafeCell<u8>]>` reached only by raw pointer (#9); MR↔PD lifetime made a
-  type guarantee via `RegisteredBuffer` (#6).
-- **Pass 3 — Async + hyper** — tokio `AsyncRead`/`AsyncWrite` parking on the CQ
-  completion fd (#15), `hyper` over the async stream, multi-connection server,
-  tunable CM params (#11), streamed bodies (#14), async half-close.
-
-## Pass 4 — Zero-copy RDMA-write (spec §7.1–7.4)  (DONE · branch `pass-4-zero-copy-rdma-write`)
-
-The first one-sided RDMA in the codebase: the server places a response body
-directly into the client's registered buffer via `IBV_WR_RDMA_WRITE`; the HTTP
-response carries `Content-Length: 0` + `X-HORD-RDMA-Write:
-status=complete;bytes_written=<n>`. No staging/reassembly copy on the data path.
-A new **`hord-zerocopy`** crate holds the HTTP semantics; the transport half
-lives in `hord-stream`/`hord-core`. Both demo paths (sync + async/hyper) gained
-zero-copy.
-
-### 4a — Transport verb (`hord-core` + C shim)  (DONE)
-- [x] `hord_post_write` (`IBV_WR_RDMA_WRITE`, `wr.rdma.remote_addr`/`rkey`) +
-      `HORD_WC_OPCODE_RDMA_WRITE`; `ACCESS_REMOTE_WRITE`; `Opcode::RdmaWrite`;
-      `Connection::post_write` (`unsafe`).
-- [x] Smoke test (`hord-core/tests/rdma_write_smoke.rs`, `#[ignore]`d): a 16 MiB
-      single-WR write over `rxe0` lands intact — de-risks the "one large WR,
-      NIC-segmented" assumption before the driver is built.
-
-### 4b — Negotiation + write driver (`hord-stream`)  (DONE)
-- [x] Handshake `ZERO_COPY_CAPABLE` (set via `Handshake::with_zero_copy`),
-      `HordConfig::zero_copy` (default true), `HordStream::zero_copy_negotiated`.
-      (Also fixed the flag layout to match spec §5.3: dropped the non-spec
-      `HTTP2_CAPABLE`, `SPLIT_MODE_CAPABLE` is now bit 1.)
-- [x] `register_remote_writable` (client dest, `LOCAL_WRITE|REMOTE_WRITE`) /
-      `register_source` (server src, `LOCAL_WRITE`) pass-throughs.
-- [x] Non-blocking write driver: a `WRITE_FLAG` `wr_id` routed **before** the
-      `is_send` branch in `handle_completion` (writes belong to neither pool — a
-      `writes_outstanding` counter), `begin_rdma_write` (chunks ≤ `WRITE_WR_MAX`
-      = 1 GiB, bounded by the send queue), `writes_pending`, and the blocking
-      facade `rdma_write_all`. Writes cost no credit and no send-pool slot.
-
-### 4c — `hord-zerocopy` crate  (DONE)
-- [x] Pure `X-HORD-RDMA-Write` codec: `RdmaWriteReq` (§12.3) and
-      `RdmaWriteStatus::{Complete,TooLarge,Declined}` (§12.4), parse + format,
-      7 unit tests (round-trips, the spec examples, malformed input).
-- [x] Sync orchestration over `&mut HordStream`: `ZeroCopyRequest` (client) and
-      `serve_rdma_write` (server: register source → fill → write → status).
-
-### 4d — Sync demo  (DONE — working milestone)
-- [x] `hord-client --zero-copy [--zc-buf <n>]`: advertise a buffer, read the body
-      from it on `complete`, fall back to the stream on `declined`/`too_large`.
-- [x] `hord-server`: RDMA-write `/size/<n>` into the client's buffer; §7.4
-      `status=declined` echoed on any body response to a zero-copy request.
-- [x] Verified over `rxe0`: 64 MiB zero-copy (integrity OK), too_large→413,
-      declined fallback on `GET /`, stream path regression-free.
-
-### 4e — Async write capability (`hord-async`)  (DONE)
-- [x] `SharedAsyncStream(Rc<RefCell<AsyncHordStream>>)`: `AsyncRead`/`AsyncWrite`
-      delegated by `borrow_mut` **per poll, never across an await**, so a `hyper`
-      server can drive an RDMA write from its handler while hyper owns the stream
-      (same CQ, same task). `register_remote_writable` / `register_source` /
-      `zero_copy_negotiated` pass-throughs; async `rdma_write` over
-      `poll_rdma_write` (reuses `poll_events`, no flow-control logic duplicated).
-
-### 4f — Async/hyper demo  (DONE)
-- [x] `hord-client-async --zero-copy`: register dest, add the header, read the
-      payload from the buffer after the (empty-body) response.
-- [x] `hord-server-async`: clone the shared handle into the `service_fn` closure,
-      `await` the RDMA write, respond `Content-Length: 0`. Verified over `rxe0`
-      (64 MiB zero-copy ~700 MiB/s, too_large, declined; no double-borrow).
-
-### 4g — Tests & docs  (DONE)
-- [x] `#[ignore]`d `rxe0` integration tests: sync `zerocopy_loopback` (complete +
-      too_large + integrity) and async `zerocopy` (`SharedAsyncStream` write).
-- [x] Codec unit tests; handshake flag round-trip. No regression in
-      `full_duplex_bulk` / async `loopback`.
-- [x] PROTOTYPE.md + this file + README spec findings updated.
-
----
-Fixed in the review pass: #1 #2 #4 #5 #7 #10 #12 #13.
-Pass 1: #3 #8. Pass 2: #6 #9. Pass 3: #15 #11 #14 + async half-close.
-
-## Remaining / future
-- [ ] **§7.7 protocol splitting** — `IBV_WR_RDMA_WRITE_WITH_IMM`, control/data
-      plane split, transfer credits. The natural next pass (the `id=` request
-      param is already parsed and currently ignored).
+- [x] **§7.7 protocol splitting** — done (Pass 7). `IBV_WR_RDMA_WRITE_WITH_IMM`
+      in the shim/core, `SPLIT_MODE_CAPABLE` negotiation, the opcode-demux
+      dispatcher + transfer-credit recv headroom in the stream, `with_id` / split
+      dispatch in `hord-zerocopy`, `SplitReceiver`, async `rdma_write_with_imm` /
+      `next_split_completion`, and `--split` on the async demo. Verified
+      end-to-end on Soft-RoCE (incl. the §7.7.7 mid-write failure path). The data
+      plane still shares the one driver task (see the multi-waiter item below); a
+      true separate data-plane consumer thread is the remaining follow-up.
 - [ ] **§7.5 GPUDirect** — untestable on this host (no GPU / real NIC); the
       addr/rkey path is opaque, so it should work unchanged on capable hardware.
 - [ ] **§7.6 range requests** — small add-on on top of the zero-copy path.
 - [ ] A zero-copy *source* buffer pool on the server (amortize registration —
-      §8.3) instead of registering per response.
+      §8.3) instead of registering per response. Also covers the split-mode
+      source registered per response.
 - [ ] Concurrent independent read+write on one async stream (two tasks over
-      `tokio::io::split`) needs a multi-waiter scheme on the completion fd.
+      `tokio::io::split`) needs a multi-waiter scheme on the completion fd. The
+      same gap blocks a true HTTP-unaware split *data-plane* consumer running on
+      its own thread; for now it shares the control plane's driver task.
 - [ ] Half-close detection on the *synchronous* stream (the async path has it).
 - [ ] True thread-per-core server (worker pool + `spawn_local`) instead of one OS
       thread per connection.
+
+## Deferred from the Pass 7 (§7.7) code review
+
+Surfaced by the high-effort review of the protocol-splitting work and consciously
+deferred — none is a live bug on the supported single-task path. Context kept so a
+future pass has what it needs.
+
+- [ ] **Transfer credits are neither enforced nor advertised (spec §7.7.6).** The
+      receiver pre-posts a fixed `split_credits` (default 8) recv-WR headroom, but
+      (a) the count never travels on the wire — the 16-byte handshake carries only
+      the `SPLIT_MODE_CAPABLE` bit — and (b) the sender's `begin_rdma_write_with_imm`
+      bounds a write only against local free send slots, never against how many recv
+      WRs the peer has posted. So `split_credits` is a *local sizing heuristic*, not
+      flow control. **Failure:** a concurrent split sender (not the demo, which
+      serialises over HTTP/1.1 keep-alive) with more in-flight write-with-immediates
+      than the peer's posted recv WRs — reachable when split traffic runs alongside
+      unread stream data holding recv slots, or when `send_pool_size` is configured
+      above the recv headroom — hits RNR. Under the default `rnr_retry=7` (infinite)
+      this *stalls* the transfer indefinitely; if `rnr_retry` is lowered the QP errors
+      and the connection dies, with no diagnostic. **Fix:** carry a credit count in
+      the handshake and add sender-side in-flight-transfer accounting (a real window)
+      so an overrun back-pressures instead of RNR-ing. This is a protocol feature
+      (wire-format change), not a local patch — hence deferred.
+
+- [ ] **Multi-WR split write (> `WRITE_WR_MAX` = 1 GiB) can skip the immediate.** The
+      immediate rides only the final WR (`begin_rdma_write_inner`); if a *non-final*
+      chunk's `ibv_post_send` fails mid-batch, the call returns `Err` having never
+      posted the imm-bearing WR, so the peer's recv WR is never consumed and no
+      data-plane completion is delivered. The async client recovers via connection
+      teardown (`peer_closed` → close); the residual is the *sync* path, which has no
+      half-close detection (see the sync half-close item above). **Fix:** on a
+      partial-post failure in split mode, guarantee the connection is observably
+      closed on both paths (or surface an error-bearing completion). Narrow (needs a
+      > 1 GiB object *and* a mid-batch post failure).
+
+- [ ] **Data-plane completion queue has no backpressure.** A `RecvRdmaWithImm`
+      reposts its recv WR immediately (spec §7.7.5 *requires* this) and pushes the id
+      onto an unbounded `completed_transfers` `VecDeque`, so a client that pipelines
+      many split requests and drains slowly accumulates queued ids without the
+      transport throttling it (unlike stream data, which holds its recv buffer until
+      `read()`). Bounded by the client's own outstanding requests; entries are 4
+      bytes. **Note:** cannot be fixed at the transport layer without violating the
+      §7.7.5 "repost immediately" rule — any cap belongs to the data-plane consumer
+      API, not the stream. Captured for awareness, likely WONTFIX at this layer.
+
+- [ ] **Split recv headroom is pinned before negotiation.** `recv_wr_count` sizes and
+      `post_all_recvs` posts `split_credits` extra recv WRs from the *local* config at
+      construction (before the handshake), so a connection that advertises split mode
+      pins `split_credits * max_message_size` (default 512 KiB) per connection even
+      against peers that never negotiate it. Can't be revised post-handshake because
+      receives must be pre-posted before the QP goes live (the two-phase RNR-avoidance
+      design). **Fix:** register the split headroom into a *separate* MR and post it
+      lazily in `apply_peer` only when split mode survives negotiation. Interacts with
+      the source-buffer-pool and multi-waiter items above.
+
+- [ ] **`serve_zero_copy` (async demo) forks `hord_zerocopy::serve_rdma_write`.** The
+      async server can't `.await` the sync library orchestration, so the §7.7 policy
+      (too_large gate, id/negotiation gate, the zero-length 1-byte-source workaround,
+      status mapping) is duplicated — and the zero-length workaround now lives in
+      three layers (stream `begin_rdma_write_inner`, `serve_rdma_write`, demo
+      `serve_zero_copy`). **Failure (maintenance):** a spec/policy change applied to
+      the library silently won't reach the deployed async path. **Fix:** provide an
+      async-capable orchestration in the library (generic over a sync/async write
+      strategy, or an async variant in `hord-async`) and have both servers call it.
+      Deferred because adding library API solely for a demo is the wrong altitude; a
+      proper async orchestration is a feature.
+
+- [ ] **Minor cleanup (low priority).** The `pattern()` LCG test helper is copy-pasted
+      across 5 test modules in 3 crates — a shared test-support location would prevent
+      cross-crate drift, but a dedicated crate for a 7-line fn is over-engineering for
+      now. (Left as-is by design: the `begin_rdma_write`/`rdma_write_all`
+      `_with_imm`/`_inner` wrapper trios and the C `hord_post_write`/`_with_imm` pair —
+      named methods read better at call sites than threading an `Option<u32>`.)

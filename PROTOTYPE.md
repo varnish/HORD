@@ -4,12 +4,14 @@ A first working implementation of the HORD stream path: **HTTP/1.1 over RDMA
 RC**, demonstrated end-to-end over Soft-RoCE.
 
 This implements the two-sided (send/recv) transport described in spec sections
-4–6, 8 and 9, **plus the zero-copy / RDMA-write extension (spec section 7.1–7.4)**:
+4–6, 8 and 9, **the zero-copy / RDMA-write extension (spec section 7.1–7.4)** —
 one-sided `IBV_WR_RDMA_WRITE` straight into a client-registered buffer, advertised
-via `X-HORD-RDMA-Write`. Still out of scope: §7.7 protocol splitting
-(write-with-immediate) and §7.5 GPUDirect (untestable here — no GPU/real NIC —
-though the addr/rkey path is opaque, so it should work unchanged on capable
-hardware).
+via `X-HORD-RDMA-Write` — **and protocol splitting (spec §7.7)**:
+`IBV_WR_RDMA_WRITE_WITH_IMM` delivers the payload plus a transfer-ID immediate to
+the client's CQ, so a data-plane consumer collects payloads off the completion
+queue without parsing HTTP. The only spec feature still unbuilt is §7.5 GPUDirect
+(untestable here — no GPU/real NIC — though the addr/rkey path is opaque, so it
+should work unchanged on capable hardware).
 
 ## What works
 
@@ -30,6 +32,16 @@ hardware).
   the body never touches the stream. The `too_large` (413) and `declined`
   (stream fallback) outcomes are handled too. Works on both the sync and
   async/hyper demos.
+- **Protocol splitting (spec §7.7).** When both peers also advertise
+  `SPLIT_MODE_CAPABLE`, a request carrying `;id=<n>` is served with
+  `IBV_WR_RDMA_WRITE_WITH_IMM`: the write lands the payload and delivers the
+  transfer ID to the client's CQ as a `RECV_RDMA_WITH_IMM` completion. A
+  dispatcher in the stream demuxes completions by opcode (stream message vs.
+  payload), so the *data plane* (`SplitReceiver` / async `next_split_completion`)
+  collects payloads by ID — out of order, with no HTTP parsing — while the
+  control plane still gets the `status=complete` HTTP response. Transfer credits
+  (§7.7.6) are pre-posted recv headroom; an immediate returns no stream data
+  credit. The `--split` flag on the async/hyper demo exercises it end to end.
 
 Verified on this host's Soft-RoCE device (`rxe0`, loopback over `enp14s0`):
 ~0.7–0.75 GiB/s for bodies from 1 MiB to 1 GiB, flat with size, byte-pattern
@@ -59,15 +71,21 @@ hord-stream/   HORD wire protocol: handshake, envelope, credit flow control,
                and the HordStream byte stream (Read + Write), factored over a
                non-blocking core that both the sync facade and the async wrapper
                drive. Also the zero-copy transport half: capability negotiation,
-               buffer registration, and the one-sided RDMA-write driver.
+               buffer registration, and the one-sided RDMA-write driver — plus the
+               §7.7 split half: write-with-immediate, the completion dispatcher
+               (demux by opcode), transfer-credit recv headroom, and the
+               data-plane transfer queue.
 hord-zerocopy/ Zero-copy HTTP semantics (spec §7): the X-HORD-RDMA-Write header
-               codec and the client/server orchestration over a HordStream.
+               codec and the client/server orchestration over a HordStream;
+               split-mode dispatch (§7.7) and the SplitReceiver data-plane handle.
 hord-async/    Async wrapper: tokio AsyncRead/AsyncWrite over a HordStream,
                driving the CQ completion-channel fd with AsyncFd (no busy-poll);
-               SharedAsyncStream lets a hyper handler drive a zero-copy write.
+               SharedAsyncStream lets a hyper handler drive a zero-copy or
+               split-mode (write-with-imm) write, and next_split_completion
+               receives data-plane completions.
 hord-demo/     hord-server / hord-client (sync) and hord-server-async /
                hord-client-async (hyper over the async stream). --zero-copy opts
-               into the RDMA-write path.
+               into the RDMA-write path; --split (async) opts into §7.7.
 ```
 
 `hord-core`, `hord-stream` and `hord-zerocopy` have **no third-party crate
@@ -166,11 +184,16 @@ What remains:
   `hyper` uses it); two tasks over `tokio::io::split` would both wait on the one
   completion fd and need a multi-waiter scheme. (`SharedAsyncStream` keeps a
   zero-copy write on that *same* one task — it does not add a second waiter.)
+  This is also why the §7.7 *data plane* shares the control plane's task rather
+  than running as an independent HTTP-unaware consumer thread polling the shared
+  CQ directly — the spec's intended split. The mechanism (write-with-immediate,
+  opcode demux, demux-by-ID) is all there; only the second waiter is deferred.
 - **Thread-per-connection, not thread-per-core.** A real server would use a
   bounded worker pool with `spawn_local`, not one OS thread per connection.
 - **Zero-copy source registered per response.** The server registers (and frees)
-  a source MR per zero-copy response; a real server would amortize this with a
-  pool (spec §8.3). §7.7 protocol splitting and §7.5 GPUDirect remain unbuilt.
+  a source MR per zero-copy *or split-mode* response; a real server would
+  amortize this with a pool (spec §8.3). §7.5 GPUDirect remains unbuilt
+  (untestable on this host — see above).
 
 ## Open issues from code review (deferred, by design)
 
@@ -254,3 +277,29 @@ Both of the remaining design-level items were then closed by the **async pass**:
   `addr` advertised in `X-HORD-RDMA-Write` is the buffer's absolute virtual
   address and `rkey` is its MR rkey, exactly as §12.3 describes — confirmed
   interoperable end to end.
+- **Split-mode completion opcode (spec §7.7.5).** The client recognises a payload
+  completion by the verbs opcode `IBV_WC_RECV_RDMA_WITH_IMM` (value **129** =
+  `(1<<7)+1`, the entry after `IBV_WC_RECV`), confirmed on Soft-RoCE. Worth
+  stating the opcode explicitly in §7.7.5 alongside "demultiplexes by opcode".
+- **Immediate byte order (spec §12).** §12 says the immediate is presented "in
+  host byte order ... the verbs implementation handles conversion." In practice
+  the verbs `imm_data` field is `__be32` and *no* automatic conversion happens —
+  the application must `htonl` on send and `ntohl` on receive (this prototype
+  does so in the C shim, so Rust sees a host-order `u32`). Same-endian peers round
+  trip either way; the conversion only matters cross-endian. Recommend §12 say
+  the immediate travels big-endian on the wire and the application is responsible
+  for the conversion (rather than implying the library does it).
+- **The recv buffer a write-with-imm consumes carries no data (spec §7.7.5).**
+  The payload lands in the client's *remote-writable* region (via `remote_addr`),
+  not in the consumed receive WR's buffer. §7.7.5 already says "contains no data
+  ... reposted immediately"; worth adding that the completion's `byte_len` is
+  therefore not a length into that buffer and MUST NOT be used to read it.
+- **Transfer-credit posting (spec §7.7.6).** §7.7.6 has the client post one extra
+  recv buffer *per* split request. This prototype instead pre-posts a fixed
+  `split_credits` headroom of recv WRs (a config knob, default 8) on top of the
+  data pool and control slack, reposting each on consumption. It satisfies the
+  intent (a recv WR is always available for an immediate, without starving the
+  data window) without dynamically growing the recv queue per request — simpler,
+  at the cost of bounding concurrent in-flight split transfers to that headroom.
+  Either model is spec-conformant on the wire; worth noting the headroom approach
+  as an option.

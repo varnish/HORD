@@ -71,6 +71,18 @@ pub struct HordConfig {
     /// when `true` even if unused: it only takes effect once a peer sends an
     /// `X-HORD-RDMA-Write` request and we elect to honour it.
     pub zero_copy: bool,
+    /// Advertise protocol splitting (spec §7.7) in our handshake. Per §5.3 it
+    /// requires `zero_copy`; advertised only when both are set. When negotiated,
+    /// a split-mode request (one carrying an `id`) is served with RDMA
+    /// write-with-immediate so the data plane learns of payload arrival from the
+    /// CQ rather than the HTTP response.
+    pub split_mode: bool,
+    /// Transfer credits (spec §7.7.6): receive WRs reserved, on top of the data
+    /// pool and control slack, for in-flight split-mode transfers. Each
+    /// write-with-immediate consumes one posted recv WR; this headroom bounds
+    /// the concurrent split transfers a peer can have in flight without starving
+    /// the data receive window. Ignored unless `split_mode`.
+    pub split_credits: usize,
 }
 
 impl Default for HordConfig {
@@ -81,6 +93,8 @@ impl Default for HordConfig {
             send_pool_size: 16,
             cm: CmParams::default(),
             zero_copy: true,
+            split_mode: true,
+            split_credits: 8,
         }
     }
 }
@@ -96,6 +110,27 @@ const CTRL_RECV_SLACK: usize = 2;
 // Reserved send buffers for the control lane. One is enough: a credit-return is
 // bounded to a single in-flight message and self-clocks on its completion.
 const CTRL_SEND_SLOTS: usize = 1;
+
+// Transfer-credit (spec §7.7.6) receive headroom: zero unless we advertise split
+// mode, otherwise `split_credits`. A write-with-immediate consumes one posted
+// recv WR; this slack keeps concurrent split transfers from cannibalising the
+// data receive window. We size for our *own* advertised intent at construction
+// (the peer's capability isn't known until the handshake completes); if the peer
+// turns out not to support split mode, the extra posted WRs are simply unused.
+fn split_slack(config: &HordConfig) -> usize {
+    if config.split_mode {
+        config.split_credits
+    } else {
+        0
+    }
+}
+
+// Total receive WRs the QP must hold and we keep posted: the data pool, the
+// control slack, and the split-mode transfer headroom. `cqe` in hord-core is
+// derived from send_wr + recv_wr, so growing this auto-sizes the CQ.
+fn recv_wr_count(config: &HordConfig) -> usize {
+    config.recv_pool_size + CTRL_RECV_SLACK + split_slack(config)
+}
 
 // wr_id encoding: top bit distinguishes sends from receives; the next bit marks
 // the reserved control send (so its completion frees the control slot rather
@@ -166,6 +201,7 @@ pub struct HordStream {
     msg_size: usize,    // bytes per buffer slot (our max_message_size)
     payload_cap: usize, // max payload per message = min(ours, peer) - ENVELOPE_LEN
     recv_pool: usize,
+    recv_total: usize, // recv WRs we keep posted: data pool + ctrl slack + split slack
     send_pool: usize,
 
     send_free: Vec<usize>, // free *data* send slot indices (the control slot is separate)
@@ -184,6 +220,16 @@ pub struct HordStream {
     // advertised the capability".
     zero_copy: bool,
     writes_outstanding: u32,  // one-sided RDMA writes posted but not yet reaped
+
+    // ---- protocol splitting (spec §7.7) ----
+    // Like `zero_copy`: our config AND-ed with the peer's flag (and our own
+    // zero-copy) in `apply_peer`.
+    split_mode: bool,
+    // Transfer IDs from `RECV_RDMA_WITH_IMM` completions, awaiting the data-plane
+    // consumer (`next_completed_transfer` / `poll_completed_transfer`). The
+    // dispatcher in `handle_completion` demultiplexes these from stream messages
+    // by opcode (spec §7.7.1).
+    completed_transfers: VecDeque<u32>,
 }
 
 impl HordStream {
@@ -209,10 +255,11 @@ impl HordStream {
         listener: &Listener,
         config: &HordConfig,
     ) -> io::Result<(Connection, Vec<u8>)> {
-        // The QP must hold the control lane's extra WRs on top of the data pools.
+        // The QP must hold the control lane's extra WRs and the split-mode
+        // transfer headroom on top of the data pools.
         listener.accept(
             config.send_pool_size + CTRL_SEND_SLOTS,
-            config.recv_pool_size + CTRL_RECV_SLACK,
+            recv_wr_count(config),
             HANDSHAKE_LEN,
             config.cm,
         )
@@ -229,24 +276,27 @@ impl HordStream {
         let peer = Handshake::decode(&peer_bytes)?;
         s.apply_peer(&peer)?;
         let my = Handshake::new(config.max_message_size as u32, config.recv_pool_size as u16)
-            .with_zero_copy(config.zero_copy);
+            .with_zero_copy(config.zero_copy)
+            .with_split_mode(config.split_mode && config.zero_copy);
         s.conn.accept_finish(&my.encode())?;
         Ok(s)
     }
 
     /// Client side: connect to `ip:port` and complete the HORD handshake.
     pub fn connect(ip: &str, port: u16, config: &HordConfig) -> io::Result<HordStream> {
-        // The QP must hold the control lane's extra WRs on top of the data pools.
+        // The QP must hold the control lane's extra WRs and the split-mode
+        // transfer headroom on top of the data pools.
         let conn = Connection::connect(
             ip,
             port,
             config.send_pool_size + CTRL_SEND_SLOTS,
-            config.recv_pool_size + CTRL_RECV_SLACK,
+            recv_wr_count(config),
             config.cm,
         )?;
         let mut s = HordStream::new_common(conn, config)?;
         let my = Handshake::new(config.max_message_size as u32, config.recv_pool_size as u16)
-            .with_zero_copy(config.zero_copy);
+            .with_zero_copy(config.zero_copy)
+            .with_split_mode(config.split_mode && config.zero_copy);
         let peer_bytes = s.conn.connect_finish(&my.encode(), HANDSHAKE_LEN)?;
         let peer = Handshake::decode(&peer_bytes)?;
         s.apply_peer(&peer)?;
@@ -262,10 +312,10 @@ impl HordStream {
         let send_pool = config.send_pool_size;
         assert!(msg_size > ENVELOPE_LEN, "max_message_size too small");
 
-        // recv carries the data pool plus the always-posted control slack;
-        // send carries the data pool plus the reserved control send slot
-        // (the highest index, `send_pool`).
-        let recv_slots = recv_pool + CTRL_RECV_SLACK;
+        // recv carries the data pool plus the always-posted control slack plus
+        // the split-mode transfer headroom; send carries the data pool plus the
+        // reserved control send slot (the highest index, `send_pool`).
+        let recv_slots = recv_wr_count(config);
         let send_slots = send_pool + CTRL_SEND_SLOTS;
 
         // `register_buffer` allocates the (UnsafeCell-backed) storage and ties
@@ -289,6 +339,7 @@ impl HordStream {
             msg_size,
             payload_cap: 0,
             recv_pool,
+            recv_total: recv_slots,
             send_pool,
             send_free: (0..send_pool).rev().collect(),
             send_credits: 0,
@@ -300,6 +351,8 @@ impl HordStream {
             peer_closed: false,
             zero_copy: config.zero_copy,
             writes_outstanding: 0,
+            split_mode: config.split_mode,
+            completed_transfers: VecDeque::new(),
         };
         s.post_all_recvs()?;
         Ok(s)
@@ -309,9 +362,9 @@ impl HordStream {
         let base = self.recv.as_mut_ptr();
         let msg = self.msg_size;
         let lkey = self.recv.lkey();
-        // Post the data pool *and* the control slack; both are needed before the
-        // QP can carry traffic.
-        for slot in 0..self.recv_pool + CTRL_RECV_SLACK {
+        // Post the data pool, the control slack, *and* the split-mode transfer
+        // headroom; all are needed before the QP can carry traffic.
+        for slot in 0..self.recv_total {
             // SAFETY: `base + slot*msg` lies within `recv` (a single MR with
             // `lkey`), which holds an Arc<Connection> so it outlives the QP.
             unsafe {
@@ -334,6 +387,10 @@ impl HordStream {
         self.payload_cap = effective - ENVELOPE_LEN;
         self.send_credits = peer.max_recv_buffers as u32;
         self.zero_copy &= peer.zero_copy_capable();
+        // Split mode requires zero-copy (§5.3): AND in the *negotiated* zero-copy
+        // result, so it can never be on without zero-copy even if a peer set the
+        // bit in violation of the spec.
+        self.split_mode &= peer.split_mode_capable() && self.zero_copy;
         Ok(())
     }
 
@@ -355,6 +412,45 @@ impl HordStream {
     /// `X-HORD-RDMA-Write` exchange.
     pub fn zero_copy_negotiated(&self) -> bool {
         self.zero_copy
+    }
+
+    /// Whether protocol splitting (spec §7.7) is usable on this connection: both
+    /// peers advertised `SPLIT_MODE_CAPABLE` *and* `ZERO_COPY_CAPABLE`. The
+    /// zero-copy HTTP layer gates on this before serving a split-mode request
+    /// (one carrying an `id`) with write-with-immediate.
+    pub fn split_mode_negotiated(&self) -> bool {
+        self.split_mode
+    }
+
+    /// Pop the next completed split-mode transfer ID, if a `RECV_RDMA_WITH_IMM`
+    /// completion has been reaped (drive the CQ first via
+    /// [`drain_completions`](Self::drain_completions) or
+    /// [`poll_completed_transfer`](Self::poll_completed_transfer)). This is the
+    /// non-blocking data-plane primitive (spec §7.7.5); the async wrapper builds
+    /// on it.
+    pub fn next_completed_transfer(&mut self) -> Option<u32> {
+        self.completed_transfers.pop_front()
+    }
+
+    /// Whether any completed split-mode transfer is queued.
+    pub fn has_completed_transfers(&self) -> bool {
+        !self.completed_transfers.is_empty()
+    }
+
+    /// Blocking data-plane receive (sync reference path): busy-poll the CQ until
+    /// a split-mode transfer completes, returning its 32-bit ID — or `None` if
+    /// the connection closes first. Mirrors [`rdma_write_all`](Self::rdma_write_all)'s
+    /// busy-poll style; the async stream parks on the completion fd instead.
+    pub fn poll_completed_transfer(&mut self) -> io::Result<Option<u32>> {
+        loop {
+            if let Some(id) = self.completed_transfers.pop_front() {
+                return Ok(Some(id));
+            }
+            if self.peer_closed {
+                return Ok(None);
+            }
+            self.pump(true)?;
+        }
     }
 
     /// Register `len` zeroed bytes the **peer may RDMA-write into** (client side:
@@ -397,6 +493,24 @@ impl HordStream {
     }
 
     fn handle_completion(&mut self, wc: Completion) -> io::Result<()> {
+        // Data-plane completion (spec §7.7): a write-with-immediate landed its
+        // payload in the application's remote-writable buffer and consumed one of
+        // our posted recv WRs to deliver the 32-bit transfer ID. This is the
+        // dispatcher's demux-by-opcode (§7.7.1) — recognise it *before* the
+        // generic recv path, which would otherwise try to decode an envelope from
+        // a slot the write never touched. No data credit is returned: the peer
+        // spent no stream credit (the recv WR was an implicit transfer credit,
+        // §7.7.6); we simply repost the slot to keep the window full (§7.7.5).
+        if wc.opcode == Opcode::RecvRdmaWithImm {
+            if !wc.is_success() {
+                self.peer_closed = true;
+                return Ok(());
+            }
+            self.completed_transfers.push_back(wc.imm_data);
+            self.repost_recv(slot_of(wc.wr_id))?;
+            return Ok(());
+        }
+
         // One-sided RDMA write (zero-copy). It belongs to neither the send pool
         // nor the recv pool — just a counter — so reap it first, on both the
         // success and failure paths. A failed write means the peer's buffer is in
@@ -414,8 +528,14 @@ impl HordStream {
             // Flush or transport error (commonly seen when the peer
             // disconnects and our outstanding recvs are flushed). Treat as a
             // closed connection rather than a hard error so reads see EOF.
+            // Only reclaim a *send* slot: a flushed recv WR (or a write-with-imm
+            // recv whose opcode the NIC didn't report as RecvRdmaWithImm) carries
+            // a recv-slot wr_id, and pushing that onto `send_free` would corrupt
+            // the send free-list with a recv-pool index.
             self.peer_closed = true;
-            self.reclaim_send(wc.wr_id);
+            if is_send(wc.wr_id) {
+                self.reclaim_send(wc.wr_id);
+            }
             return Ok(());
         }
 
@@ -786,6 +906,43 @@ impl HordStream {
         peer_rkey: u32,
         len: usize,
     ) -> io::Result<()> {
+        self.begin_rdma_write_inner(src, src_off, peer_addr, peer_rkey, len, None)
+    }
+
+    /// Like [`begin_rdma_write`](Self::begin_rdma_write), but the final WR is an
+    /// RDMA write-with-immediate carrying `transfer_id` (spec §7.7 protocol
+    /// splitting): it lands the last payload bytes — or, for a zero-length body,
+    /// an empty WR — and delivers `transfer_id` to the peer's CQ, consuming one
+    /// of its posted recv WRs (a transfer credit, §7.7.6). Gate on
+    /// [`split_mode_negotiated`](Self::split_mode_negotiated). Non-blocking; the
+    /// blocking [`rdma_write_all_with_imm`](Self::rdma_write_all_with_imm) builds
+    /// on this.
+    pub fn begin_rdma_write_with_imm(
+        &mut self,
+        src: &RegisteredBuffer,
+        src_off: usize,
+        peer_addr: u64,
+        peer_rkey: u32,
+        len: usize,
+        transfer_id: u32,
+    ) -> io::Result<()> {
+        self.begin_rdma_write_inner(src, src_off, peer_addr, peer_rkey, len, Some(transfer_id))
+    }
+
+    /// Shared driver behind [`begin_rdma_write`](Self::begin_rdma_write) and
+    /// [`begin_rdma_write_with_imm`](Self::begin_rdma_write_with_imm). When `imm`
+    /// is `Some`, the *last* WR uses write-with-immediate; a zero-length body
+    /// still emits one empty write-with-immediate so the transfer ID is always
+    /// delivered (§7.7.4 step 2).
+    fn begin_rdma_write_inner(
+        &mut self,
+        src: &RegisteredBuffer,
+        src_off: usize,
+        peer_addr: u64,
+        peer_rkey: u32,
+        len: usize,
+        imm: Option<u32>,
+    ) -> io::Result<()> {
         if self.peer_closed {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
         }
@@ -799,8 +956,16 @@ impl HordStream {
         // earlier in-flight writes, leaving the control slot reserved for credit
         // returns. Bound the write against the data slots actually free *now* —
         // `send_free` tracks free data slots, of which `writes_outstanding` are
-        // already taken by posted writes (writes don't draw from `send_free`).
-        let n_wrs = len.div_ceil(WRITE_WR_MAX);
+        // already taken by posted writes (writes don't draw from `send_free`). A
+        // zero-length split write still needs one slot for its imm-only WR.
+        let n_wrs = {
+            let data = len.div_ceil(WRITE_WR_MAX);
+            if imm.is_some() {
+                data.max(1)
+            } else {
+                data
+            }
+        };
         let free_slots = self
             .send_free
             .len()
@@ -821,20 +986,33 @@ impl HordStream {
         let mut chunk = 0u64;
         while off < len {
             let n = (len - off).min(WRITE_WR_MAX);
+            let is_last = off + n == len;
             // SAFETY: `[base+src_off+off, +n)` lies within `src`, which the caller
             // keeps alive until the completion is reaped; the destination is
             // authorized by the peer-supplied rkey. A bad/stale rkey fails the WR,
             // transitioning the QP to error → `peer_closed` (handled on the
             // completion). The src pointer is stable (the storage is boxed).
             let r = unsafe {
-                self.conn.post_write(
-                    write_wr_id(chunk),
-                    base.add(src_off + off),
-                    n as u32,
-                    lkey,
-                    peer_addr + off as u64,
-                    peer_rkey,
-                )
+                match imm {
+                    // The immediate rides the last WR (§7.7.4 step 2).
+                    Some(id) if is_last => self.conn.post_write_with_imm(
+                        write_wr_id(chunk),
+                        base.add(src_off + off),
+                        n as u32,
+                        lkey,
+                        peer_addr + off as u64,
+                        peer_rkey,
+                        id,
+                    ),
+                    _ => self.conn.post_write(
+                        write_wr_id(chunk),
+                        base.add(src_off + off),
+                        n as u32,
+                        lkey,
+                        peer_addr + off as u64,
+                        peer_rkey,
+                    ),
+                }
             };
             if let Err(e) = r {
                 self.peer_closed = true;
@@ -843,6 +1021,30 @@ impl HordStream {
             self.writes_outstanding += 1;
             off += n;
             chunk += 1;
+        }
+        // Zero-length split write: the loop posted nothing, so emit one empty
+        // write-with-immediate purely to deliver the transfer ID.
+        if len == 0 {
+            if let Some(id) = imm {
+                // SAFETY: a 0-byte SGE reads nothing from `src`; `base` is a valid
+                // registered pointer and the rkey contract is as above.
+                let r = unsafe {
+                    self.conn.post_write_with_imm(
+                        write_wr_id(chunk),
+                        base.add(src_off),
+                        0,
+                        lkey,
+                        peer_addr,
+                        peer_rkey,
+                        id,
+                    )
+                };
+                if let Err(e) = r {
+                    self.peer_closed = true;
+                    return Err(e);
+                }
+                self.writes_outstanding += 1;
+            }
         }
         Ok(())
     }
@@ -866,13 +1068,45 @@ impl HordStream {
         peer_rkey: u32,
         len: usize,
     ) -> io::Result<()> {
-        // If a WR fails to post mid-batch, `begin_rdma_write` returns Err but the
-        // WRs that DID post are still queued on the NIC. We must drain every
-        // posted write (reap its completion) before returning, or the caller will
-        // drop `src` — deregistering its MR and freeing the storage — while the
-        // NIC is still DMA-reading it (use-after-free). So drain first, propagate
-        // the post error after.
-        let posted = self.begin_rdma_write(src, src_off, peer_addr, peer_rkey, len);
+        self.rdma_write_all_inner(src, src_off, peer_addr, peer_rkey, len, None)
+    }
+
+    /// Blocking facade over
+    /// [`begin_rdma_write_with_imm`](Self::begin_rdma_write_with_imm) (spec §7.7):
+    /// post the payload + the final write-with-immediate carrying `transfer_id`,
+    /// then busy-poll until every WR is acknowledged. On `Ok(())` the payload is
+    /// in the peer's memory and the transfer ID has been delivered to its CQ, so
+    /// the caller may report `status=complete`. A transport failure mid-write
+    /// closes the stream and returns an error (spec §7.7.7: never report
+    /// `complete` on a partial write).
+    pub fn rdma_write_all_with_imm(
+        &mut self,
+        src: &RegisteredBuffer,
+        src_off: usize,
+        peer_addr: u64,
+        peer_rkey: u32,
+        len: usize,
+        transfer_id: u32,
+    ) -> io::Result<()> {
+        self.rdma_write_all_inner(src, src_off, peer_addr, peer_rkey, len, Some(transfer_id))
+    }
+
+    fn rdma_write_all_inner(
+        &mut self,
+        src: &RegisteredBuffer,
+        src_off: usize,
+        peer_addr: u64,
+        peer_rkey: u32,
+        len: usize,
+        imm: Option<u32>,
+    ) -> io::Result<()> {
+        // If a WR fails to post mid-batch, the begin call returns Err but the WRs
+        // that DID post are still queued on the NIC. We must drain every posted
+        // write (reap its completion) before returning, or the caller will drop
+        // `src` — deregistering its MR and freeing the storage — while the NIC is
+        // still DMA-reading it (use-after-free). So drain first, propagate the
+        // post error after.
+        let posted = self.begin_rdma_write_inner(src, src_off, peer_addr, peer_rkey, len, imm);
         while self.writes_pending() {
             self.pump(true)?;
         }
@@ -1167,6 +1401,252 @@ mod fullduplex_tests {
         teardown.wait();
         drop(client);
 
+        server.join().expect("server thread panicked");
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    //! Protocol splitting (spec §7.7) end-to-end over a real RC connection: the
+    //! server delivers several payloads with RDMA write-with-immediate, and the
+    //! client's *data plane* learns of each arrival from its CQ — by transfer ID,
+    //! with no stream message and no HTTP parsing.
+    //!
+    //! The server fires all transfers (non-blocking) before reaping, so the full
+    //! default transfer-credit budget (`split_credits` = 8) is in flight at once,
+    //! and writes them in a different order than the client registered the
+    //! buffers, so the client must demultiplex purely by the ID in `wc.imm_data`
+    //! (§7.7.5). It also asserts the credit invariant that matters for this path:
+    //! an immediate returns *no* stream data credit.
+    //!
+    //! Scope note: this confirms `split_credits` concurrent immediates all land
+    //! and demux correctly; it does NOT test *over*-saturation (more in-flight
+    //! immediates than posted recv WRs), because transfer credits are not
+    //! sender-enforced — exceeding them RNR-stalls rather than erroring (a known
+    //! limitation; see PROTOTYPE.md / TODO.md).
+    //!
+    //! Needs the host's Soft-RoCE device (see CLAUDE.md), so it is `#[ignore]`d.
+    //! Run with:
+    //!
+    //! ```sh
+    //! cargo test -p hord-stream -- --ignored --nocapture split_mode_round_trip
+    //! ```
+
+    use super::*;
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+    const PORT: u16 = 18522; // distinct from full_duplex_bulk (18519) and the smokes
+    const STALL: Duration = Duration::from_secs(15);
+    // (transfer ID, payload length). Distinct IDs and sizes so a misrouted
+    // payload — or a byte-swapped ID — is caught. Exactly `split_credits` (8)
+    // entries so the full default transfer-credit budget is in flight at once;
+    // 8 <= send_pool (16) and 8 <= posted recv WRs (42), so no overrun.
+    const TRANSFERS: &[(u32, usize)] = &[
+        (10, 1 << 20), // 1 MiB
+        (20, 1 << 19), // 512 KiB
+        (30, 3 << 20), // 3 MiB
+        (40, 1 << 18), // 256 KiB
+        (50, 1 << 20), // 1 MiB
+        (60, 1 << 17), // 128 KiB
+        (70, 2 << 20), // 2 MiB
+        (80, 1 << 16), // 64 KiB
+    ];
+
+    fn pattern(len: usize, seed: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut x = seed as u32 | 1;
+        for _ in 0..len {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            out.push((x >> 16) as u8);
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+    fn split_mode_round_trip() {
+        let config = HordConfig::default(); // split_mode + zero_copy on by default
+
+        let teardown = Arc::new(Barrier::new(2));
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        // client -> server: (id, dest addr, dest rkey, len) for every buffer.
+        let (desc_tx, desc_rx) = mpsc::channel::<Vec<(u32, u64, u32, usize)>>();
+
+        let srv_config = config.clone();
+        let srv_teardown = Arc::clone(&teardown);
+        let server = std::thread::spawn(move || {
+            let listener = Listener::bind(IP, PORT).expect("bind");
+            ready_tx.send(()).expect("signal ready");
+            let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
+            assert!(
+                s.split_mode_negotiated(),
+                "server: split mode should have negotiated"
+            );
+
+            let descs = desc_rx.recv().expect("recv descriptors");
+            // Hold every source MR alive until all writes are acked (the NIC
+            // DMA-reads them); fill each with its ID-keyed pattern.
+            let mut srcs = Vec::new();
+            for &(id, _, _, len) in &descs {
+                let src = s.register_source(len).expect("register src");
+                src.copy_in(0, &pattern(len, id as u8));
+                srcs.push(src);
+            }
+            // Fire them in *reverse* registration order, all in flight at once,
+            // so arrival order can't match registration order on the client.
+            for (i, &(id, addr, rkey, len)) in descs.iter().enumerate().rev() {
+                s.begin_rdma_write_with_imm(&srcs[i], 0, addr, rkey, len, id)
+                    .expect("begin_rdma_write_with_imm");
+            }
+            // Reap every send-side completion before dropping the sources.
+            let start = Instant::now();
+            while s.writes_pending() {
+                s.pump(true).expect("pump");
+                assert!(start.elapsed() < STALL, "server writes never drained");
+            }
+            srv_teardown.wait();
+            drop(srcs);
+            // s drops after the client has collected everything.
+        });
+
+        ready_rx.recv().expect("server ready");
+        let mut client = HordStream::connect(IP, PORT, &config).expect("connect");
+        assert!(
+            client.split_mode_negotiated(),
+            "client: split mode should have negotiated"
+        );
+        let credits_before = client.send_credits;
+
+        // Register a destination buffer per transfer and advertise them.
+        let bufs: Vec<RegisteredBuffer> = TRANSFERS
+            .iter()
+            .map(|&(_, len)| client.register_remote_writable(len).expect("register dst"))
+            .collect();
+        let descs: Vec<(u32, u64, u32, usize)> = TRANSFERS
+            .iter()
+            .zip(&bufs)
+            .map(|(&(id, len), buf)| (id, buf.as_mut_ptr() as u64, buf.rkey(), len))
+            .collect();
+        desc_tx.send(descs).expect("send descriptors");
+
+        // Data plane: collect every transfer by ID from the CQ — no HTTP, no
+        // stream message. Verify each landed payload against its ID-keyed pattern.
+        let mut seen = std::collections::HashSet::new();
+        let start = Instant::now();
+        while seen.len() < TRANSFERS.len() {
+            match client.poll_completed_transfer().expect("poll_completed_transfer") {
+                Some(id) => {
+                    assert!(seen.insert(id), "transfer {id} completed twice");
+                    let (idx, &(_, len)) = TRANSFERS
+                        .iter()
+                        .enumerate()
+                        .find(|(_, &(tid, _))| tid == id)
+                        .unwrap_or_else(|| panic!("unknown transfer ID {id} in imm_data"));
+                    let mut got = vec![0u8; len];
+                    bufs[idx].copy_out(0, &mut got);
+                    assert_eq!(got, pattern(len, id as u8), "transfer {id} payload mismatch");
+                }
+                None => panic!("connection closed before all transfers completed"),
+            }
+            assert!(start.elapsed() < STALL, "data-plane completions stalled");
+        }
+
+        // The whole-buffer demux worked; now the credit invariant (§7.7.6): an
+        // immediate consumes a recv WR that cost the peer no stream credit, so it
+        // must return none — our send window is untouched and we owe no grant.
+        assert_eq!(
+            client.send_credits, credits_before,
+            "split-mode immediates must not perturb stream send credits"
+        );
+        assert_eq!(
+            client.grant_pending, 0,
+            "split-mode immediates must not accrue a data-credit grant debt"
+        );
+
+        teardown.wait();
+        drop(bufs);
+        drop(client);
+        server.join().expect("server thread panicked");
+    }
+
+    #[test]
+    #[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+    fn split_mode_mid_write_failure() {
+        // §7.7.7: when a write-with-immediate fails after posting, the QP enters
+        // the error state and the connection closes — the server MUST NOT report
+        // `complete`, and the data plane MUST surface the close rather than a
+        // phantom transfer. We force the failure deterministically by writing far
+        // more than the client's MR covers (an out-of-bounds remote access).
+        const PORT_FAIL: u16 = 18524;
+        const CLIENT_CAP: usize = 64 * 1024; // client's registered region
+        const WRITE_LEN: usize = 1 << 20; // server writes 1 MiB into it -> overflow
+
+        let config = HordConfig::default();
+        let teardown = Arc::new(Barrier::new(2));
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (target_tx, target_rx) = mpsc::channel::<(u64, u32)>();
+
+        let srv_config = config.clone();
+        let srv_teardown = Arc::clone(&teardown);
+        let server = std::thread::spawn(move || {
+            let listener = Listener::bind(IP, PORT_FAIL).expect("bind");
+            ready_tx.send(()).expect("signal ready");
+            let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
+            assert!(s.split_mode_negotiated());
+
+            let (addr, rkey) = target_rx.recv().expect("recv target");
+            let src = s.register_source(WRITE_LEN).expect("register src");
+            src.copy_in(0, &pattern(WRITE_LEN, 0x77));
+            // The write overflows the client's MR -> remote access error. The
+            // blocking facade drains the (failed) WR and returns Err; it MUST NOT
+            // succeed (which would let us report `complete`, §7.7.7).
+            let result = s.rdma_write_all_with_imm(&src, 0, addr, rkey, WRITE_LEN, 99);
+            assert!(
+                result.is_err(),
+                "out-of-bounds write-with-imm must fail, got {result:?}"
+            );
+            srv_teardown.wait();
+            drop(src); // safe: rdma_write_all_with_imm drained the WR before returning
+        });
+
+        ready_rx.recv().expect("server ready");
+        let mut client = HordStream::connect(IP, PORT_FAIL, &config).expect("connect");
+        assert!(client.split_mode_negotiated());
+        let buf = client.register_remote_writable(CLIENT_CAP).expect("register dst");
+        target_tx
+            .send((buf.as_mut_ptr() as u64, buf.rkey()))
+            .expect("send target");
+
+        // The failed write must surface as a close — never as a completed
+        // transfer. Bounded poll: a flushed completion (QP in error) sets
+        // peer_closed; a poll-level error is itself a close.
+        let start = Instant::now();
+        let outcome = loop {
+            if client.drain_completions().is_err() {
+                break None;
+            }
+            if let Some(id) = client.next_completed_transfer() {
+                break Some(id);
+            }
+            if client.is_closed() {
+                break None;
+            }
+            assert!(
+                start.elapsed() < STALL,
+                "neither a completion nor a close was observed after a failed write"
+            );
+            std::hint::spin_loop();
+        };
+        assert!(
+            outcome.is_none(),
+            "a failed write must not yield a transfer completion (got {outcome:?})"
+        );
+
+        teardown.wait();
+        drop(buf);
+        drop(client);
         server.join().expect("server thread panicked");
     }
 }

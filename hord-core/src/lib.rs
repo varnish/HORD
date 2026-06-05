@@ -138,12 +138,25 @@ mod ffi {
             err: *mut c_char,
             errlen: usize,
         ) -> c_int;
+        pub fn hord_post_write_with_imm(
+            c: *mut HordConn,
+            wr_id: u64,
+            addr: *mut c_void,
+            length: u32,
+            lkey: u32,
+            remote_addr: u64,
+            rkey: u32,
+            imm: u32,
+            err: *mut c_char,
+            errlen: usize,
+        ) -> c_int;
         pub fn hord_poll(
             c: *mut HordConn,
             wr_id: *mut u64,
             byte_len: *mut u32,
             opcode: *mut u32,
             status: *mut u32,
+            imm_data: *mut u32,
             err: *mut c_char,
             errlen: usize,
         ) -> c_int;
@@ -199,21 +212,27 @@ impl Default for CmParams {
 
 /// Work-completion opcode, as reported by the NIC. The stream path observes
 /// `Send` and `Recv`; the zero-copy extension adds `RdmaWrite` (the sender's
-/// completion for a one-sided RDMA write — write-with-immediate is not used).
+/// completion for a one-sided RDMA write). Protocol splitting (§7.7) adds
+/// `RecvRdmaWithImm` — the *receiver's* completion for a write-with-immediate,
+/// which consumes a posted recv WR and carries the immediate in
+/// [`Completion::imm_data`]. (The sender of a write-with-immediate still reaps
+/// an `RdmaWrite` completion.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opcode {
     Send,
     RdmaWrite,
     Recv,
+    RecvRdmaWithImm,
     Other(u32),
 }
 
 impl Opcode {
     fn from_raw(v: u32) -> Self {
         match v {
-            0 => Opcode::Send,        // IBV_WC_SEND
-            1 => Opcode::RdmaWrite,   // IBV_WC_RDMA_WRITE
-            128 => Opcode::Recv,      // IBV_WC_RECV
+            0 => Opcode::Send,             // IBV_WC_SEND
+            1 => Opcode::RdmaWrite,        // IBV_WC_RDMA_WRITE
+            128 => Opcode::Recv,           // IBV_WC_RECV (1 << 7)
+            129 => Opcode::RecvRdmaWithImm, // IBV_WC_RECV_RDMA_WITH_IMM
             other => Opcode::Other(other),
         }
     }
@@ -229,6 +248,9 @@ pub struct Completion {
     pub opcode: Opcode,
     /// Raw `ibv_wc_status`; `0` is `IBV_WC_SUCCESS`.
     pub status: u32,
+    /// The 32-bit immediate (host order) on a [`Opcode::RecvRdmaWithImm`]
+    /// completion; `0` for every other completion kind.
+    pub imm_data: u32,
 }
 
 impl Completion {
@@ -693,12 +715,53 @@ impl Connection {
         check_rc(rc, &err)
     }
 
+    /// Post a one-sided RDMA write-with-immediate (§7.7 protocol splitting):
+    /// like [`post_write`](Self::post_write), but atomically delivers `imm`
+    /// (host order) to the peer's CQ as a [`Opcode::RecvRdmaWithImm`] completion,
+    /// consuming one of the peer's posted receive WRs. `length` may be `0` (the
+    /// WR then carries only the immediate). The local completion the sender reaps
+    /// is still an [`Opcode::RdmaWrite`].
+    ///
+    /// # Safety
+    /// Same contract as [`post_write`](Self::post_write); additionally the peer
+    /// MUST have a receive WR posted, or the write fails with RNR and the QP
+    /// transitions to the error state.
+    // One argument over clippy's default threshold: this mirrors the verbs WR
+    // fields one-to-one (the sibling `post_write` sits exactly at the limit).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn post_write_with_imm(
+        &self,
+        wr_id: u64,
+        addr: *const u8,
+        length: u32,
+        lkey: u32,
+        remote_addr: u64,
+        rkey: u32,
+        imm: u32,
+    ) -> io::Result<()> {
+        let mut err = errbuf();
+        let rc = ffi::hord_post_write_with_imm(
+            self.raw,
+            wr_id,
+            addr as *mut c_void,
+            length,
+            lkey,
+            remote_addr,
+            rkey,
+            imm,
+            err.as_mut_ptr(),
+            err.len(),
+        );
+        check_rc(rc, &err)
+    }
+
     /// Poll once for a completion. `Ok(None)` means the CQ was empty.
     pub fn poll(&self) -> io::Result<Option<Completion>> {
         let mut wr_id = 0u64;
         let mut byte_len = 0u32;
         let mut opcode = 0u32;
         let mut status = 0u32;
+        let mut imm_data = 0u32;
         let mut err = errbuf();
         let rc = unsafe {
             ffi::hord_poll(
@@ -707,6 +770,7 @@ impl Connection {
                 &mut byte_len,
                 &mut opcode,
                 &mut status,
+                &mut imm_data,
                 err.as_mut_ptr(),
                 err.len(),
             )
@@ -722,6 +786,7 @@ impl Connection {
             byte_len,
             opcode: Opcode::from_raw(opcode),
             status,
+            imm_data,
         }))
     }
 
