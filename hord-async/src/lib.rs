@@ -176,17 +176,39 @@ impl AsyncHordStream {
         cx: &mut Context<'_>,
         w: &mut PendingWrite<'_>,
     ) -> Poll<io::Result<()>> {
-        if w.post_outcome.is_none() {
-            // Split mode (§7.7) rides the immediate on the final WR; plain
-            // zero-copy posts an ordinary write. Both reap as one-sided writes.
-            w.post_outcome = Some(match w.imm {
+        // Post on the first poll. Split mode (§7.7) rides the immediate on the
+        // final WR; plain zero-copy posts an ordinary write. Both reap as one-sided
+        // writes. A split post can hit transfer-credit back-pressure (§7.7.6): it
+        // returns `WouldBlock` having posted nothing, so leave `post_outcome` unset
+        // and pump events to free a credit, retrying on a later poll.
+        while w.post_outcome.is_none() {
+            let r = match w.imm {
                 Some(id) => self.stream.begin_rdma_write_with_imm(
                     w.src, w.src_off, w.peer_addr, w.peer_rkey, w.len, id,
                 ),
                 None => self
                     .stream
                     .begin_rdma_write(w.src, w.src_off, w.peer_addr, w.peer_rkey, w.len),
-            });
+            };
+            match r {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Back-pressure: the transfer-credit window (§7.7.6) or the
+                    // send pool is momentarily full and `begin` posted nothing.
+                    // An outstanding send/write must drain to free it; if NOTHING
+                    // is in flight the block can't clear (e.g. an imm write on a
+                    // connection that never negotiated split) — surface it.
+                    if !self.stream.sends_outstanding() && !self.stream.writes_pending() {
+                        return Poll::Ready(Err(io::Error::other(
+                            "RDMA write back-pressured with nothing in flight to drain",
+                        )));
+                    }
+                    match self.poll_events(cx)? {
+                        Poll::Ready(()) => continue,
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                other => w.post_outcome = Some(other),
+            }
         }
         // Drain EVERY write that posted before resolving — even on a post error or
         // a closed stream. Otherwise an error return would let the caller drop

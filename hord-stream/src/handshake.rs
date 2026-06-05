@@ -5,13 +5,22 @@
 //! the 32-bit magic `0x484F5244` serialises to the ASCII bytes `H O R D`,
 //! which is convenient when staring at packet dumps.
 //!
-//! ## Deviation from the draft spec
+//! ## Deviations from the draft spec
 //!
-//! Spec 12.1 describes a 60-byte structure (14 meaningful bytes + 46 reserved).
-//! The RDMA CM private-data area for an RC connection is only ~56 bytes on
-//! IB/RoCE, so a 60-byte handshake does not reliably fit. This prototype
-//! transmits just the 16 meaningful bytes below and drops the reserved tail.
-//! (Worth folding back into the spec.)
+//! 1. **Size.** Spec 12.1 describes a 60-byte structure (14 meaningful bytes +
+//!    46 reserved). The RDMA CM private-data area for an RC connection is only
+//!    ~56 bytes on IB/RoCE, so a 60-byte handshake does not reliably fit. This
+//!    prototype transmits just the 16 meaningful bytes below and drops the
+//!    reserved tail.
+//! 2. **Transfer credits.** Bytes 14..16 (reserved in the spec) carry a
+//!    `split_credits` count: the transfer-credit window (§7.7.6) this side can
+//!    receive. The spec describes transfer credits as an *implicit per-request
+//!    grant* with no explicit advertisement; we advertise a static window so the
+//!    sender can bound its in-flight write-with-immediates instead of overrunning
+//!    the peer's posted recv WRs and RNR-stalling. `0` (the legacy reserved
+//!    value) means "no transfer credits", so split mode declines gracefully.
+//!
+//! (Both worth folding back into the spec.)
 
 use std::io;
 
@@ -38,6 +47,10 @@ pub struct Handshake {
     pub flags: u16,
     pub max_message_size: u32,
     pub max_recv_buffers: u16,
+    /// Transfer-credit window (spec §7.7.6): how many in-flight write-with-imm
+    /// transfers this side can receive. `0` means none (split mode declines). A
+    /// legacy peer that left bytes 14..16 reserved-zero decodes to `0` here.
+    pub split_credits: u16,
 }
 
 impl Handshake {
@@ -47,6 +60,7 @@ impl Handshake {
             flags: 0,
             max_message_size,
             max_recv_buffers,
+            split_credits: 0,
         }
     }
 
@@ -82,6 +96,14 @@ impl Handshake {
         self.flags & flags::SPLIT_MODE_CAPABLE != 0
     }
 
+    /// Advertise the transfer-credit window (spec §7.7.6) this side can receive.
+    /// Chainable on [`new`]. Set alongside [`with_split_mode`](Self::with_split_mode);
+    /// a `0` count makes a split-capable peer decline split mode.
+    pub fn with_split_credits(mut self, credits: u16) -> Self {
+        self.split_credits = credits;
+        self
+    }
+
     /// Serialise to the 16-byte wire form.
     pub fn encode(&self) -> [u8; HANDSHAKE_LEN] {
         let mut b = [0u8; HANDSHAKE_LEN];
@@ -90,7 +112,7 @@ impl Handshake {
         b[6..8].copy_from_slice(&self.flags.to_be_bytes());
         b[8..12].copy_from_slice(&self.max_message_size.to_be_bytes());
         b[12..14].copy_from_slice(&self.max_recv_buffers.to_be_bytes());
-        // bytes 14..16 reserved, left zero
+        b[14..16].copy_from_slice(&self.split_credits.to_be_bytes());
         b
     }
 
@@ -114,11 +136,19 @@ impl Handshake {
                 "unsupported HORD version {version} (this build speaks {VERSION})"
             )));
         }
+        // Transfer credits live in bytes 14..16, reserved-zero before this field
+        // was defined — tolerate a 14-byte legacy frame by defaulting to 0.
+        let split_credits = if buf.len() >= 16 {
+            u16::from_be_bytes(buf[14..16].try_into().unwrap())
+        } else {
+            0
+        };
         Ok(Handshake {
             version,
             flags: u16::from_be_bytes(buf[6..8].try_into().unwrap()),
             max_message_size: u32::from_be_bytes(buf[8..12].try_into().unwrap()),
             max_recv_buffers: u16::from_be_bytes(buf[12..14].try_into().unwrap()),
+            split_credits,
         })
     }
 }
@@ -180,5 +210,26 @@ mod tests {
 
         assert!(!both.with_split_mode(false).split_mode_capable());
         assert!(both.with_split_mode(false).zero_copy_capable());
+    }
+
+    #[test]
+    fn split_credits_round_trips() {
+        let h = Handshake::new(65536, 32).with_split_credits(8);
+        assert_eq!(h.split_credits, 8);
+        assert_eq!(Handshake::decode(&h.encode()).unwrap().split_credits, 8);
+
+        // Default is 0 (split mode then declines on the peer).
+        assert_eq!(Handshake::new(65536, 32).split_credits, 0);
+    }
+
+    #[test]
+    fn decode_tolerates_14_byte_legacy_frame() {
+        // A peer predating the split_credits field sends only 14 meaningful
+        // bytes; decode must succeed with split_credits == 0 rather than error.
+        let full = Handshake::new(65536, 32).with_split_credits(8).encode();
+        let legacy = &full[..14];
+        let decoded = Handshake::decode(legacy).unwrap();
+        assert_eq!(decoded.max_recv_buffers, 32);
+        assert_eq!(decoded.split_credits, 0);
     }
 }
