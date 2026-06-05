@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["hord-core", "hord-stream", "hord-demo"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Per Buer, Varnish Software"]
+repository = "https://github.com/varnish/HORD"
+
+# A first prototype of HORD (HTTP Over RDMA). See README.md for the spec.
+#
+# This workspace implements the *stream* path of HORD only: RC queue pairs,
+# two-sided send/recv, the message envelope, and credit-based flow control.
+# The zero-copy / RDMA-write extension (spec section 7) is intentionally
+# excluded from this prototype.
+#
+# There are deliberately no third-party crate dependencies: hord-core talks to
+# libibverbs/librdmacm through a small C shim compiled by its build script, and
+# everything above it is plain std Rust. This keeps the prototype buildable on
+# an air-gapped RDMA host with nothing but a C compiler and rdma-core -dev.
+
+[profile.release]
+opt-level = 3
