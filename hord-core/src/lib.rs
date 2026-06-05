@@ -21,9 +21,11 @@
 //! Everything here is synchronous and blocking, which is all the first
 //! prototype needs. The completion model is busy-poll ([`Connection::poll`]).
 
+use std::cell::UnsafeCell;
 use std::ffi::CString;
 use std::io;
 use std::os::raw::{c_char, c_int, c_void};
+use std::sync::Arc;
 
 mod ffi {
     use std::os::raw::{c_char, c_int, c_void};
@@ -215,25 +217,115 @@ fn errbuf() -> [c_char; ERRBUF] {
     [0; ERRBUF]
 }
 
-/// A registered memory region. Holds the lkey/rkey; the backing storage is
-/// owned by the caller and must outlive this handle.
-pub struct MemoryRegion {
+/// A heap buffer registered with the NIC for RDMA. Owns its backing storage,
+/// the memory-region handle, and a reference to the connection it belongs to.
+///
+/// This single type closes two soundness holes that a bare MR + `Box<[u8]>`
+/// pair left open:
+///
+/// * **Aliasing.** The NIC DMA-writes some slots while we read/write others in
+///   the same allocation. Forming a `&`/`&mut [u8]` over registered memory
+///   therefore asserts an exclusivity the NIC violates — UB under the Rust
+///   aliasing model. So the storage is `Box<[UnsafeCell<u8>]>` and is *never*
+///   sliced as `&[u8]`: every access goes through a raw pointer obtained with
+///   [`UnsafeCell::raw_get`] (via [`as_mut_ptr`](Self::as_mut_ptr) or the
+///   [`copy_in`](Self::copy_in) / [`copy_out`](Self::copy_out) helpers), which
+///   is exactly the sanctioned way to mutate through a shared `UnsafeCell`.
+///
+/// * **MR/PD lifetime.** The MR belongs to the connection's protection domain,
+///   so the PD must outlive the MR. Holding an `Arc<Connection>` makes that a
+///   type-system guarantee: the connection (and its PD) cannot be freed while
+///   any `RegisteredBuffer` over it is alive, regardless of drop order.
+///
+/// The one ordering step the type system still cannot express is that the NIC
+/// must be stopped (QP destroyed, DMA quiesced) *before* an MR is deregistered.
+/// Posting a work request against this buffer is `unsafe` precisely because the
+/// caller owns that obligation; in practice the stream layer calls
+/// [`Connection::shutdown`] before dropping its buffers.
+pub struct RegisteredBuffer {
+    // `_conn` keeps the PD alive until after this buffer's MR is deregistered.
+    // It is dropped (decrementing the refcount) only after the `Drop` body below
+    // has already torn down the MR, so the dereg-before-PD-free order holds for
+    // free, independent of where this struct sits in any owner's field order.
+    _conn: Arc<Connection>,
+    // The registered storage. Never sliced as `&[u8]`; reached only via
+    // `UnsafeCell::raw_get(storage.as_ptr())`. Reading `storage` here (for the
+    // base pointer and length) is what makes it a live field, not dead weight.
+    storage: Box<[UnsafeCell<u8>]>,
     raw: *mut ffi::IbvMr,
     lkey: u32,
     rkey: u32,
 }
 
-impl MemoryRegion {
+impl RegisteredBuffer {
+    /// Base pointer of the registered region. Derived fresh from the storage's
+    /// `UnsafeCell` so no `&`/`&mut [u8]` is ever formed over memory the NIC may
+    /// be DMA-ing into. The allocation never moves (it lives behind a `Box`), so
+    /// the address is stable for the buffer's whole life.
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        UnsafeCell::raw_get(self.storage.as_ptr())
+    }
+
+    /// Registered length in bytes.
+    pub fn len(&self) -> usize {
+        self.storage.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.storage.is_empty()
+    }
+
     pub fn lkey(&self) -> u32 {
         self.lkey
     }
     pub fn rkey(&self) -> u32 {
         self.rkey
     }
+
+    /// Copy `dst.len()` bytes out of the registered region starting at `off`.
+    ///
+    /// Reads through a raw pointer — no slice reference is formed over the
+    /// registered memory. The caller must ensure the NIC is not concurrently
+    /// DMA-ing into `[off, off+dst.len())`; the stream upholds this by only
+    /// reading a receive slot after its completion is reaped and before it is
+    /// re-posted.
+    pub fn copy_out(&self, off: usize, dst: &mut [u8]) {
+        assert!(
+            dst.len() <= self.len() && off <= self.len() - dst.len(),
+            "copy_out out of bounds",
+        );
+        // SAFETY: bounds checked above; `dst` is the caller's separate buffer so
+        // the ranges do not overlap; the source pointer is valid for `len` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.as_mut_ptr().add(off), dst.as_mut_ptr(), dst.len());
+        }
+    }
+
+    /// Copy `src` into the registered region starting at `off`.
+    ///
+    /// Writes through a raw pointer — no slice reference is formed over the
+    /// registered memory. The caller must ensure the NIC is not concurrently
+    /// accessing `[off, off+src.len())`; the stream upholds this by only writing
+    /// a send slot it currently owns (not posted to the NIC).
+    pub fn copy_in(&self, off: usize, src: &[u8]) {
+        assert!(
+            src.len() <= self.len() && off <= self.len() - src.len(),
+            "copy_in out of bounds",
+        );
+        // SAFETY: bounds checked above; `src` does not overlap the region; the
+        // destination pointer is valid for `len` bytes and writes are sound
+        // because the storage lives behind `UnsafeCell`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), self.as_mut_ptr().add(off), src.len());
+        }
+    }
 }
 
-impl Drop for MemoryRegion {
+impl Drop for RegisteredBuffer {
     fn drop(&mut self) {
+        // Deregister the MR while the PD is still alive (guaranteed: we still
+        // hold `_conn`, dropped only after this body). The NIC must already be
+        // stopped — see the type-level docs.
         unsafe { ffi::hord_dereg_mr(self.raw) }
     }
 }
@@ -391,22 +483,29 @@ impl Connection {
         check_rc(rc, &err)
     }
 
-    /// Register `buf` as a memory region with the given access flags.
+    /// Allocate `len` zeroed bytes and register them as a memory region with the
+    /// given access flags, returning a [`RegisteredBuffer`] that owns both the
+    /// storage and the registration.
     ///
-    /// # Safety
-    /// The returned [`MemoryRegion`] records the NIC registration but does not
-    /// own or borrow `buf`. The caller MUST ensure the backing storage stays
-    /// valid and pinned (not moved or freed) until the `MemoryRegion` — and any
-    /// work request referencing it — is dropped, and that the `MemoryRegion` is
-    /// dropped before this `Connection` (whose PD owns the registration). The
-    /// type system does not enforce this, hence `unsafe`.
-    pub unsafe fn register(&self, buf: &mut [u8], access: i32) -> io::Result<MemoryRegion> {
+    /// This is safe: the returned buffer pins its own backing storage (so it
+    /// cannot move or be freed early) and holds an `Arc<Connection>` (so the
+    /// registration cannot outlive the PD). Posting work requests against the
+    /// buffer is still `unsafe` — see [`Connection::post_recv`] /
+    /// [`Connection::post_send`] — and the caller must stop the NIC before the
+    /// buffer is dropped (see [`RegisteredBuffer`]).
+    pub fn register_buffer(self: &Arc<Self>, len: usize, access: i32) -> io::Result<RegisteredBuffer> {
+        // `Box<[UnsafeCell<u8>]>`: the registered storage is never sliced as
+        // `&[u8]`, so the NIC may DMA into it while we touch other regions
+        // through raw pointers without violating the aliasing model.
+        let storage: Box<[UnsafeCell<u8>]> = (0..len).map(|_| UnsafeCell::new(0u8)).collect();
+        // Base pointer for registration; valid for the whole life of the box.
+        let ptr = UnsafeCell::raw_get(storage.as_ptr());
         let mut err = errbuf();
         let raw = unsafe {
             ffi::hord_reg_mr(
                 self.raw,
-                buf.as_mut_ptr() as *mut c_void,
-                buf.len(),
+                ptr as *mut c_void,
+                len,
                 access as c_int,
                 err.as_mut_ptr(),
                 err.len(),
@@ -414,7 +513,13 @@ impl Connection {
         };
         let raw = check_ptr(raw, &err)?;
         let (lkey, rkey) = unsafe { (ffi::hord_mr_lkey(raw), ffi::hord_mr_rkey(raw)) };
-        Ok(MemoryRegion { raw, lkey, rkey })
+        Ok(RegisteredBuffer {
+            _conn: Arc::clone(self),
+            storage,
+            raw,
+            lkey,
+            rkey,
+        })
     }
 
     /// Post a receive WR over `[addr, addr+length)` (must lie within an MR with

@@ -127,7 +127,8 @@ A max-effort review surfaced these. The clear-cut correctness/soundness bugs
 were fixed (send/recv error paths now mark the connection closed instead of
 leaking a slot; `flush()` returns an error instead of silently truncating when
 the peer drops mid-send; `read_head` is size-capped; the handshake length is
-range-checked; `Connection::register` is now `unsafe`; the receive drain is a
+range-checked; `Connection::register` was made `unsafe` (later superseded by the
+safe `register_buffer` — see the soundness pass below); the receive drain is a
 bulk copy).
 
 A later **flow-control pass** then redesigned credit handling and fixed two
@@ -145,17 +146,24 @@ more:
   footprint is bounded to the receive pool. (`fullduplex_tests::full_duplex_bulk`
   exercises both fixes.)
 
+A **soundness & ownership pass** then closed the two memory-model issues, both
+in `hord-core`'s buffer/MR ownership model:
+
+- **Aliasing UB.** Registered storage is now `Box<[UnsafeCell<u8>]>` reached only
+  through raw pointers (`UnsafeCell::raw_get`), so the NIC can DMA into some
+  slots while we read/write others without ever forming a `&`/`&mut [u8]` over
+  the allocation — sound under the aliasing model, not merely on today's
+  compilers. Envelope encode/decode and payload copies route through stack
+  buffers and `RegisteredBuffer::copy_in`/`copy_out` (raw `copy_nonoverlapping`).
+- **MR↔PD lifetime.** `Connection::register_buffer` returns a `RegisteredBuffer`
+  that owns its storage and holds an `Arc<Connection>`, so the PD provably
+  outlives every MR regardless of drop order — registration is now a *safe* call.
+  `HordStream`'s `Drop` shrank to a single `shutdown()`: the one ordering step
+  that must stay at runtime is quiescing DMA (destroy the QP) before the MRs
+  deregister; the PD/MR lifetime itself is now type-enforced, not hand-rolled.
+
 The following are real but remain design-level work beyond a first prototype:
 
-- **MR lifetime is not tied to the PD in the type system.** Correct teardown
-  ordering lives in `HordStream`'s hand-written `Drop`; a raw
-  `Connection` + `MemoryRegion` pair dropped in the wrong order still leaks the
-  PD or use-after-frees. `register` being `unsafe` documents the contract; a
-  deeper fix has `MemoryRegion` hold a reference (e.g. `Arc<Connection>`).
-- **Registered buffers use plain `Box<[u8]>`.** The NIC DMA-writes receive slots
-  while Rust forms `&`/`&mut` references over the same allocation — UB under the
-  aliasing model even if it works on today's compilers. Sound form: keep
-  registered memory behind `UnsafeCell` / raw-pointer access only.
 - **No timeouts.** `rnr_retry_count = 7` is infinite RNR retry; combined with
   busy-poll waits, a stalled-but-alive peer hangs `flush()`/`read()` forever.
   Production needs deadlines on the wait loops and tunable CM retry params.

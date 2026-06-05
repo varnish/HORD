@@ -44,8 +44,9 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 
-use hord_core::{Completion, Connection, Listener, Opcode, ACCESS_LOCAL_WRITE};
+use hord_core::{Completion, Connection, Listener, Opcode, RegisteredBuffer, ACCESS_LOCAL_WRITE};
 
 use crate::envelope::{flags as env_flags, Envelope, ENVELOPE_LEN};
 use crate::handshake::{Handshake, HANDSHAKE_LEN};
@@ -124,27 +125,20 @@ struct ReadyMsg {
 }
 
 /// A HORD byte stream over a single RC connection.
-///
-/// Field order matters for `Drop`: `conn` is declared first so the QP is torn
-/// down before the memory regions are deregistered, which in turn happens
-/// before the backing buffers are freed.
 pub struct HordStream {
-    conn: Connection,
-    // The MRs are held as RAII guards whose `Drop` deregisters the memory
-    // regions. They are `Option` so the explicit `Drop` for `HordStream` can
-    // deregister them at the right moment — after the QP/CQ are destroyed but
-    // before `conn` deallocates the PD they belong to.
-    recv_mr: Option<hord_core::MemoryRegion>,
-    send_mr: Option<hord_core::MemoryRegion>,
-    recv_buf: Box<[u8]>,
-    send_buf: Box<[u8]>,
+    conn: Arc<Connection>,
+    // Registered RDMA buffers. Each owns its (UnsafeCell-backed) storage, its
+    // MR, and an `Arc<Connection>` clone — so the PD outlives every MR by
+    // construction and the teardown ordering is no longer hostage to field
+    // order or a hand-rolled `Option` dance (see `Drop`). The NIC and we reach
+    // them only by raw pointer; we never form a `&[u8]` over them.
+    recv: RegisteredBuffer,
+    send: RegisteredBuffer,
 
     msg_size: usize,    // bytes per buffer slot (our max_message_size)
     payload_cap: usize, // max payload per message = min(ours, peer) - ENVELOPE_LEN
     recv_pool: usize,
     send_pool: usize,
-    recv_lkey: u32,
-    send_lkey: u32,
 
     send_free: Vec<usize>, // free *data* send slot indices (the control slot is separate)
     send_credits: u32,     // data messages we may still post to the peer
@@ -201,38 +195,34 @@ impl HordStream {
         let send_pool = config.send_pool_size;
         assert!(msg_size > ENVELOPE_LEN, "max_message_size too small");
 
-        // recv_buf carries the data pool plus the always-posted control slack;
-        // send_buf carries the data pool plus the reserved control send slot
+        // recv carries the data pool plus the always-posted control slack;
+        // send carries the data pool plus the reserved control send slot
         // (the highest index, `send_pool`).
         let recv_slots = recv_pool + CTRL_RECV_SLACK;
         let send_slots = send_pool + CTRL_SEND_SLOTS;
-        let mut recv_buf = vec![0u8; recv_slots * msg_size].into_boxed_slice();
-        let mut send_buf = vec![0u8; send_slots * msg_size].into_boxed_slice();
-        // SAFETY: recv_buf/send_buf are `Box<[u8]>` whose heap storage stays put
-        // for the life of the stream (moving the box moves only the pointer).
-        // They are dropped after the MRs are deregistered and the QP destroyed —
-        // enforced by HordStream's field order and explicit Drop.
-        let (recv_mr, send_mr) = unsafe {
-            (
-                conn.register(&mut recv_buf, ACCESS_LOCAL_WRITE)?,
-                conn.register(&mut send_buf, ACCESS_LOCAL_WRITE)?,
-            )
-        };
-        let recv_lkey = recv_mr.lkey();
-        let send_lkey = send_mr.lkey();
+
+        // `register_buffer` allocates the (UnsafeCell-backed) storage and ties
+        // each MR's lifetime to the PD via an `Arc<Connection>`, so teardown
+        // ordering is no longer something `Drop` has to get right by hand.
+        //
+        // The Arc is used purely for shared *ownership* (PD outlives the MRs);
+        // every clone lives and dies on this one thread — `HordStream` is
+        // `!Send` (the buffers hold raw pointers) — so we accept the atomic
+        // refcount rather than assert an unsound `Sync` on `Connection`, whose
+        // shim methods are not safe to call concurrently.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let conn = Arc::new(conn);
+        let recv = conn.register_buffer(recv_slots * msg_size, ACCESS_LOCAL_WRITE)?;
+        let send = conn.register_buffer(send_slots * msg_size, ACCESS_LOCAL_WRITE)?;
 
         let mut s = HordStream {
             conn,
-            recv_mr: Some(recv_mr),
-            send_mr: Some(send_mr),
-            recv_buf,
-            send_buf,
+            recv,
+            send,
             msg_size,
             payload_cap: 0,
             recv_pool,
             send_pool,
-            recv_lkey,
-            send_lkey,
             send_free: (0..send_pool).rev().collect(),
             send_credits: 0,
             grant_pending: 0,
@@ -247,14 +237,14 @@ impl HordStream {
     }
 
     fn post_all_recvs(&mut self) -> io::Result<()> {
-        let base = self.recv_buf.as_mut_ptr();
+        let base = self.recv.as_mut_ptr();
         let msg = self.msg_size;
-        let lkey = self.recv_lkey;
+        let lkey = self.recv.lkey();
         // Post the data pool *and* the control slack; both are needed before the
         // QP can carry traffic.
         for slot in 0..self.recv_pool + CTRL_RECV_SLACK {
-            // SAFETY: `base + slot*msg` lies within recv_buf (a single MR with
-            // `lkey`); the buffer outlives the connection (drop order).
+            // SAFETY: `base + slot*msg` lies within `recv` (a single MR with
+            // `lkey`), which holds an Arc<Connection> so it outlives the QP.
             unsafe {
                 let addr = base.add(slot * msg);
                 self.conn
@@ -339,7 +329,11 @@ impl HordStream {
                 format!("runt message: {n} bytes < envelope header"),
             ));
         }
-        let env = Envelope::decode(&self.recv_buf[off..off + ENVELOPE_LEN]);
+        // Decode the envelope through a stack copy — never a slice reference
+        // over registered (DMA-able) memory.
+        let mut hdr = [0u8; ENVELOPE_LEN];
+        self.recv.copy_out(off, &mut hdr);
+        let env = Envelope::decode(&hdr);
         // Credits the peer granted us.
         self.send_credits = self.send_credits.saturating_add(env.credits as u32);
 
@@ -389,13 +383,13 @@ impl HordStream {
     /// instead of silently operating with a shrunken receive window.
     fn repost_recv(&mut self, slot: usize) -> io::Result<()> {
         let off = slot * self.msg_size;
-        let base = self.recv_buf.as_mut_ptr();
-        // SAFETY: `base + off` is slot `slot` inside recv_buf / the MR, which
-        // outlives the connection (drop order).
+        let base = self.recv.as_mut_ptr();
+        // SAFETY: `base + off` is slot `slot` inside `recv` / the MR, which
+        // holds an Arc<Connection> and so outlives the QP.
         let repost = unsafe {
             let addr = base.add(off);
             self.conn
-                .post_recv(recv_wr_id(slot), addr, self.msg_size as u32, self.recv_lkey)
+                .post_recv(recv_wr_id(slot), addr, self.msg_size as u32, self.recv.lkey())
         };
         if let Err(e) = repost {
             self.peer_closed = true;
@@ -468,14 +462,19 @@ impl HordStream {
         payload: &[u8],
     ) -> io::Result<()> {
         let off = slot * self.msg_size;
-        env.encode(&mut self.send_buf[off..off + ENVELOPE_LEN]);
-        let pstart = off + ENVELOPE_LEN;
-        self.send_buf[pstart..pstart + payload.len()].copy_from_slice(payload);
+        // Stamp the envelope into a stack buffer, then raw-copy header and
+        // payload into the send slot — no slice reference over registered memory.
+        let mut hdr = [0u8; ENVELOPE_LEN];
+        env.encode(&mut hdr);
+        self.send.copy_in(off, &hdr);
+        self.send.copy_in(off + ENVELOPE_LEN, payload);
         let total = (ENVELOPE_LEN + payload.len()) as u32;
-        let base = self.send_buf.as_ptr();
+        let base = self.send.as_mut_ptr();
+        // SAFETY: `base + off` is the send slot inside `send` / the MR; it stays
+        // pinned until the matching completion is reaped.
         unsafe {
             let addr = base.add(off);
-            self.conn.post_send(wr_id, addr, total, self.send_lkey)
+            self.conn.post_send(wr_id, addr, total, self.send.lkey())
         }
     }
 
@@ -546,7 +545,7 @@ impl Read for HordStream {
                 break;
             };
             let take = (end - start).min(out.len() - written);
-            out[written..written + take].copy_from_slice(&self.recv_buf[start..start + take]);
+            self.recv.copy_out(start, &mut out[written..written + take]);
             written += take;
             if start + take == end {
                 // Message fully drained: free its buffer and owe a credit.
@@ -631,16 +630,14 @@ impl Write for HordStream {
 
 impl Drop for HordStream {
     fn drop(&mut self) {
-        // RDMA teardown is order-sensitive:
-        //   1. stop the NIC (disconnect + destroy QP/CQ) so nothing can DMA
-        //      into our buffers,
-        //   2. deregister the MRs — still requires the PD to be alive,
-        //   3. let `conn` drop (after this body), which deallocates the now
-        //      MR-free PD and destroys the id/event channel; the buffers, held
-        //      in later fields, are freed last.
+        // The only teardown step still expressed at runtime: stop the NIC
+        // (disconnect + destroy QP/CQ) so no DMA can target the registered
+        // buffers once we start deregistering them. Everything below is now
+        // type-enforced — `recv`/`send` each hold an `Arc<Connection>`, so when
+        // they drop (after this body) their MRs are deregistered while the PD is
+        // still alive, and the PD is freed only once the last Arc (the two
+        // buffers plus `conn`) is gone.
         self.conn.shutdown();
-        self.recv_mr.take();
-        self.send_mr.take();
     }
 }
 
