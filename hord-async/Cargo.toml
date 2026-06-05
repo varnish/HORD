@@ -1,0 +1,22 @@
+[package]
+name = "hord-async"
+description = "Async (tokio) AsyncRead/AsyncWrite wrapper over a HORD stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# This is the one crate in the workspace that takes third-party dependencies:
+# the async milestone targets tokio + hyper, and isolating them here keeps
+# hord-core and hord-stream dependency-free (and buildable on an air-gapped RDMA
+# host with only a C compiler and rdma-core).
+[dependencies]
+hord-stream = { path = "../hord-stream" }
+tokio = { version = "1", features = ["net", "io-util", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros", "sync"] }
+# Test-only: per-thread CPU accounting (CLOCK_THREAD_CPUTIME_ID) for the #15
+# busy-poll-vs-park measurement in tests/idle_cpu.rs.
+libc = "0.2"

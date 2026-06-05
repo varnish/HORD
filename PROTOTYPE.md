@@ -47,13 +47,21 @@ hord-core/     RDMA transport. Safe Rust wrappers over a small C shim
                ibv_poll_cq, ...) are `static inline` in the rdma-core headers
                and therefore not linkable symbols.
 hord-stream/   HORD wire protocol: handshake, envelope, credit flow control,
-               and the HordStream byte stream (Read + Write).
-hord-demo/     hord-server and hord-client: a tiny HTTP/1.1 origin and client.
+               and the HordStream byte stream (Read + Write), factored over a
+               non-blocking core that both the sync facade and the async wrapper
+               drive.
+hord-async/    Async wrapper: tokio AsyncRead/AsyncWrite over a HordStream,
+               driving the CQ completion-channel fd with AsyncFd (no busy-poll).
+hord-demo/     hord-server / hord-client (sync) and hord-server-async /
+               hord-client-async (hyper over the async stream).
 ```
 
-There are **no third-party crate dependencies** — only `std`, plus the system
-`librdmacm`/`libibverbs` linked through the shim. `build.rs` invokes `cc`/`ar`
-directly rather than pulling in the `cc` crate.
+`hord-core` and `hord-stream` have **no third-party crate dependencies** — only
+`std`, plus the system `librdmacm`/`libibverbs` linked through the shim
+(`build.rs` invokes `cc`/`ar` directly, not the `cc` crate). The async milestone
+(`hord-async`, and the demo's hyper bins) is the sole exception: it pulls in
+`tokio` + `hyper`, confined to those crates so the transport stays
+air-gapped-buildable.
 
 ## Building
 
@@ -101,25 +109,36 @@ tagged by `wr_id` (top bit = send vs. recv, low bits = buffer slot).
 
 ## Limitations (prototype scope)
 
-These are deliberate cuts, not oversights — each is a known next step:
+The async milestone (Pass 3, in `hord-async` + the demo's `*-async` bins) cleared
+most of the original cuts. What it resolved:
 
-- **Synchronous + busy-polled.** The spec's target API is `tokio::AsyncRead`/
-  `AsyncWrite` feeding `hyper`. The natural path is to drive the CQ and CM event
-  channels (both have pollable fds) via `tokio::io::unix::AsyncFd`, then wrap
-  `HordStream` as async. The current stream is `std::io` and busy-polls the CQ
-  (100% CPU while blocked).
-- **One connection at a time** on the server (sequential `accept`). Real use
-  needs a per-connection task/thread.
-- **No graceful half-close detection.** We rely on HTTP `Content-Length` and
-  `flush()`-before-disconnect rather than processing CM `DISCONNECTED` events on
-  the data path.
+- ~~**Synchronous + busy-polled.**~~ `hord-async` drives the CQ
+  completion-channel fd with `tokio::io::unix::AsyncFd`, so a blocked connection
+  *parks* instead of busy-polling: measured ~90 µs of CPU over a 1 s idle read,
+  versus ~800 ms (a full core) for the synchronous busy-poll. The `std::io`
+  stream remains as the busy-polled reference path.
+- ~~**One connection at a time.**~~ `hord-server-async` accepts in a loop and
+  runs each connection on its own thread (current-thread runtime + `hyper`);
+  verified with 6 concurrent transfers.
+- ~~**No graceful half-close detection.**~~ The async stream registers the CM fd
+  and maps a peer `DISCONNECTED` to a clean EOF. (The *synchronous* stream still
+  has none — it relies on `Content-Length` + `flush()`-before-disconnect.)
+- ~~**HTTP is hand-rolled.**~~ `hyper` runs unmodified over the async stream
+  (`http_body::Body` streams `/size/<n>` in fixed-size chunks). The hand-rolled
+  codec stays in the sync demo.
+
+What remains:
+
 - **One copy on each path.** The send path copies into the registered staging
-  buffer; the receive path now copies straight from the registered receive
-  buffer to the caller (the payload is held in place until `read()` drains it —
-  see #8 below), so the intermediate reassembly copy is gone.
-- **HTTP is hand-rolled** (just enough to prove the transport). Swapping in
-  `hyper` over an async `HordStream` is the intended end state and changes
-  nothing below the socket.
+  buffer; the receive path copies straight from the registered receive buffer to
+  the caller (the payload is held in place until `read()` drains it — see #8
+  below), so the intermediate reassembly copy is gone, but the staging copy
+  stays. The zero-copy / RDMA-write extension (spec §7) is still out of scope.
+- **Single-task driver.** The async stream is built for one driving task (as
+  `hyper` uses it); two tasks over `tokio::io::split` would both wait on the one
+  completion fd and need a multi-waiter scheme.
+- **Thread-per-connection, not thread-per-core.** A real server would use a
+  bounded worker pool with `spawn_local`, not one OS thread per connection.
 
 ## Open issues from code review (deferred, by design)
 
@@ -162,14 +181,16 @@ in `hord-core`'s buffer/MR ownership model:
   that must stay at runtime is quiescing DMA (destroy the QP) before the MRs
   deregister; the PD/MR lifetime itself is now type-enforced, not hand-rolled.
 
-The following are real but remain design-level work beyond a first prototype:
+Both of the remaining design-level items were then closed by the **async pass**:
 
-- **No timeouts.** `rnr_retry_count = 7` is infinite RNR retry; combined with
-  busy-poll waits, a stalled-but-alive peer hangs `flush()`/`read()` forever.
-  Production needs deadlines on the wait loops and tunable CM retry params.
-- **Demo server materialises the whole body.** `/size/<n>` allocates and
-  pattern-fills up to 1 GiB before sending. Fine for a demo; a real handler
-  would stream fixed-size chunks.
+- ~~**No timeouts.**~~ The CM retry params (`rnr_retry_count` / `retry_count` /
+  resolve timeout) are now tunable via `HordConfig::cm`, and the async stream is
+  cancellable, so a stalled-but-alive peer is bounded with `tokio::time::timeout`
+  instead of hanging forever. (The synchronous busy-poll path is still
+  un-deadlined.)
+- ~~**Demo server materialises the whole body.**~~ The async server's
+  `/size/<n>` streams a verifiable pattern in fixed-size (256 KiB) chunks via a
+  custom `http_body::Body`, with no up-front allocation.
 
 ## Findings worth folding back into the spec
 

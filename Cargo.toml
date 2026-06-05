@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["hord-core", "hord-stream", "hord-demo"]
+members = ["hord-core", "hord-stream", "hord-async", "hord-demo"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,10 +16,14 @@ repository = "https://github.com/varnish/HORD"
 # The zero-copy / RDMA-write extension (spec section 7) is intentionally
 # excluded from this prototype.
 #
-# There are deliberately no third-party crate dependencies: hord-core talks to
+# The core stack takes no third-party crate dependencies: hord-core talks to
 # libibverbs/librdmacm through a small C shim compiled by its build script, and
-# everything above it is plain std Rust. This keeps the prototype buildable on
+# hord-stream above it is plain std Rust. This keeps the transport buildable on
 # an air-gapped RDMA host with nothing but a C compiler and rdma-core -dev.
+#
+# The async milestone (hord-async) is the sole exception: it depends on tokio
+# (and the demo on hyper) to present AsyncRead/AsyncWrite + serve HTTP. Those
+# deps are confined to that crate, so hord-core/hord-stream stay dep-free.
 
 [profile.release]
 opt-level = 3

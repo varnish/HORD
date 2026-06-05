@@ -8,7 +8,17 @@ authors.workspace = true
 
 [dependencies]
 hord-stream = { path = "../hord-stream" }
+# Async + hyper demo (server_async / client_async). The sync bins below use
+# only hord-stream; these third-party deps are pulled in for the hyper bins.
+hord-async = { path = "../hord-async" }
+tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
 
+# Synchronous prototype (busy-polled, one connection at a time).
 [[bin]]
 name = "hord-server"
 path = "src/bin/server.rs"
@@ -16,3 +26,12 @@ path = "src/bin/server.rs"
 [[bin]]
 name = "hord-client"
 path = "src/bin/client.rs"
+
+# Async milestone: hyper over the tokio AsyncRead/AsyncWrite stream.
+[[bin]]
+name = "hord-server-async"
+path = "src/bin/server_async.rs"
+
+[[bin]]
+name = "hord-client-async"
+path = "src/bin/client_async.rs"

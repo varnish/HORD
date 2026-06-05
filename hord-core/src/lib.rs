@@ -24,6 +24,7 @@
 use std::cell::UnsafeCell;
 use std::ffi::CString;
 use std::io;
+use std::os::fd::RawFd;
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::Arc;
 
@@ -67,6 +68,7 @@ mod ffi {
             c: *mut HordConn,
             my_priv: *const u8,
             my_priv_len: u32,
+            rnr_retry_count: u8,
             err: *mut c_char,
             errlen: usize,
         ) -> c_int;
@@ -77,6 +79,7 @@ mod ffi {
             send_wr: c_int,
             recv_wr: c_int,
             cqe: c_int,
+            resolve_timeout_ms: c_int,
             err: *mut c_char,
             errlen: usize,
         ) -> *mut HordConn;
@@ -85,6 +88,8 @@ mod ffi {
             c: *mut HordConn,
             my_priv: *const u8,
             my_priv_len: u32,
+            retry_count: u8,
+            rnr_retry_count: u8,
             peer_priv: *mut u8,
             peer_priv_cap: usize,
             peer_priv_len: *mut u32,
@@ -132,6 +137,13 @@ mod ffi {
             errlen: usize,
         ) -> c_int;
 
+        pub fn hord_conn_cq_fd(c: *mut HordConn) -> c_int;
+        pub fn hord_cq_arm(c: *mut HordConn, err: *mut c_char, errlen: usize) -> c_int;
+        pub fn hord_cq_consume(c: *mut HordConn) -> c_int;
+        pub fn hord_conn_cm_fd(c: *mut HordConn) -> c_int;
+        pub fn hord_conn_cm_set_nonblock(c: *mut HordConn) -> c_int;
+        pub fn hord_conn_check_disconnect(c: *mut HordConn) -> c_int;
+
         pub fn hord_disconnect(c: *mut HordConn);
         pub fn hord_conn_shutdown(c: *mut HordConn);
         pub fn hord_conn_free(c: *mut HordConn);
@@ -143,6 +155,30 @@ mod ffi {
 pub const ACCESS_LOCAL_WRITE: i32 = 1;
 
 const ERRBUF: usize = 256;
+
+/// Connection-manager retry / timeout parameters (#11). The defaults reproduce
+/// the values the prototype hardcoded before they were made tunable, so they
+/// change no existing behaviour; the async layer can lower them to bound how
+/// long a stalled peer holds a connection.
+#[derive(Debug, Clone, Copy)]
+pub struct CmParams {
+    /// Transport retry count on connect (initiator side). Valid range 0..=7.
+    pub retry_count: u8,
+    /// Receiver-not-ready retry count. 7 means infinite RNR retry.
+    pub rnr_retry_count: u8,
+    /// Timeout (ms) for each of the address/route resolution steps on connect.
+    pub resolve_timeout_ms: i32,
+}
+
+impl Default for CmParams {
+    fn default() -> Self {
+        CmParams {
+            retry_count: 7,
+            rnr_retry_count: 7,
+            resolve_timeout_ms: 2000,
+        }
+    }
+}
 
 /// Work-completion opcode, as reported by the NIC. The prototype only ever
 /// observes `Send` and `Recv` (no RDMA write / write-with-immediate).
@@ -360,6 +396,7 @@ impl Listener {
         send_wr: usize,
         recv_wr: usize,
         handshake_cap: usize,
+        cm: CmParams,
     ) -> io::Result<(Connection, Vec<u8>)> {
         let mut peer = vec![0u8; handshake_cap];
         let mut peer_len: u32 = 0;
@@ -380,7 +417,7 @@ impl Listener {
         };
         let raw = check_ptr(raw, &err)?;
         peer.truncate(peer_len as usize);
-        Ok((Connection { raw, role: Role::Server }, peer))
+        Ok((Connection { raw, role: Role::Server, cm }, peer))
     }
 }
 
@@ -401,6 +438,7 @@ enum Role {
 pub struct Connection {
     raw: *mut ffi::HordConn,
     role: Role,
+    cm: CmParams,
 }
 
 // The connection owns its RDMA resources and is only ever driven from one
@@ -415,6 +453,7 @@ impl Connection {
         port: u16,
         send_wr: usize,
         recv_wr: usize,
+        cm: CmParams,
     ) -> io::Result<Connection> {
         let c_ip = CString::new(ip).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "ip contained a NUL byte")
@@ -428,6 +467,7 @@ impl Connection {
                 send_wr as c_int,
                 recv_wr as c_int,
                 cqe,
+                cm.resolve_timeout_ms as c_int,
                 err.as_mut_ptr(),
                 err.len(),
             )
@@ -435,6 +475,7 @@ impl Connection {
         Ok(Connection {
             raw: check_ptr(raw, &err)?,
             role: Role::Client,
+            cm,
         })
     }
 
@@ -454,6 +495,8 @@ impl Connection {
                 self.raw,
                 handshake.as_ptr(),
                 handshake.len() as u32,
+                self.cm.retry_count,
+                self.cm.rnr_retry_count,
                 peer.as_mut_ptr(),
                 peer.len(),
                 &mut peer_len,
@@ -476,6 +519,7 @@ impl Connection {
                 self.raw,
                 handshake.as_ptr(),
                 handshake.len() as u32,
+                self.cm.rnr_retry_count,
                 err.as_mut_ptr(),
                 err.len(),
             )
@@ -604,6 +648,71 @@ impl Connection {
             opcode: Opcode::from_raw(opcode),
             status,
         }))
+    }
+
+    /// File descriptor of the CQ completion channel. Once the CQ is armed (see
+    /// [`arm_cq`](Self::arm_cq)) it becomes readable when a completion is
+    /// signalled — register it with an async reactor instead of busy-polling
+    /// [`poll`](Self::poll). Owned by the connection; valid until shutdown.
+    pub fn cq_fd(&self) -> io::Result<RawFd> {
+        let fd = unsafe { ffi::hord_conn_cq_fd(self.raw) };
+        if fd < 0 {
+            return Err(io::Error::other("connection has no completion channel"));
+        }
+        Ok(fd)
+    }
+
+    /// Arm the CQ to signal its completion channel on the next completion.
+    /// Notifications are one-shot, so the sequence is: arm → wait on
+    /// [`cq_fd`](Self::cq_fd) → [`consume_cq_events`](Self::consume_cq_events) →
+    /// re-arm → drain with [`poll`](Self::poll). Re-arming before the final
+    /// drain closes the race where a completion lands between drain and arm.
+    pub fn arm_cq(&self) -> io::Result<()> {
+        let mut err = errbuf();
+        let rc = unsafe { ffi::hord_cq_arm(self.raw, err.as_mut_ptr(), err.len()) };
+        check_rc(rc, &err)
+    }
+
+    /// Drain and acknowledge all pending completion-channel notifications (the
+    /// fd is non-blocking). Returns the number consumed. Acknowledging is
+    /// required before the CQ can be destroyed.
+    pub fn consume_cq_events(&self) -> usize {
+        let n = unsafe { ffi::hord_cq_consume(self.raw) };
+        if n < 0 {
+            0
+        } else {
+            n as usize
+        }
+    }
+
+    /// File descriptor of the connection's CM event channel.
+    pub fn cm_fd(&self) -> io::Result<RawFd> {
+        let fd = unsafe { ffi::hord_conn_cm_fd(self.raw) };
+        if fd < 0 {
+            return Err(io::Error::other("connection has no CM channel"));
+        }
+        Ok(fd)
+    }
+
+    /// Make the CM channel non-blocking. Call only *after* the handshake — setup
+    /// relies on blocking CM waits.
+    pub fn set_cm_nonblock(&self) -> io::Result<()> {
+        let rc = unsafe { ffi::hord_conn_cm_set_nonblock(self.raw) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Non-blocking check for a peer-initiated teardown (DISCONNECTED / device
+    /// removal / connect error). Requires [`set_cm_nonblock`](Self::set_cm_nonblock)
+    /// first. `Ok(true)` means the peer is gone.
+    pub fn check_disconnect(&self) -> io::Result<bool> {
+        let rc = unsafe { ffi::hord_conn_check_disconnect(self.raw) };
+        if rc < 0 {
+            return Err(io::Error::other("CM disconnect poll failed"));
+        }
+        Ok(rc == 1)
     }
 
     /// Begin a graceful disconnect. Best-effort.
