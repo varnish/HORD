@@ -8,6 +8,9 @@
 
 use std::io::{self, Read};
 
+use hord_stream::RegisteredBuffer;
+use hord_zerocopy::ZeroCopyRequest;
+
 /// Read bytes from `r` until the `\r\n\r\n` header terminator is seen.
 /// Returns `(header_bytes, leftover)` where `leftover` is any body bytes that
 /// were read past the terminator.
@@ -127,4 +130,65 @@ pub fn pattern_fill(buf: &mut [u8]) {
     for (i, b) in buf.iter_mut().enumerate() {
         *b = pattern_byte(i);
     }
+}
+
+/// Fill the first `n` bytes of a registered buffer with [`pattern_byte`], in
+/// bounded chunks via raw copies into the registered memory (never forming a
+/// `&mut [u8]` over it). Used to populate a zero-copy RDMA-write source region.
+pub fn pattern_fill_registered(buf: &RegisteredBuffer, n: usize) {
+    const CHUNK: usize = 256 * 1024;
+    let mut tmp = vec![0u8; CHUNK.min(n.max(1))];
+    let mut off = 0;
+    while off < n {
+        let take = CHUNK.min(n - off);
+        for (i, b) in tmp[..take].iter_mut().enumerate() {
+            *b = pattern_byte(off + i);
+        }
+        buf.copy_in(off, &tmp[..take]);
+        off += take;
+    }
+}
+
+/// Parse the `<n>` from a `/size/<n>` request path, if that is the route.
+pub fn size_from_path(path: &str) -> Option<usize> {
+    path.strip_prefix("/size/").and_then(|n| n.parse().ok())
+}
+
+/// Verify the first `n` bytes of a zero-copy destination buffer against
+/// [`pattern_byte`], reading them out in bounded chunks (the consumer reading
+/// its own buffer — not a transport copy). `Ok(true)` = verified, `Ok(false)` =
+/// not a `/size/` route so there's nothing to check, `Err(msg)` = mismatch.
+/// Shared by the sync and async demo clients.
+pub fn verify_zero_copy(zc: &ZeroCopyRequest, n: usize, path: &str) -> Result<bool, String> {
+    if size_from_path(path).is_none() {
+        return Ok(false);
+    }
+    const CHUNK: usize = 256 * 1024;
+    let mut tmp = vec![0u8; CHUNK.min(n.max(1))];
+    let mut off = 0;
+    while off < n {
+        let take = CHUNK.min(n - off);
+        zc.copy_out(off, &mut tmp[..take]);
+        for (i, &got) in tmp[..take].iter().enumerate() {
+            let want = pattern_byte(off + i);
+            if got != want {
+                return Err(format!("payload mismatch at byte {}: got {got}, expected {want}", off + i));
+            }
+        }
+        off += take;
+    }
+    Ok(true)
+}
+
+/// Verify a stream-delivered body against [`pattern_byte`] (only meaningful for a
+/// 200 response on a `/size/` route). Same return convention as
+/// [`verify_zero_copy`]. Shared by the sync and async demo clients.
+pub fn verify_stream_body(body: &[u8], is_200: bool, path: &str) -> Result<bool, String> {
+    if !is_200 || size_from_path(path).is_none() {
+        return Ok(false);
+    }
+    if let Some((i, &got)) = body.iter().enumerate().find(|(i, &b)| b != pattern_byte(*i)) {
+        return Err(format!("payload mismatch at byte {i}: got {got}, expected {}", pattern_byte(i)));
+    }
+    Ok(true)
 }

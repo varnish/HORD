@@ -4,10 +4,12 @@ A first working implementation of the HORD stream path: **HTTP/1.1 over RDMA
 RC**, demonstrated end-to-end over Soft-RoCE.
 
 This implements the two-sided (send/recv) transport described in spec sections
-4–6, 8 and 9. The **zero-copy / RDMA-write extension (spec section 7) is
-deliberately out of scope** for this prototype — no `X-HORD-RDMA-Write`, no
-one-sided writes, no GPUDirect, no protocol splitting. The point here was to get
-real bytes of HTTP moving over real queue pairs.
+4–6, 8 and 9, **plus the zero-copy / RDMA-write extension (spec section 7.1–7.4)**:
+one-sided `IBV_WR_RDMA_WRITE` straight into a client-registered buffer, advertised
+via `X-HORD-RDMA-Write`. Still out of scope: §7.7 protocol splitting
+(write-with-immediate) and §7.5 GPUDirect (untestable here — no GPU/real NIC —
+though the addr/rkey path is opaque, so it should work unchanged on capable
+hardware).
 
 ## What works
 
@@ -21,6 +23,13 @@ real bytes of HTTP moving over real queue pairs.
   messages and reassembles receives — the stream abstraction of spec 6.
 - A minimal but real HTTP/1.1 client and server running unmodified over that
   stream.
+- **Zero-copy responses (spec §7.1–7.4).** When both peers advertise
+  `ZERO_COPY_CAPABLE`, a `GET /size/<n>` carrying `X-HORD-RDMA-Write` is served
+  by a one-sided RDMA write straight into the client's registered buffer; the
+  HTTP response is `Content-Length: 0` + `status=complete;bytes_written=<n>`, and
+  the body never touches the stream. The `too_large` (413) and `declined`
+  (stream fallback) outcomes are handled too. Works on both the sync and
+  async/hyper demos.
 
 Verified on this host's Soft-RoCE device (`rxe0`, loopback over `enp14s0`):
 ~0.7–0.75 GiB/s for bodies from 1 MiB to 1 GiB, flat with size, byte-pattern
@@ -49,18 +58,23 @@ hord-core/     RDMA transport. Safe Rust wrappers over a small C shim
 hord-stream/   HORD wire protocol: handshake, envelope, credit flow control,
                and the HordStream byte stream (Read + Write), factored over a
                non-blocking core that both the sync facade and the async wrapper
-               drive.
+               drive. Also the zero-copy transport half: capability negotiation,
+               buffer registration, and the one-sided RDMA-write driver.
+hord-zerocopy/ Zero-copy HTTP semantics (spec §7): the X-HORD-RDMA-Write header
+               codec and the client/server orchestration over a HordStream.
 hord-async/    Async wrapper: tokio AsyncRead/AsyncWrite over a HordStream,
-               driving the CQ completion-channel fd with AsyncFd (no busy-poll).
+               driving the CQ completion-channel fd with AsyncFd (no busy-poll);
+               SharedAsyncStream lets a hyper handler drive a zero-copy write.
 hord-demo/     hord-server / hord-client (sync) and hord-server-async /
-               hord-client-async (hyper over the async stream).
+               hord-client-async (hyper over the async stream). --zero-copy opts
+               into the RDMA-write path.
 ```
 
-`hord-core` and `hord-stream` have **no third-party crate dependencies** — only
-`std`, plus the system `librdmacm`/`libibverbs` linked through the shim
-(`build.rs` invokes `cc`/`ar` directly, not the `cc` crate). The async milestone
-(`hord-async`, and the demo's hyper bins) is the sole exception: it pulls in
-`tokio` + `hyper`, confined to those crates so the transport stays
+`hord-core`, `hord-stream` and `hord-zerocopy` have **no third-party crate
+dependencies** — only `std`, plus the system `librdmacm`/`libibverbs` linked
+through the shim (`build.rs` invokes `cc`/`ar` directly, not the `cc` crate). The
+async milestone (`hord-async`, and the demo's hyper bins) is the sole exception:
+it pulls in `tokio` + `hyper`, confined to those crates so the transport stays
 air-gapped-buildable.
 
 ## Building
@@ -86,10 +100,15 @@ loops it back internally. (Note: `127.0.0.1` does **not** work — it routes via
 # Terminal 2
 ./target/release/hord-client --path /                       # small greeting
 ./target/release/hord-client --path /size/67108864          # 64 MiB, integrity-checked
+./target/release/hord-client --path /size/67108864 --zero-copy   # via one-sided RDMA write
 ```
 
 Routes: `GET /` → greeting; `GET /size/<n>` → `<n>` bytes of a verifiable
-pattern; anything else → 404.
+pattern; anything else → 404. `--zero-copy` advertises a registered buffer and,
+when the server honours it, the body is RDMA-written into that buffer
+(`delivery: zero-copy`) instead of streamed. The async bins
+(`hord-server-async` / `hord-client-async --zero-copy`) behave identically over
+`hyper`.
 
 ## Design notes
 
@@ -104,8 +123,10 @@ message has been placed in the peer's receive buffer and acknowledged. So once
 `flush()` returns, the data is delivered and it is safe to disconnect — which is
 exactly what the server relies on before dropping the connection.
 
-**One CQ per connection**, shared by sends and receives; work requests are
-tagged by `wr_id` (top bit = send vs. recv, low bits = buffer slot).
+**One CQ per connection**, shared by sends, receives and one-sided RDMA writes;
+work requests are tagged by `wr_id` (top bits = send / control-send / RDMA-write
+lane, low bits = buffer slot). A write completion is reaped by a dedicated
+counter, separate from the send and receive pools.
 
 ## Limitations (prototype scope)
 
@@ -127,18 +148,29 @@ most of the original cuts. What it resolved:
   (`http_body::Body` streams `/size/<n>` in fixed-size chunks). The hand-rolled
   codec stays in the sync demo.
 
+And then the **zero-copy pass** (Pass 4, `hord-zerocopy` + `--zero-copy` in the
+demos) cleared the last copy on the data path:
+
+- ~~**One copy on each path.**~~ The *stream* path still copies into the
+  registered staging buffer on send (the receive-side reassembly copy was already
+  gone — payload held in place until `read()`). The *zero-copy* path eliminates
+  the staging copy entirely: the server fills a registered source once and
+  RDMA-writes it straight into the client's buffer, which the client reads in
+  place — no transport copy. On Soft-RoCE the throughput gain is modest (rxe
+  copies in software in the kernel); on real RDMA hardware this is the whole
+  point.
+
 What remains:
 
-- **One copy on each path.** The send path copies into the registered staging
-  buffer; the receive path copies straight from the registered receive buffer to
-  the caller (the payload is held in place until `read()` drains it — see #8
-  below), so the intermediate reassembly copy is gone, but the staging copy
-  stays. The zero-copy / RDMA-write extension (spec §7) is still out of scope.
 - **Single-task driver.** The async stream is built for one driving task (as
   `hyper` uses it); two tasks over `tokio::io::split` would both wait on the one
-  completion fd and need a multi-waiter scheme.
+  completion fd and need a multi-waiter scheme. (`SharedAsyncStream` keeps a
+  zero-copy write on that *same* one task — it does not add a second waiter.)
 - **Thread-per-connection, not thread-per-core.** A real server would use a
   bounded worker pool with `spawn_local`, not one OS thread per connection.
+- **Zero-copy source registered per response.** The server registers (and frees)
+  a source MR per zero-copy response; a real server would amortize this with a
+  pool (spec §8.3). §7.7 protocol splitting and §7.5 GPUDirect remain unbuilt.
 
 ## Open issues from code review (deferred, by design)
 
@@ -203,3 +235,22 @@ Both of the remaining design-level items were then closed by the **async pass**:
   envelope/handshake fields. This prototype uses big-endian (network order),
   which has the nice property that the magic `0x484F5244` serialises to the
   ASCII bytes `HORD`. Worth stating explicitly in the spec.
+- **Handshake flag bits (spec 5.3).** The spec defines bit 0 `ZERO_COPY_CAPABLE`
+  and bit 1 `SPLIT_MODE_CAPABLE`; there is no HTTP/2 flag (HTTP/2 was dropped
+  from the spec). An early prototype had stubbed an `HTTP2_CAPABLE` at bit 1 and
+  pushed split mode to bit 2 — now corrected to match §5.3. (No on-wire impact:
+  only bit 0 is currently set.)
+- **Zero-copy MR access flags (spec 7 / 8.3).** §7 doesn't spell out the access
+  flags. The client's destination buffer must be registered
+  `IBV_ACCESS_REMOTE_WRITE`, and per IBA that flag is only valid in combination
+  with `IBV_ACCESS_LOCAL_WRITE` — so the buffer is registered with *both*. The
+  server's source buffer needs only local access (the NIC reads it). Worth a
+  one-line note in §8.3.
+- **Zero-copy write sizing (spec 7.3 / 8.4).** A single `IBV_WR_RDMA_WRITE` WR
+  carries the whole body — the NIC segments it into MTU-sized packets — so §8.4's
+  "single large RDMA write" is literally one WR in the common case. This
+  prototype caps a WR at 1 GiB and would split a larger object across WRs bounded
+  by the send-queue depth; verified up to 64 MiB single-WR on Soft-RoCE. The
+  `addr` advertised in `X-HORD-RDMA-Write` is the buffer's absolute virtual
+  address and `rkey` is its MR rkey, exactly as §12.3 describes — confirmed
+  interoperable end to end.

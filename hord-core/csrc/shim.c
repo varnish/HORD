@@ -409,6 +409,33 @@ int hord_post_send(hord_conn *c, uint64_t wr_id, void *addr, uint32_t length,
     return 0;
 }
 
+int hord_post_write(hord_conn *c, uint64_t wr_id, void *addr, uint32_t length,
+                    uint32_t lkey, uint64_t remote_addr, uint32_t rkey,
+                    char *err, size_t errlen) {
+    struct ibv_sge sge = {
+        .addr = (uintptr_t)addr,
+        .length = length,
+        .lkey = lkey,
+    };
+    struct ibv_send_wr wr = {
+        .wr_id = wr_id,
+        .sg_list = &sge,
+        .num_sge = 1,
+        .opcode = IBV_WR_RDMA_WRITE,
+        .send_flags = IBV_SEND_SIGNALED,
+    };
+    wr.wr.rdma.remote_addr = remote_addr;
+    wr.wr.rdma.rkey = rkey;
+    struct ibv_send_wr *bad = NULL;
+    int rc = ibv_post_send(c->qp, &wr, &bad);
+    if (rc) {
+        errno = rc;
+        set_err(err, errlen, "ibv_post_send (rdma write)");
+        return -1;
+    }
+    return 0;
+}
+
 int hord_poll(hord_conn *c, uint64_t *wr_id, uint32_t *byte_len,
               uint32_t *opcode, uint32_t *status, char *err, size_t errlen) {
     struct ibv_wc wc;

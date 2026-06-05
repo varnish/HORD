@@ -9,11 +9,19 @@
 //!                           in fixed-size chunks (no up-front allocation — #14)
 //!   (anything else)      -> 404
 //!
+//! Zero-copy (spec §7): when negotiated and a `GET /size/<n>` carries an
+//! `X-HORD-RDMA-Write` header, the body is delivered by a one-sided RDMA write
+//! into the client's buffer and the HTTP response carries `Content-Length: 0`.
+//! The write is driven from inside the request handler via a [`SharedAsyncStream`]
+//! handle — `hyper`'s `service_fn` never receives the connection, and the write
+//! shares the one completion queue `hyper` drains, so the handler must reach the
+//! same stream object (see hord-async). Other body responses to a zero-copy
+//! request echo `status=declined`.
+//!
 //! Concurrency model: a blocking acceptor loop hands each connection (the `Send`
 //! `Connection` from `accept_begin`) to a fresh thread running a current-thread
 //! Tokio runtime. The async stream is `!Send`, so it is built and driven on that
-//! one thread. This serves many connections at once (one thread each) while the
-//! data path itself never busy-polls.
+//! one thread.
 
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -22,16 +30,17 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
 
-use hord_async::AsyncHordStream;
-use hord_demo::pattern_byte;
+use hord_async::{AsyncHordStream, SharedAsyncStream};
+use hord_demo::{pattern_byte, pattern_fill_registered};
 use hord_stream::{HordConfig, HordStream, Listener};
+use hord_zerocopy::{RdmaWriteReq, RdmaWriteStatus, HEADER};
 
 const DEFAULT_BIND: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
 const DEFAULT_PORT: u16 = 4791;
@@ -85,11 +94,25 @@ impl Body for PatternBody {
     }
 }
 
-fn respond(status: u16, content_type: &str, body: DemoBody) -> Response<DemoBody> {
+/// Build a response with a stream body, optionally echoing a zero-copy status
+/// (e.g. `declined` — §7.4 requires it on a body-bearing response to a request
+/// that carried `X-HORD-RDMA-Write`).
+fn respond(status: u16, content_type: &str, body: DemoBody, zc: Option<RdmaWriteStatus>) -> Response<DemoBody> {
+    let mut b = Response::builder().status(status).header("content-type", content_type);
+    if let Some(zc) = zc {
+        b = b.header(HEADER, zc.header_value());
+    }
+    b.body(body).expect("valid response")
+}
+
+/// Build a bodiless (`Content-Length: 0`) response carrying a zero-copy status —
+/// the payload travelled out-of-band via RDMA write.
+fn zc_response(status_code: u16, zc: RdmaWriteStatus) -> Response<DemoBody> {
     Response::builder()
-        .status(status)
-        .header("content-type", content_type)
-        .body(body)
+        .status(status_code)
+        .header("content-type", "application/octet-stream")
+        .header(HEADER, zc.header_value())
+        .body(empty())
         .expect("valid response")
 }
 
@@ -97,38 +120,96 @@ fn full(bytes: &'static [u8]) -> DemoBody {
     Full::new(Bytes::from_static(bytes)).boxed()
 }
 
-async fn serve(req: Request<Incoming>) -> Result<Response<DemoBody>, Infallible> {
-    let path = req.uri().path();
-    eprintln!("[server] {} {path}", req.method());
+fn empty() -> DemoBody {
+    Empty::<Bytes>::new().boxed()
+}
 
-    if req.method() != Method::GET {
-        return Ok(respond(405, "text/plain", full(b"only GET is supported\n")));
+async fn serve(req: Request<Incoming>, stream: SharedAsyncStream) -> Result<Response<DemoBody>, Infallible> {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    eprintln!("[server] {method} {path}");
+
+    // Did the request carry a zero-copy header, and is it one we'll honour?
+    let raw_header = req.headers().get(HEADER).and_then(|v| v.to_str().ok());
+    let had_header = raw_header.is_some();
+    let zc_req = if stream.zero_copy_negotiated() {
+        raw_header.and_then(RdmaWriteReq::parse)
+    } else {
+        None
+    };
+    // Drop the request before any await (we never read a GET body); nothing below
+    // borrows it.
+    drop(req);
+    // §7.4: any body-bearing response to a request that carried the header must
+    // echo a status; for non-zero-copy responses that is `declined`.
+    let declined = had_header.then_some(RdmaWriteStatus::Declined);
+
+    if method != Method::GET {
+        return Ok(respond(405, "text/plain", full(b"only GET is supported\n"), declined));
     }
     if path == "/" {
         return Ok(respond(
             200,
             "text/plain",
             full(b"HORD async server. Try GET /size/<bytes>.\n"),
+            declined,
         ));
     }
     if let Some(rest) = path.strip_prefix("/size/") {
         return Ok(match rest.parse::<usize>() {
-            Ok(n) if n <= MAX_BODY => respond(
-                200,
-                "application/octet-stream",
-                PatternBody::new(n).boxed(),
-            ),
-            Ok(_) => respond(413, "text/plain", full(b"size exceeds server limit\n")),
-            Err(_) => respond(400, "text/plain", full(b"bad size\n")),
+            Ok(n) if n <= MAX_BODY => {
+                if let Some(req) = zc_req {
+                    serve_zero_copy(&stream, &req, n).await
+                } else {
+                    respond(200, "application/octet-stream", PatternBody::new(n).boxed(), declined)
+                }
+            }
+            Ok(_) => respond(413, "text/plain", full(b"size exceeds server limit\n"), declined),
+            Err(_) => respond(400, "text/plain", full(b"bad size\n"), declined),
         });
     }
-    Ok(respond(404, "text/plain", full(b"not found\n")))
+    Ok(respond(404, "text/plain", full(b"not found\n"), declined))
 }
 
-/// Drive one accepted connection to completion on its own current-thread
-/// runtime. hyper calls `poll_shutdown` on close, which flushes (waits for every
-/// RDMA send to be acked) before disconnecting, so the response is fully
-/// delivered.
+/// Deliver a `/size/<n>` body by RDMA-writing it into the client's buffer, then
+/// return a bodiless response with the outcome. The write is awaited before the
+/// response is built, so the payload has landed by the time the client reads it.
+async fn serve_zero_copy(stream: &SharedAsyncStream, req: &RdmaWriteReq, n: usize) -> Response<DemoBody> {
+    if n as u64 > req.len {
+        eprintln!("[server] -> 413 (zero-copy: too_large object_size={n})");
+        return zc_response(413, RdmaWriteStatus::TooLarge { object_size: n as u64 });
+    }
+    if n == 0 {
+        // Nothing to place; a zero-length MR is not portable, so short-circuit
+        // (matching the sync hord_zerocopy::serve_rdma_write path) rather than
+        // calling register_source(0)/ibv_reg_mr(.., 0, ..).
+        return zc_response(200, RdmaWriteStatus::Complete { bytes_written: 0 });
+    }
+    let src = match stream.register_source(n) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[server] register_source failed: {e}");
+            return respond(500, "text/plain", full(b"internal error\n"), None);
+        }
+    };
+    pattern_fill_registered(&src, n);
+    match stream.rdma_write(&src, 0, req.addr, req.rkey, n).await {
+        Ok(()) => {
+            eprintln!("[server] -> 200 (zero-copy: complete bytes_written={n})");
+            zc_response(200, RdmaWriteStatus::Complete { bytes_written: n as u64 })
+        }
+        Err(e) => {
+            // Mid-write failure (§7.4): the QP is in error, the connection will
+            // close. Returning anything is best-effort.
+            eprintln!("[server] rdma_write failed: {e}");
+            respond(500, "text/plain", full(b"rdma write failed\n"), None)
+        }
+    }
+}
+
+/// Drive one accepted connection to completion on its own current-thread runtime.
+/// The stream is wrapped in a [`SharedAsyncStream`] so the request handler can
+/// reach it to perform a zero-copy RDMA write while hyper owns it for HTTP.
 fn serve_connection(conn: hord_stream::Connection, peer: Vec<u8>, config: &HordConfig) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -148,8 +229,13 @@ fn serve_connection(conn: hord_stream::Connection, peer: Vec<u8>, config: &HordC
                 return;
             }
         };
+        let shared = SharedAsyncStream::new(stream);
+        let handle = shared.clone();
         if let Err(e) = http1::Builder::new()
-            .serve_connection(TokioIo::new(stream), service_fn(serve))
+            .serve_connection(
+                TokioIo::new(shared),
+                service_fn(move |req| serve(req, handle.clone())),
+            )
             .await
         {
             eprintln!("[server] connection error: {e}");
@@ -185,7 +271,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("[server] listening on {bind}:{port} (async/hyper, per-connection threads)");
+    eprintln!(
+        "[server] listening on {bind}:{port} (async/hyper, per-connection threads, zero_copy={})",
+        config.zero_copy
+    );
 
     // Blocking accept loop: each accepted connection is handed (as the Send
     // `Connection`) to its own thread, which builds and runs the !Send stream.

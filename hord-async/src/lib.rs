@@ -37,6 +37,16 @@
 //! bidirectional traffic from one task (the busy-poll path's
 //! `full_duplex_bulk`) is fine; two tasks over `split` can stall.
 //!
+//! ## Zero-copy (spec §7)
+//!
+//! The one-sided RDMA write is driven through [`SharedAsyncStream`], a clonable
+//! handle that lets a `hyper` server reach the connection from inside its request
+//! handler — necessary because the write shares the one completion queue `hyper`
+//! drains, on the one driving task. The client needs no handle: it registers its
+//! destination buffer up front ([`AsyncHordStream::register_remote_writable`])
+//! and reads it after the response. The `X-HORD-RDMA-Write` HTTP semantics live
+//! in `hord-zerocopy`.
+//!
 //! ## Timeouts
 //!
 //! Per-operation deadlines are applied the idiomatic tokio way — wrap a call in
@@ -46,15 +56,17 @@
 //! cancelled (timed-out) read/write future drops cleanly: already-reaped
 //! completions stay reaped and no slot is leaked.
 
+use std::cell::RefCell;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use hord_stream::{Connection, HordConfig, HordStream};
+use hord_stream::{Connection, HordConfig, HordStream, RegisteredBuffer};
 
 /// A raw fd owned elsewhere (by the connection), wrapped only so `AsyncFd` can
 /// register it with the reactor. Dropping it does **not** close the fd — it just
@@ -125,6 +137,64 @@ impl AsyncHordStream {
     /// Begin a graceful disconnect (best-effort).
     pub fn disconnect(&self) {
         self.stream.disconnect();
+    }
+
+    // ---- zero-copy extension (spec §7) -------------------------------------
+
+    /// Whether the zero-copy extension was negotiated on this connection.
+    /// See [`HordStream::zero_copy_negotiated`].
+    pub fn zero_copy_negotiated(&self) -> bool {
+        self.stream.zero_copy_negotiated()
+    }
+
+    /// Register a destination buffer the peer may RDMA-write into (client side).
+    /// See [`HordStream::register_remote_writable`].
+    pub fn register_remote_writable(&self, len: usize) -> io::Result<RegisteredBuffer> {
+        self.stream.register_remote_writable(len)
+    }
+
+    /// Register a source buffer to RDMA-write from (server side).
+    /// See [`HordStream::register_source`].
+    pub fn register_source(&self, len: usize) -> io::Result<RegisteredBuffer> {
+        self.stream.register_source(len)
+    }
+
+    /// Non-blocking driver for a one-sided RDMA write: post the WR(s) on the first
+    /// poll (tracked by `w.posted`), then park on the completion fd until every WR
+    /// is acknowledged. Mirrors [`poll_write`] / [`poll_flush`] — it reuses
+    /// [`poll_events`](Self::poll_events) and the write driver in `hord-stream`,
+    /// duplicating no flow-control logic. [`SharedAsyncStream::rdma_write`] wraps
+    /// this in a future.
+    fn poll_rdma_write(
+        &mut self,
+        cx: &mut Context<'_>,
+        w: &mut PendingWrite<'_>,
+    ) -> Poll<io::Result<()>> {
+        if w.post_outcome.is_none() {
+            w.post_outcome = Some(self.stream.begin_rdma_write(
+                w.src, w.src_off, w.peer_addr, w.peer_rkey, w.len,
+            ));
+        }
+        // Drain EVERY write that posted before resolving — even on a post error or
+        // a closed stream. Otherwise an error return would let the caller drop
+        // `src` (deregistering its MR + freeing the storage) while the NIC is
+        // still DMA-reading it from an outstanding write (use-after-free).
+        while self.stream.writes_pending() {
+            match self.poll_events(cx)? {
+                Poll::Ready(()) => continue,
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        // All posted writes reaped. A post error wins; else a closed stream means
+        // the write didn't fully land (§7.4 — never report complete); else Ok.
+        if let Some(Err(e)) = w.post_outcome.take() {
+            return Poll::Ready(Err(e));
+        }
+        Poll::Ready(if self.stream.is_closed() {
+            Err(write_aborted())
+        } else {
+            Ok(())
+        })
     }
 
     /// Best-effort, non-blocking half-close check via the CM fd. Returns `true`
@@ -241,10 +311,11 @@ impl AsyncWrite for AsyncHordStream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         loop {
-            // Emit any staged partial message, then wait for every data send to
-            // be acknowledged (an RC send completion == delivered + acked).
+            // Emit any staged partial message, then wait for every data send
+            // *and* one-sided RDMA write to be acknowledged (an RC completion ==
+            // delivered + acked) — flush is a full delivery barrier.
             let stage_clear = this.stream.try_flush_stage()?;
-            if stage_clear && !this.stream.sends_outstanding() {
+            if stage_clear && !this.stream.sends_outstanding() && !this.stream.writes_pending() {
                 return Poll::Ready(Ok(()));
             }
             if this.stream.is_closed() {
@@ -265,5 +336,140 @@ impl AsyncWrite for AsyncHordStream {
         std::task::ready!(self.as_mut().poll_flush(cx))?;
         self.stream.disconnect();
         Poll::Ready(Ok(()))
+    }
+}
+
+fn write_aborted() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "connection closed before the RDMA write completed",
+    )
+}
+
+/// In-progress one-sided RDMA write, threaded through
+/// [`AsyncHordStream::poll_rdma_write`] across polls. `post_outcome` is `None`
+/// until the first poll issues the WR(s); thereafter it holds that `begin`
+/// call's result, which is reported only *after* every posted WR has been
+/// drained (so a post error can't drop the source buffer with DMA outstanding).
+struct PendingWrite<'a> {
+    src: &'a RegisteredBuffer,
+    src_off: usize,
+    peer_addr: u64,
+    peer_rkey: u32,
+    len: usize,
+    post_outcome: Option<io::Result<()>>,
+}
+
+/// A clonable handle to an [`AsyncHordStream`], so a `hyper` *server* can drive a
+/// zero-copy RDMA write from inside its request handler while `hyper` owns the
+/// stream for HTTP. (`hyper`'s `service_fn` never receives the connection, and
+/// the RDMA write shares the one completion queue `hyper` drains — so the write
+/// must be driven by the same object, on the same task.)
+///
+/// Both `hyper` (via [`tokio::io::AsyncRead`]/[`AsyncWrite`]) and the handler (via
+/// [`rdma_write`](Self::rdma_write)) reach the stream through this handle, which
+/// `borrow_mut`s the shared cell **only for the duration of each poll — never
+/// across an await**. That keeps the two borrows *sequential*, which is the whole
+/// safety argument: everything runs on one current-thread task, and within that
+/// task no two polls overlap, so the cell is never borrowed twice at once.
+///
+/// **The borrow discipline is a runtime invariant, not a type-level one.** It
+/// holds for the demo (a single body-less GET, driven by `hyper`'s sequential
+/// per-connection poll loop) and for any single-task driver that polls read,
+/// write, and `rdma_write` in turn. It would be **violated** by driving the
+/// stream from two tasks at once — e.g. [`tokio::io::split`] with the halves on
+/// independent tasks of a multi-thread runtime — where a concurrent
+/// `borrow_mut` panics (`already borrowed: BorrowMutError`), aborting the
+/// connection task. That split model is the one the module header documents as
+/// unsupported; this handle does not change that. (No present code path — not
+/// even a streamed request body, which `hyper` still reads sequentially before
+/// polling the handler — triggers it.)
+///
+/// The *client* does not need this: it registers its destination buffer up front
+/// and reads it after the response, so it can hand a plain [`AsyncHordStream`] to
+/// `hyper` and keep the [`RegisteredBuffer`] alongside.
+#[derive(Clone)]
+pub struct SharedAsyncStream(Rc<RefCell<AsyncHordStream>>);
+
+impl SharedAsyncStream {
+    /// Wrap an [`AsyncHordStream`] in a shared, clonable handle.
+    pub fn new(inner: AsyncHordStream) -> Self {
+        SharedAsyncStream(Rc::new(RefCell::new(inner)))
+    }
+
+    /// Whether the zero-copy extension was negotiated. See
+    /// [`AsyncHordStream::zero_copy_negotiated`].
+    pub fn zero_copy_negotiated(&self) -> bool {
+        self.0.borrow().zero_copy_negotiated()
+    }
+
+    /// Register a source buffer to RDMA-write from (server side).
+    pub fn register_source(&self, len: usize) -> io::Result<RegisteredBuffer> {
+        self.0.borrow().register_source(len)
+    }
+
+    /// Register a destination buffer the peer may RDMA-write into (client side).
+    pub fn register_remote_writable(&self, len: usize) -> io::Result<RegisteredBuffer> {
+        self.0.borrow().register_remote_writable(len)
+    }
+
+    /// Best-effort graceful disconnect.
+    pub fn disconnect(&self) {
+        self.0.borrow().disconnect();
+    }
+
+    /// RDMA-write `src[src_off .. src_off+len]` into the peer's `[peer_addr,
+    /// peer_rkey]`, awaiting completion. The body is delivered out-of-band; the
+    /// caller then sends an HTTP response with `Content-Length: 0`. Borrows the
+    /// shared stream afresh on each poll (no borrow held across an await).
+    pub async fn rdma_write(
+        &self,
+        src: &RegisteredBuffer,
+        src_off: usize,
+        peer_addr: u64,
+        peer_rkey: u32,
+        len: usize,
+    ) -> io::Result<()> {
+        let mut w = PendingWrite {
+            src,
+            src_off,
+            peer_addr,
+            peer_rkey,
+            len,
+            post_outcome: None,
+        };
+        std::future::poll_fn(|cx| self.0.borrow_mut().poll_rdma_write(cx, &mut w)).await
+    }
+}
+
+impl AsyncRead for SharedAsyncStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut inner = self.get_mut().0.borrow_mut();
+        Pin::new(&mut *inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for SharedAsyncStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut inner = self.get_mut().0.borrow_mut();
+        Pin::new(&mut *inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut inner = self.get_mut().0.borrow_mut();
+        Pin::new(&mut *inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut inner = self.get_mut().0.borrow_mut();
+        Pin::new(&mut *inner).poll_shutdown(cx)
     }
 }

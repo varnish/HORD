@@ -127,6 +127,17 @@ mod ffi {
             err: *mut c_char,
             errlen: usize,
         ) -> c_int;
+        pub fn hord_post_write(
+            c: *mut HordConn,
+            wr_id: u64,
+            addr: *mut c_void,
+            length: u32,
+            lkey: u32,
+            remote_addr: u64,
+            rkey: u32,
+            err: *mut c_char,
+            errlen: usize,
+        ) -> c_int;
         pub fn hord_poll(
             c: *mut HordConn,
             wr_id: *mut u64,
@@ -154,6 +165,12 @@ mod ffi {
 /// IBV_ACCESS_LOCAL_WRITE — the only MR access flag the stream path needs.
 pub const ACCESS_LOCAL_WRITE: i32 = 1;
 
+/// IBV_ACCESS_REMOTE_WRITE — lets a peer RDMA-write into this MR. Used for the
+/// zero-copy extension's client destination buffer. Per IBA, remote write also
+/// requires local write, so register such buffers with
+/// `ACCESS_LOCAL_WRITE | ACCESS_REMOTE_WRITE`.
+pub const ACCESS_REMOTE_WRITE: i32 = 2;
+
 const ERRBUF: usize = 256;
 
 /// Connection-manager retry / timeout parameters (#11). The defaults reproduce
@@ -180,11 +197,13 @@ impl Default for CmParams {
     }
 }
 
-/// Work-completion opcode, as reported by the NIC. The prototype only ever
-/// observes `Send` and `Recv` (no RDMA write / write-with-immediate).
+/// Work-completion opcode, as reported by the NIC. The stream path observes
+/// `Send` and `Recv`; the zero-copy extension adds `RdmaWrite` (the sender's
+/// completion for a one-sided RDMA write — write-with-immediate is not used).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opcode {
     Send,
+    RdmaWrite,
     Recv,
     Other(u32),
 }
@@ -192,8 +211,9 @@ pub enum Opcode {
 impl Opcode {
     fn from_raw(v: u32) -> Self {
         match v {
-            0 => Opcode::Send,   // IBV_WC_SEND
-            128 => Opcode::Recv, // IBV_WC_RECV
+            0 => Opcode::Send,        // IBV_WC_SEND
+            1 => Opcode::RdmaWrite,   // IBV_WC_RDMA_WRITE
+            128 => Opcode::Recv,      // IBV_WC_RECV
             other => Opcode::Other(other),
         }
     }
@@ -541,7 +561,26 @@ impl Connection {
         // `Box<[UnsafeCell<u8>]>`: the registered storage is never sliced as
         // `&[u8]`, so the NIC may DMA into it while we touch other regions
         // through raw pointers without violating the aliasing model.
-        let storage: Box<[UnsafeCell<u8>]> = (0..len).map(|_| UnsafeCell::new(0u8)).collect();
+        //
+        // Allocated zeroed via `vec![0u8; len]` (which lowers to `alloc_zeroed`,
+        // i.e. lazily-zeroed OS pages on Linux) rather than an eager per-element
+        // `(0..len).map(|_| UnsafeCell::new(0u8)).collect()` memset. For an
+        // RDMA-write *source* the caller overwrites the whole region immediately,
+        // so an eager zeroing pass over it is wasted work; receive / destination
+        // buffers still see the zeros they rely on.
+        let storage: Box<[UnsafeCell<u8>]> = {
+            let zeroed: Box<[u8]> = vec![0u8; len].into_boxed_slice();
+            // `UnsafeCell<u8>` is `#[repr(transparent)]` over `u8`: identical
+            // size/alignment, and an initialized `0u8` is a valid `UnsafeCell<u8>`.
+            let data = Box::into_raw(zeroed) as *mut UnsafeCell<u8>;
+            let slice = std::ptr::slice_from_raw_parts_mut(data, len);
+            // SAFETY: `data` is the (non-null, aligned) base of a `len`-element
+            // allocation of `u8`, reinterpreted as layout-identical
+            // `UnsafeCell<u8>`; the allocation's `Layout` is unchanged, so
+            // rebuilding the `Box` under the new element type — and freeing it as
+            // such on drop — is sound.
+            unsafe { Box::from_raw(slice) }
+        };
         // Base pointer for registration; valid for the whole life of the box.
         let ptr = UnsafeCell::raw_get(storage.as_ptr());
         let mut err = errbuf();
@@ -612,6 +651,42 @@ impl Connection {
             addr as *mut c_void,
             length,
             lkey,
+            err.as_mut_ptr(),
+            err.len(),
+        );
+        check_rc(rc, &err)
+    }
+
+    /// Post a signaled one-sided RDMA write: copy `[addr, addr+length)` (local,
+    /// in an MR with `lkey`) into the peer's memory at `remote_addr`, authorized
+    /// by `rkey` (an rkey the peer registered with `ACCESS_REMOTE_WRITE` and
+    /// advertised to us). Only valid once the connection is established (RTS).
+    /// The completion carries [`Opcode::RdmaWrite`]; the peer posts no receive
+    /// and observes nothing.
+    ///
+    /// # Safety
+    /// `addr`/`length` must reference live, registered local memory until the
+    /// matching completion is reaped. `remote_addr`/`rkey` must describe a live
+    /// remote region the peer authorized for remote write; a stale or wrong rkey
+    /// transitions the QP to the error state (closing the connection).
+    pub unsafe fn post_write(
+        &self,
+        wr_id: u64,
+        addr: *const u8,
+        length: u32,
+        lkey: u32,
+        remote_addr: u64,
+        rkey: u32,
+    ) -> io::Result<()> {
+        let mut err = errbuf();
+        let rc = ffi::hord_post_write(
+            self.raw,
+            wr_id,
+            addr as *mut c_void,
+            length,
+            lkey,
+            remote_addr,
+            rkey,
             err.as_mut_ptr(),
             err.len(),
         );

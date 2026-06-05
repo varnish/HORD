@@ -1,0 +1,15 @@
+[package]
+name = "hord-zerocopy"
+description = "HORD zero-copy extension: X-HORD-RDMA-Write header codec + one-sided RDMA-write orchestration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# Like hord-core/hord-stream, this crate is plain std Rust with no third-party
+# dependencies. It layers the HORD zero-copy *HTTP semantics* (§7) over the
+# RDMA-write driver in hord-stream; tokio/hyper stay confined to hord-async and
+# the demo.
+[dependencies]
+hord-stream = { path = "../hord-stream" }

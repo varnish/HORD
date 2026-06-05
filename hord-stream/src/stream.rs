@@ -49,6 +49,7 @@ use std::sync::Arc;
 
 use hord_core::{
     CmParams, Completion, Connection, Listener, Opcode, RegisteredBuffer, ACCESS_LOCAL_WRITE,
+    ACCESS_REMOTE_WRITE,
 };
 
 use crate::envelope::{flags as env_flags, Envelope, ENVELOPE_LEN};
@@ -66,6 +67,10 @@ pub struct HordConfig {
     pub send_pool_size: usize,
     /// Connection-manager retry / timeout parameters (#11).
     pub cm: CmParams,
+    /// Advertise the zero-copy extension (spec §7) in our handshake. Harmless
+    /// when `true` even if unused: it only takes effect once a peer sends an
+    /// `X-HORD-RDMA-Write` request and we elect to honour it.
+    pub zero_copy: bool,
 }
 
 impl Default for HordConfig {
@@ -75,6 +80,7 @@ impl Default for HordConfig {
             recv_pool_size: 32,
             send_pool_size: 16,
             cm: CmParams::default(),
+            zero_copy: true,
         }
     }
 }
@@ -93,11 +99,14 @@ const CTRL_SEND_SLOTS: usize = 1;
 
 // wr_id encoding: top bit distinguishes sends from receives; the next bit marks
 // the reserved control send (so its completion frees the control slot rather
-// than a data slot); low bits are the buffer slot index. Control *receives* are
+// than a data slot); a third bit marks a one-sided RDMA write (zero-copy), which
+// belongs to neither send pool nor recv pool and is reaped by a separate
+// counter. Low bits are the buffer/chunk index. Control *receives* are
 // recognised by the CREDIT_ONLY envelope flag, not by wr_id (the NIC consumes
 // receive WRs FIFO regardless of message type, so the slot carries no lane).
 const SEND_FLAG: u64 = 1 << 63;
 const CTRL_FLAG: u64 = 1 << 62;
+const WRITE_FLAG: u64 = 1 << 61;
 fn recv_wr_id(slot: usize) -> u64 {
     slot as u64
 }
@@ -107,15 +116,28 @@ fn send_wr_id(slot: usize) -> u64 {
 fn ctrl_send_wr_id(slot: usize) -> u64 {
     SEND_FLAG | CTRL_FLAG | slot as u64
 }
+fn write_wr_id(chunk: u64) -> u64 {
+    WRITE_FLAG | chunk
+}
 fn is_send(wr_id: u64) -> bool {
     wr_id & SEND_FLAG != 0
 }
 fn is_ctrl_send(wr_id: u64) -> bool {
     wr_id & CTRL_FLAG != 0
 }
-fn slot_of(wr_id: u64) -> usize {
-    (wr_id & !(SEND_FLAG | CTRL_FLAG)) as usize
+fn is_write(wr_id: u64) -> bool {
+    wr_id & WRITE_FLAG != 0
 }
+fn slot_of(wr_id: u64) -> usize {
+    (wr_id & !(SEND_FLAG | CTRL_FLAG | WRITE_FLAG)) as usize
+}
+
+/// Bytes per RDMA-write work request. The NIC segments a single WR into MTU-sized
+/// packets, so one WR can carry a very large payload; we cap it only so an
+/// enormous object maps to a bounded number of WRs (`begin_rdma_write` requires
+/// that count to fit the send queue). 1 GiB matches the demo's body ceiling, so
+/// every demo response is a single WR.
+const WRITE_WR_MAX: usize = 1 << 30;
 
 /// A received data message whose payload still lives in its receive buffer,
 /// awaiting `read()`. We hold the buffer (rather than copying out and
@@ -155,6 +177,13 @@ pub struct HordStream {
     tx_stage: Vec<u8>,        // bytes buffered by write(), drained into messages
     rx_ready: VecDeque<ReadyMsg>, // received data, still in its recv buffer, awaiting read()
     peer_closed: bool,        // observed a flush/transport error -> treat as EOF/broken pipe
+
+    // ---- zero-copy extension (spec §7) ----
+    // Our config's `zero_copy` at construction, AND-ed with the peer's handshake
+    // flag in `apply_peer` — so after the handshake it is exactly "both sides
+    // advertised the capability".
+    zero_copy: bool,
+    writes_outstanding: u32,  // one-sided RDMA writes posted but not yet reaped
 }
 
 impl HordStream {
@@ -199,7 +228,8 @@ impl HordStream {
         let mut s = HordStream::new_common(conn, config)?;
         let peer = Handshake::decode(&peer_bytes)?;
         s.apply_peer(&peer)?;
-        let my = Handshake::new(config.max_message_size as u32, config.recv_pool_size as u16);
+        let my = Handshake::new(config.max_message_size as u32, config.recv_pool_size as u16)
+            .with_zero_copy(config.zero_copy);
         s.conn.accept_finish(&my.encode())?;
         Ok(s)
     }
@@ -215,7 +245,8 @@ impl HordStream {
             config.cm,
         )?;
         let mut s = HordStream::new_common(conn, config)?;
-        let my = Handshake::new(config.max_message_size as u32, config.recv_pool_size as u16);
+        let my = Handshake::new(config.max_message_size as u32, config.recv_pool_size as u16)
+            .with_zero_copy(config.zero_copy);
         let peer_bytes = s.conn.connect_finish(&my.encode(), HANDSHAKE_LEN)?;
         let peer = Handshake::decode(&peer_bytes)?;
         s.apply_peer(&peer)?;
@@ -267,6 +298,8 @@ impl HordStream {
             tx_stage: Vec::new(),
             rx_ready: VecDeque::new(),
             peer_closed: false,
+            zero_copy: config.zero_copy,
+            writes_outstanding: 0,
         };
         s.post_all_recvs()?;
         Ok(s)
@@ -300,6 +333,7 @@ impl HordStream {
         }
         self.payload_cap = effective - ENVELOPE_LEN;
         self.send_credits = peer.max_recv_buffers as u32;
+        self.zero_copy &= peer.zero_copy_capable();
         Ok(())
     }
 
@@ -311,6 +345,32 @@ impl HordStream {
     /// Begin graceful disconnect.
     pub fn disconnect(&self) {
         self.conn.disconnect();
+    }
+
+    // ---- zero-copy extension (spec §7) -------------------------------------
+
+    /// Whether the zero-copy extension is usable on this connection: both we and
+    /// the peer advertised `ZERO_COPY_CAPABLE` in the handshake. The zero-copy
+    /// HTTP layer (`hord-zerocopy`) gates on this before offering / honouring an
+    /// `X-HORD-RDMA-Write` exchange.
+    pub fn zero_copy_negotiated(&self) -> bool {
+        self.zero_copy
+    }
+
+    /// Register `len` zeroed bytes the **peer may RDMA-write into** (client side:
+    /// the destination buffer advertised via `X-HORD-RDMA-Write`). Registered
+    /// `LOCAL_WRITE | REMOTE_WRITE`; expose its address via
+    /// [`RegisteredBuffer::as_mut_ptr`] and key via [`RegisteredBuffer::rkey`].
+    pub fn register_remote_writable(&self, len: usize) -> io::Result<RegisteredBuffer> {
+        self.conn
+            .register_buffer(len, ACCESS_LOCAL_WRITE | ACCESS_REMOTE_WRITE)
+    }
+
+    /// Register `len` bytes to RDMA-write **from** (server side: the source of a
+    /// zero-copy response body). The NIC only reads it, so `LOCAL_WRITE` access
+    /// is sufficient; fill it with [`RegisteredBuffer::copy_in`].
+    pub fn register_source(&self, len: usize) -> io::Result<RegisteredBuffer> {
+        self.conn.register_buffer(len, ACCESS_LOCAL_WRITE)
     }
 
     // ---- completion engine -------------------------------------------------
@@ -337,6 +397,19 @@ impl HordStream {
     }
 
     fn handle_completion(&mut self, wc: Completion) -> io::Result<()> {
+        // One-sided RDMA write (zero-copy). It belongs to neither the send pool
+        // nor the recv pool — just a counter — so reap it first, on both the
+        // success and failure paths. A failed write means the peer's buffer is in
+        // an undefined state (spec §7.4 mid-write failure), so close the stream;
+        // `rdma_write_all` then surfaces it rather than reporting `complete`.
+        if is_write(wc.wr_id) {
+            self.writes_outstanding = self.writes_outstanding.saturating_sub(1);
+            if !wc.is_success() {
+                self.peer_closed = true;
+            }
+            return Ok(());
+        }
+
         if !wc.is_success() {
             // Flush or transport error (commonly seen when the peer
             // disconnects and our outstanding recvs are flushed). Treat as a
@@ -689,6 +762,130 @@ impl HordStream {
         self.peer_closed
     }
 
+    // ---- zero-copy write driver (spec §7) ----------------------------------
+
+    /// Post a one-sided RDMA write of `src[src_off .. src_off+len]` into the
+    /// peer's memory at `peer_addr`, authorized by `peer_rkey` (which the peer
+    /// registered with `ACCESS_REMOTE_WRITE` and advertised via
+    /// `X-HORD-RDMA-Write`). Non-blocking: it posts the WR(s) and returns; drive
+    /// [`drain_completions`](Self::drain_completions) / [`pump`](Self::pump)
+    /// until [`writes_pending`](Self::writes_pending) is false. The blocking
+    /// [`rdma_write_all`](Self::rdma_write_all) and the async wrapper both build
+    /// on this — no logic duplicated.
+    ///
+    /// Consumes **no stream credit** (one-sided — the peer posts no receive) and
+    /// **no send-pool slot**, but each WR occupies a send-queue entry. The whole
+    /// write must therefore fit the send queue, and must be issued while no
+    /// stream *data* sends are in flight — both hold for the HTTP request →
+    /// response pattern (the body is written before the response head is sent).
+    pub fn begin_rdma_write(
+        &mut self,
+        src: &RegisteredBuffer,
+        src_off: usize,
+        peer_addr: u64,
+        peer_rkey: u32,
+        len: usize,
+    ) -> io::Result<()> {
+        if self.peer_closed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
+        }
+        assert!(
+            src_off.checked_add(len).is_some_and(|end| end <= src.len()),
+            "rdma write source range out of bounds",
+        );
+        // Each WR carries up to WRITE_WR_MAX bytes and occupies one send-queue
+        // entry. The send queue holds `send_pool + CTRL_SEND_SLOTS` WRs; writes
+        // share the `send_pool` data portion with in-flight data sends and any
+        // earlier in-flight writes, leaving the control slot reserved for credit
+        // returns. Bound the write against the data slots actually free *now* —
+        // `send_free` tracks free data slots, of which `writes_outstanding` are
+        // already taken by posted writes (writes don't draw from `send_free`).
+        let n_wrs = len.div_ceil(WRITE_WR_MAX);
+        let free_slots = self
+            .send_free
+            .len()
+            .saturating_sub(self.writes_outstanding as usize);
+        if n_wrs > free_slots {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "zero-copy write of {len} bytes needs {n_wrs} send-queue slots, \
+                     only {free_slots} free ({} writes already in flight)",
+                    self.writes_outstanding
+                ),
+            ));
+        }
+        let base = src.as_mut_ptr();
+        let lkey = src.lkey();
+        let mut off = 0usize;
+        let mut chunk = 0u64;
+        while off < len {
+            let n = (len - off).min(WRITE_WR_MAX);
+            // SAFETY: `[base+src_off+off, +n)` lies within `src`, which the caller
+            // keeps alive until the completion is reaped; the destination is
+            // authorized by the peer-supplied rkey. A bad/stale rkey fails the WR,
+            // transitioning the QP to error → `peer_closed` (handled on the
+            // completion). The src pointer is stable (the storage is boxed).
+            let r = unsafe {
+                self.conn.post_write(
+                    write_wr_id(chunk),
+                    base.add(src_off + off),
+                    n as u32,
+                    lkey,
+                    peer_addr + off as u64,
+                    peer_rkey,
+                )
+            };
+            if let Err(e) = r {
+                self.peer_closed = true;
+                return Err(e);
+            }
+            self.writes_outstanding += 1;
+            off += n;
+            chunk += 1;
+        }
+        Ok(())
+    }
+
+    /// Whether any one-sided RDMA write is still unacknowledged.
+    pub fn writes_pending(&self) -> bool {
+        self.writes_outstanding > 0
+    }
+
+    /// Blocking facade over [`begin_rdma_write`](Self::begin_rdma_write): post the
+    /// write and busy-poll (servicing any interleaved stream completions) until
+    /// every WR is acknowledged. For RC, a write completion means the bytes are
+    /// in the peer's memory and acked — so on `Ok(())` the caller may report
+    /// `status=complete`. A transport failure mid-write closes the stream and
+    /// returns an error (spec §7.4: never report `complete` on a partial write).
+    pub fn rdma_write_all(
+        &mut self,
+        src: &RegisteredBuffer,
+        src_off: usize,
+        peer_addr: u64,
+        peer_rkey: u32,
+        len: usize,
+    ) -> io::Result<()> {
+        // If a WR fails to post mid-batch, `begin_rdma_write` returns Err but the
+        // WRs that DID post are still queued on the NIC. We must drain every
+        // posted write (reap its completion) before returning, or the caller will
+        // drop `src` — deregistering its MR and freeing the storage — while the
+        // NIC is still DMA-reading it (use-after-free). So drain first, propagate
+        // the post error after.
+        let posted = self.begin_rdma_write(src, src_off, peer_addr, peer_rkey, len);
+        while self.writes_pending() {
+            self.pump(true)?;
+        }
+        posted?;
+        if self.peer_closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection closed before the RDMA write completed",
+            ));
+        }
+        Ok(())
+    }
+
     /// Mark the stream closed — e.g. when the async layer observes a CM
     /// `DISCONNECTED` event (half-close). Subsequent reads see EOF.
     pub fn mark_closed(&mut self) {
@@ -774,8 +971,12 @@ impl Write for HordStream {
             }
             self.pump(true)?;
         }
-        // Then wait for every posted data send to be acknowledged.
-        while self.sends_outstanding() {
+        // Then wait for every posted data send *and* one-sided RDMA write to be
+        // acknowledged — flush is a full "everything I posted is delivered"
+        // barrier, so a caller may safely disconnect after it (a write left
+        // pending here would otherwise be truncated, or leave the NIC DMA-ing a
+        // buffer the caller is about to drop).
+        while self.sends_outstanding() || self.writes_pending() {
             if self.peer_closed {
                 // The connection dropped with sends still outstanding, so we
                 // can NOT claim the data was delivered. Surface it rather than
