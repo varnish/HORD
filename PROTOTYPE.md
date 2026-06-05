@@ -113,10 +113,10 @@ These are deliberate cuts, not oversights — each is a known next step:
 - **No graceful half-close detection.** We rely on HTTP `Content-Length` and
   `flush()`-before-disconnect rather than processing CM `DISCONNECTED` events on
   the data path.
-- **Two copies on the receive path** (NIC buffer → reassembly `VecDeque` →
-  caller). The send path is down to one copy (into the registered staging
-  buffer). The reassembly buffer could be bypassed when a read spans a whole
-  message.
+- **One copy on each path.** The send path copies into the registered staging
+  buffer; the receive path now copies straight from the registered receive
+  buffer to the caller (the payload is held in place until `read()` drains it —
+  see #8 below), so the intermediate reassembly copy is gone.
 - **HTTP is hand-rolled** (just enough to prove the transport). Swapping in
   `hyper` over an async `HordStream` is the intended end state and changes
   nothing below the socket.
@@ -128,21 +128,25 @@ were fixed (send/recv error paths now mark the connection closed instead of
 leaking a slot; `flush()` returns an error instead of silently truncating when
 the peer drops mid-send; `read_head` is size-capped; the handshake length is
 range-checked; `Connection::register` is now `unsafe`; the receive drain is a
-bulk copy). The following are real but are design-level work beyond a first
-prototype:
+bulk copy).
 
-- **Full-duplex credit deadlock.** Returning credits goes through
-  `send_message`, which itself costs a credit. If both peers simultaneously
-  reach zero send credits while each still owes grants, neither can send even a
-  `CREDIT_ONLY` message — mutual, unrecoverable. The half-duplex HTTP
-  request/response demo never hits this. Fix: a credit-return path that does not
-  consume a data credit (e.g. a small reserved pool of receive buffers for
-  control messages, accounted separately).
-- **Reassembly buffer is unbounded.** A consumed receive buffer is re-posted
-  (and its credit returned) on *receipt*, not on application *consumption*, so a
-  fast sender + slow reader grows the `rx` `VecDeque` without limit. Credit flow
-  control bounds the NIC receive pool but not application memory. Fix: defer the
-  re-post/credit-return until `read()` has drained the bytes.
+A later **flow-control pass** then redesigned credit handling and fixed two
+more:
+
+- **Full-duplex credit deadlock.** Returning credits used to go through
+  `send_message`, which itself cost a credit, so two peers that simultaneously
+  hit zero credits while each owed grants could deadlock. Credit-returns now
+  travel a separate, self-clocked *control lane* — a small pool of always-posted
+  receive buffers (`CTRL_RECV_SLACK`) plus a reserved control send slot bounded
+  by one in-flight message rather than by a data credit. No wire-format change.
+- **Reassembly buffer was unbounded.** A received data buffer is now held in
+  place and only re-posted / credited on application *consumption* in `read()`,
+  not on receipt — so backpressure reaches the sender and the reassembly
+  footprint is bounded to the receive pool. (`fullduplex_tests::full_duplex_bulk`
+  exercises both fixes.)
+
+The following are real but remain design-level work beyond a first prototype:
+
 - **MR lifetime is not tied to the PD in the type system.** Correct teardown
   ordering lives in `HordStream`'s hand-written `Drop`; a raw
   `Connection` + `MemoryRegion` pair dropped in the wrong order still leaks the

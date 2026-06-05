@@ -5,16 +5,19 @@ code review"). Tackled as focused passes, not one big change: the items are
 different kinds of work with different risk, and two of them belong with the
 async milestone rather than now.
 
-## Pass 1 — Flow-control correctness  (independent · highest stakes · testable now)
-- [ ] **#3 Full-duplex credit deadlock** — add a credit-return path that does not
-      consume a data credit (a small reserved pool of receive buffers for control
-      messages, accounted separately from data credits).
-- [ ] **#8 Unbounded reassembly** — return credits / re-post receive buffers on
-      application *consumption* (once `read()` drains the bytes), not on receipt,
-      so backpressure actually reaches the sender.
-  - Design these two together — both change *when/how* credits are returned.
-  - Add a full-duplex bulk test (both ends write large bodies at once) to
-    exercise the deadlock path the half-duplex HTTP demo can't reach.
+## Pass 1 — Flow-control correctness  (DONE)
+- [x] **#3 Full-duplex credit deadlock** — credit-returns now travel a separate,
+      self-clocked control lane: `CTRL_RECV_SLACK` extra receive buffers kept
+      permanently posted, and a reserved control send slot bounded by one
+      in-flight message (`ctrl_send_busy`) rather than by a data credit. No
+      wire-format change.
+- [x] **#8 Unbounded reassembly** — a received data buffer is held in place
+      (`ReadyMsg`) and only re-posted / credited on application *consumption* in
+      `read()`, so backpressure reaches the sender and the reassembly footprint
+      is bounded to the receive pool.
+  - [x] Full-duplex bulk test (`fullduplex_tests::full_duplex_bulk`, `#[ignore]`d):
+        forces the simultaneous-zero-credit standoff via a barrier and verifies
+        16 MiB each way; confirmed to deadlock if the control lane is removed.
 
 ## Pass 2 — Soundness & ownership  (hord-core refactor · independent of async)
 - [ ] **#9 Aliasing UB** — keep registered buffers behind `UnsafeCell` /
@@ -39,3 +42,4 @@ async milestone rather than now.
 
 ---
 Fixed in the review pass (reference): #1 #2 #4 #5 #7 #10 #12 #13.
+Fixed in Pass 1 (flow-control credit redesign): #3 #8.
