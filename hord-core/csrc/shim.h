@@ -45,12 +45,16 @@ struct ibv_mr;
 
 /* Work-completion opcode/status values the caller cares about. These mirror
  * the libibverbs enums (stable ABI values) so Rust need not include verbs.h. */
-#define HORD_WC_STATUS_SUCCESS 0u
-#define HORD_WC_OPCODE_SEND    0u   /* IBV_WC_SEND */
-#define HORD_WC_OPCODE_RECV    128u /* IBV_WC_RECV */
+#define HORD_WC_STATUS_SUCCESS    0u
+#define HORD_WC_OPCODE_SEND       0u   /* IBV_WC_SEND */
+#define HORD_WC_OPCODE_RDMA_WRITE 1u   /* IBV_WC_RDMA_WRITE */
+#define HORD_WC_OPCODE_RECV       128u /* IBV_WC_RECV */
 
-/* IBV_ACCESS_LOCAL_WRITE — the only access flag the stream path needs. */
-#define HORD_ACCESS_LOCAL_WRITE 1
+/* MR access flags. LOCAL_WRITE is all the stream path needs; the zero-copy
+ * extension adds REMOTE_WRITE for the client's destination buffer (the server
+ * RDMA-writes into it). Per IBA, REMOTE_WRITE must be OR'd with LOCAL_WRITE. */
+#define HORD_ACCESS_LOCAL_WRITE  1
+#define HORD_ACCESS_REMOTE_WRITE 2
 
 /* ---- Server ---------------------------------------------------------- */
 
@@ -115,6 +119,15 @@ int hord_post_recv(hord_conn *c, uint64_t wr_id, void *addr, uint32_t length,
 /* Post a single-SGE, signaled send. wr_id is echoed back on completion. */
 int hord_post_send(hord_conn *c, uint64_t wr_id, void *addr, uint32_t length,
                    uint32_t lkey, char *err, size_t errlen);
+
+/* Post a single-SGE, signaled RDMA write: copy [addr, addr+length) (local,
+ * lkey) into the peer's memory at remote_addr, authorized by rkey. wr_id is
+ * echoed back on completion (opcode HORD_WC_OPCODE_RDMA_WRITE). One-sided — the
+ * peer posts no receive and sees no completion; QP ordering still applies, so a
+ * subsequent send on the same QP arrives after the write has landed. */
+int hord_post_write(hord_conn *c, uint64_t wr_id, void *addr, uint32_t length,
+                    uint32_t lkey, uint64_t remote_addr, uint32_t rkey,
+                    char *err, size_t errlen);
 
 /* Poll for one completion. Returns 1 and fills the out-params if a completion
  * was available, 0 if the CQ was empty, or -1 on a poll error. A retrieved
