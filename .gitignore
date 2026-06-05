@@ -1,2 +1,8 @@
 target/
 Cargo.lock
+
+# Coverage artifacts (cargo-llvm-cov)
+/lcov.info
+/coverage-summary.txt
+*.profraw
+*.profdata

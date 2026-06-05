@@ -77,3 +77,45 @@ sudo modprobe -r rdma_rxe
   module-autoload + systemd unit will re-establish `rxe0` automatically, but if
   `rdma link show` is ever empty, the module just needs reloading
   (`sudo systemctl restart soft-roce`).
+
+## Testing & coverage
+
+Most of the meaningful tests (the actual RDMA data path) are `#[ignore]`d
+because they need the `rxe0` device above. They do **not** run under a bare
+`cargo test`. Always include them when `rxe0` is up:
+
+```sh
+# Full suite incl. the RDMA loopback tests. --test-threads=1 because a few
+# in-binary tests reuse the same RDMA-CM port and would otherwise race on bind().
+cargo test --workspace -- --include-ignored --test-threads=1
+
+# Just the device-free logic tests (wire format, handshake, parsers):
+cargo test --workspace
+```
+
+### Line coverage
+
+Coverage uses `cargo-llvm-cov` (`cargo install cargo-llvm-cov`, plus the
+`llvm-tools-preview` rustup component):
+
+```sh
+cargo llvm-cov --workspace --summary-only -- --include-ignored --test-threads=1
+# lcov for editors/Codecov:
+cargo llvm-cov --workspace --lcov --output-path lcov.info -- --include-ignored --test-threads=1
+```
+
+Library coverage sits around **~88% lines** (`hord-core` ~91%, `hord-stream`
+92–100%, `hord-zerocopy` ~84%, `hord-async` ~69%). The `hord-demo` binaries are
+run by hand and show 0%, which pulls the workspace *total* down to ~60% — read
+the per-file table, not the total. Add `--ignore-filename-regex 'hord-demo/'`
+to exclude the demos from the figure.
+
+### CI
+
+`.github/workflows/ci.yml` runs both of the above on every push/PR: a `test`
+job (full suite incl. ignored) and a `coverage` job (uploads `lcov.info`,
+prints the per-file table to the run summary). Both bring up Soft-RoCE via the
+`.github/actions/setup-soft-roce` composite action, which **fails the job** if
+`rxe0` cannot be made ACTIVE — so the RDMA suite can never silently skip in CI.
+If a hosted runner's kernel lacks `rdma_rxe`, the fix is the
+`linux-modules-extra-$(uname -r)` install the action already attempts.

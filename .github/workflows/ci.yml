@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The whole point of this job is enforcement: it brings up Soft-RoCE and runs
+  # the suite with `--include-ignored`, so the 13 RDMA loopback tests (the actual
+  # data path) run on every push/PR instead of only on a dev host by hand.
+  test:
+    name: test (incl. RDMA loopback)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-soft-roce
+      - name: cargo test --workspace (incl. ignored)
+        # --test-threads=1: a couple of in-binary tests reuse the same TCP/RDMA-CM
+        # port, so serialize to avoid bind() races. The suite runs in seconds.
+        run: cargo test --workspace -- --include-ignored --test-threads=1
+
+  coverage:
+    name: coverage (llvm-cov)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: ./.github/actions/setup-soft-roce
+      - name: Collect coverage (incl. RDMA loopback tests)
+        run: |
+          set -euxo pipefail
+          # --no-report runs the instrumented suite and stashes the raw profiles;
+          # the two `report` calls then render from that data without recompiling.
+          cargo llvm-cov --workspace --no-report -- --include-ignored --test-threads=1
+          cargo llvm-cov report --lcov --output-path lcov.info
+          cargo llvm-cov report --summary-only | tee coverage-summary.txt
+      - name: Publish coverage summary
+        if: always()
+        run: |
+          {
+            echo '### Coverage (line/region, incl. RDMA loopback tests)'
+            echo '```'
+            cat coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error

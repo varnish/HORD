@@ -1,0 +1,51 @@
+name: Set up Soft-RoCE
+description: >
+  Install the rdma-core build/runtime packages and bring up an `rxe0` Soft-RoCE
+  device for loopback RDMA tests. Fails loudly if the device cannot be made
+  ACTIVE, so the `#[ignore]`d RDMA suite can never silently skip in CI.
+
+runs:
+  using: composite
+  steps:
+    - name: Install RDMA packages
+      shell: bash
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          libibverbs-dev librdmacm-dev ibverbs-utils rdma-core
+        # The rdma_rxe module ships in modules-extra on the kernels GitHub's
+        # hosted runners use. Soft-fail here; the hard check is `modprobe` below.
+        sudo apt-get install -y "linux-modules-extra-$(uname -r)" \
+          || echo "linux-modules-extra unavailable; relying on the base kernel"
+
+    - name: Bring up rxe0
+      shell: bash
+      run: |
+        set -euxo pipefail
+        # Hard requirement: if rdma_rxe cannot load, the RDMA tests cannot run,
+        # and a green CI would be a lie. Fail the job instead.
+        sudo modprobe rdma_rxe
+
+        NETDEV=$(ip -o -4 route show default | awk '{print $5}' | head -1)
+        echo "Backing netdev: ${NETDEV}"
+
+        # The RDMA loopback tests hardcode 77.40.251.67 (this is the dev host's
+        # rxe0 address — see CLAUDE.md). Give the runner's NIC that same address
+        # as a host-local /32: traffic to it is delivered locally and loops back
+        # through the rxe device, exactly as localhost does on the dev host. This
+        # keeps the test sources identical across the dev host and CI.
+        sudo ip addr add 77.40.251.67/32 dev "${NETDEV}" || true
+        sudo rdma link add rxe0 type rxe netdev "${NETDEV}"
+        sudo ip link set "${NETDEV}" up
+
+    - name: Verify device is ACTIVE
+      shell: bash
+      run: |
+        set -euxo pipefail
+        rdma link show
+        ibv_devices
+        ibv_devinfo -d rxe0 || true
+        # RoCEv2 over rxe0/1 must be ACTIVE, else the loopback tests would skip.
+        rdma link show | grep -E 'rxe0/1 .*state ACTIVE' \
+          || { echo "::error::Soft-RoCE rxe0 is not ACTIVE — RDMA tests would silently skip"; exit 1; }
