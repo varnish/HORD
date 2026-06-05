@@ -10,7 +10,19 @@
       true separate data-plane consumer thread is the remaining follow-up.
 - [ ] **§7.5 GPUDirect** — untestable on this host (no GPU / real NIC); the
       addr/rkey path is opaque, so it should work unchanged on capable hardware.
-- [ ] **§7.6 range requests** — small add-on on top of the zero-copy path.
+- [x] **§7.6 range requests** — done (sync demo). A single-range `Range: bytes=…`
+      (`a-b` / `a-` / `-n`) on `GET /size/<n>` yields `206 Partial Content` +
+      `Content-Range: bytes start-end/total`, composed with the zero-copy path; a
+      range past the end yields `416` + `Content-Range: bytes */total` (bodiless,
+      so no `X-HORD-RDMA-Write` per §7.4); a multi-range request is served as a
+      full `200` (no multipart, §4.1.2). Needed **no transport change** — the
+      one-sided write is offset-agnostic; it is a `Range`/`Content-Range` codec +
+      base-offset pattern fill/verify in the demo lib (`parse_range`,
+      `content_range`, `pattern_fill_*_from`, `verify_*_at`), `Range` handling in
+      `server.rs`, and `--range` on `client.rs`. Device-free codec unit tests +
+      rxe0 `range_loopback` (satisfiable sub-range + unsatisfiable). **Follow-up:**
+      wire `--range` into the async bins (`*_async`) — the range logic lands in
+      the forked `serve_zero_copy` (see the `serve_zero_copy` fork item below).
 - [ ] A zero-copy *source* buffer pool on the server (amortize registration —
       §8.3) instead of registering per response. Also covers the split-mode
       source registered per response.

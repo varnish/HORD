@@ -22,7 +22,10 @@
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use hord_demo::{pattern_fill, pattern_fill_registered, read_head, Head};
+use hord_demo::{
+    content_range, content_range_unsatisfied, parse_range, pattern_fill, pattern_fill_from,
+    pattern_fill_registered_from, read_head, Head, RangeSpec,
+};
 use hord_stream::{HordConfig, HordStream, Listener};
 use hord_zerocopy::{serve_rdma_write, RdmaWriteReq, RdmaWriteStatus, HEADER};
 
@@ -109,23 +112,49 @@ fn serve_one(stream: &mut HordStream) -> io::Result<()> {
     };
 
     if method != "GET" {
-        return respond(stream, 405, "Method Not Allowed", b"only GET is supported\n", "text/plain", declined);
+        return respond(stream, 405, "Method Not Allowed", b"only GET is supported\n", "text/plain", declined, None);
     }
 
     if path == "/" {
         let body = b"HORD prototype server. Try GET /size/<bytes>.\n";
-        return respond(stream, 200, "OK", body, "text/plain", declined);
+        return respond(stream, 200, "OK", body, "text/plain", declined, None);
     }
 
     if let Some(rest) = path.strip_prefix("/size/") {
         match rest.parse::<usize>() {
             Ok(n) if n <= MAX_BODY => {
-                if let Some(req) = zc_req {
-                    return serve_size_zero_copy(stream, &req, n);
+                // §7.6 range requests: resolve a single-range `Range` header
+                // against the object size. Absent/ignored → the whole object
+                // (200); a satisfiable range → 206 + Content-Range; a range
+                // entirely past the end → 416.
+                match head.header("Range").map(|r| parse_range(r, n)).unwrap_or(RangeSpec::Full) {
+                    RangeSpec::Unsatisfiable => return respond_unsatisfiable(stream, n),
+                    RangeSpec::Range { start, end } => {
+                        let len = end - start + 1;
+                        if let Some(req) = zc_req {
+                            return serve_size_zero_copy(stream, &req, start, len, n, true);
+                        }
+                        let mut body = vec![0u8; len];
+                        pattern_fill_from(&mut body, start);
+                        return respond(
+                            stream,
+                            206,
+                            "Partial Content",
+                            &body,
+                            "application/octet-stream",
+                            declined,
+                            Some(content_range(start, end, n)),
+                        );
+                    }
+                    RangeSpec::Full => {
+                        if let Some(req) = zc_req {
+                            return serve_size_zero_copy(stream, &req, 0, n, n, false);
+                        }
+                        let mut body = vec![0u8; n];
+                        pattern_fill(&mut body);
+                        return respond(stream, 200, "OK", &body, "application/octet-stream", declined, None);
+                    }
                 }
-                let mut body = vec![0u8; n];
-                pattern_fill(&mut body);
-                return respond(stream, 200, "OK", &body, "application/octet-stream", declined);
             }
             Ok(_) => {
                 return respond(
@@ -135,41 +164,59 @@ fn serve_one(stream: &mut HordStream) -> io::Result<()> {
                     b"size exceeds server limit\n",
                     "text/plain",
                     declined,
+                    None,
                 );
             }
             Err(_) => {
-                return respond(stream, 400, "Bad Request", b"bad size\n", "text/plain", declined);
+                return respond(stream, 400, "Bad Request", b"bad size\n", "text/plain", declined, None);
             }
         }
     }
 
-    respond(stream, 404, "Not Found", b"not found\n", "text/plain", declined)
+    respond(stream, 404, "Not Found", b"not found\n", "text/plain", declined, None)
 }
 
-/// Serve a `/size/<n>` body via a one-sided RDMA write into the client's
-/// advertised buffer, then a bodiless HTTP response carrying the outcome.
-fn serve_size_zero_copy(stream: &mut HordStream, req: &RdmaWriteReq, n: usize) -> io::Result<()> {
-    // serve_rdma_write registers a source region, fills it with the pattern, and
+/// Serve a `/size/<n>` body — or a `[base, base+len)` sub-range of it (§7.6) —
+/// via a one-sided RDMA write into the client's advertised buffer, then a
+/// bodiless HTTP response carrying the outcome. `partial` selects `206 Partial
+/// Content` + `Content-Range` over a plain `200`.
+fn serve_size_zero_copy(
+    stream: &mut HordStream,
+    req: &RdmaWriteReq,
+    base: usize,
+    len: usize,
+    total: usize,
+    partial: bool,
+) -> io::Result<()> {
+    // serve_rdma_write registers a source region, fills it with the pattern at
+    // the object's absolute offset (so a sub-range carries the right bytes), and
     // RDMA-writes it into the client's [addr, rkey] — blocking until the write is
     // acknowledged before it returns. The HTTP response is sent *after*, so the
     // payload has provably landed by the time the client reads the head.
-    let status = serve_rdma_write(stream, req, n as u64, |buf| pattern_fill_registered(buf, n))?;
+    let status = serve_rdma_write(stream, req, len as u64, |buf| {
+        pattern_fill_registered_from(buf, base, len)
+    })?;
     let (code, reason) = match status {
-        RdmaWriteStatus::Complete { .. } => (200u16, "OK"),
+        RdmaWriteStatus::Complete { .. } if partial => (206u16, "Partial Content"),
+        RdmaWriteStatus::Complete { .. } => (200, "OK"),
         RdmaWriteStatus::TooLarge { .. } => (413, "Content Too Large"),
         // serve_rdma_write only ever returns Complete/TooLarge; declining is the
         // caller's choice not to call it at all (handled in serve_one).
         RdmaWriteStatus::Declined => unreachable!("serve_rdma_write never declines"),
     };
-    let head = format!(
+    let mut head = format!(
         "HTTP/1.1 {code} {reason}\r\n\
          Content-Type: application/octet-stream\r\n\
          Content-Length: 0\r\n\
-         {}\r\n\
-         Connection: close\r\n\
-         \r\n",
+         {}\r\n",
         status.header_line()
     );
+    // Content-Range only on a satisfied range (206); a too_large (413) is the
+    // plain zero-copy "exceeds your buffer" outcome and carries no range header.
+    if partial && matches!(status, RdmaWriteStatus::Complete { .. }) {
+        head.push_str(&format!("Content-Range: {}\r\n", content_range(base, base + len - 1, total)));
+    }
+    head.push_str("Connection: close\r\n\r\n");
     stream.write_all(head.as_bytes())?;
     stream.flush()?;
     eprintln!("[server] -> {code} {reason} (zero-copy: {})", status.header_value());
@@ -183,6 +230,7 @@ fn respond(
     body: &[u8],
     content_type: &str,
     zc: Option<RdmaWriteStatus>,
+    content_range: Option<String>,
 ) -> io::Result<()> {
     let mut head = format!(
         "HTTP/1.1 {status} {reason}\r\n\
@@ -191,6 +239,9 @@ fn respond(
          Connection: close\r\n",
         body.len()
     );
+    if let Some(cr) = content_range {
+        head.push_str(&format!("Content-Range: {cr}\r\n"));
+    }
     if let Some(zc) = zc {
         head.push_str(&zc.header_line());
         head.push_str("\r\n");
@@ -202,5 +253,24 @@ fn respond(
     // buffers and acknowledged, so it is safe to drop/disconnect afterwards.
     stream.flush()?;
     eprintln!("[server] -> {status} {reason} ({} body bytes)", body.len());
+    Ok(())
+}
+
+/// §7.6: a `Range` that lies entirely past the end of the object → `416 Range
+/// Not Satisfiable` with `Content-Range: bytes */total` and no body. Per §7.4 a
+/// bodiless response omits `X-HORD-RDMA-Write` even if the request carried it.
+fn respond_unsatisfiable(stream: &mut HordStream, total: usize) -> io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 416 Range Not Satisfiable\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Content-Length: 0\r\n\
+         Content-Range: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        content_range_unsatisfied(total)
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.flush()?;
+    eprintln!("[server] -> 416 Range Not Satisfiable (bytes */{total})");
     Ok(())
 }
