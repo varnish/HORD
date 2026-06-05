@@ -8,8 +8,10 @@ authors.workspace = true
 
 [dependencies]
 hord-stream = { path = "../hord-stream" }
+hord-zerocopy = { path = "../hord-zerocopy" }
 # Async + hyper demo (server_async / client_async). The sync bins below use
-# only hord-stream; these third-party deps are pulled in for the hyper bins.
+# only hord-stream + hord-zerocopy; these third-party deps are pulled in for the
+# hyper bins.
 hord-async = { path = "../hord-async" }
 tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
 hyper = { version = "1", features = ["http1", "server", "client"] }
