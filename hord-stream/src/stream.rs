@@ -44,6 +44,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
+use std::os::fd::RawFd;
 use std::sync::Arc;
 
 use hord_core::{
@@ -160,13 +161,41 @@ impl HordStream {
     /// Server side: accept the next connection on `listener` and complete the
     /// HORD handshake.
     pub fn accept(listener: &Listener, config: &HordConfig) -> io::Result<HordStream> {
+        let (conn, peer_bytes) = Self::accept_begin(listener, config)?;
+        Self::from_accepted(conn, peer_bytes, config)
+    }
+
+    /// Server side, phase one: accept the next connection request with this
+    /// config's QP sizing (the data pools plus the control lane's reserved WRs),
+    /// returning the not-yet-established [`Connection`] — which **is** `Send` —
+    /// and the peer's handshake bytes.
+    ///
+    /// Split out from [`accept`](Self::accept) so an async server can run the
+    /// accept loop on one thread and finish each connection on another: the
+    /// registered buffers make the resulting `HordStream` thread-affine (`!Send`),
+    /// so it must be *built* on the thread that will *run* it. The acceptor moves
+    /// the bare `Connection` across the thread boundary and the worker calls
+    /// [`from_accepted`](Self::from_accepted).
+    pub fn accept_begin(
+        listener: &Listener,
+        config: &HordConfig,
+    ) -> io::Result<(Connection, Vec<u8>)> {
         // The QP must hold the control lane's extra WRs on top of the data pools.
-        let (conn, peer_bytes) = listener.accept(
+        listener.accept(
             config.send_pool_size + CTRL_SEND_SLOTS,
             config.recv_pool_size + CTRL_RECV_SLACK,
             HANDSHAKE_LEN,
             config.cm,
-        )?;
+        )
+    }
+
+    /// Server side, phase two: register buffers, post receives, and complete the
+    /// handshake on a connection returned by [`accept_begin`](Self::accept_begin).
+    pub fn from_accepted(
+        conn: Connection,
+        peer_bytes: Vec<u8>,
+        config: &HordConfig,
+    ) -> io::Result<HordStream> {
         let mut s = HordStream::new_common(conn, config)?;
         let peer = Handshake::decode(&peer_bytes)?;
         s.apply_peer(&peer)?;
@@ -407,30 +436,23 @@ impl HordStream {
 
     // ---- sending -----------------------------------------------------------
 
-    /// Post one *data* message carrying `payload` (<= payload_cap). Blocks until
-    /// a send slot and a data credit are available, processing completions
-    /// meanwhile. While blocked on credits, returns any owed grants via the
-    /// control lane so a peer waiting on us can make progress — this is what
-    /// breaks the full-duplex deadlock (#3).
-    fn send_message(&mut self, payload: &[u8]) -> io::Result<()> {
-        debug_assert!(payload.len() <= self.payload_cap);
-        loop {
-            if self.peer_closed {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "connection closed",
-                ));
-            }
-            if !self.send_free.is_empty() && self.send_credits > 0 {
-                break;
-            }
-            // We can't send data (no credit and/or no slot). Return whatever we
-            // owe the peer now, over the control lane (no data credit needed),
-            // so the peer can grant us credits back. Then wait for a completion.
-            self.maybe_return_credits(1)?;
-            self.pump(true)?;
-        }
+    /// Whether a *data* message can be posted right now: the stream is live and
+    /// we hold both a free send slot and a data credit.
+    /// [`post_data_message`](Self::post_data_message) requires this; the blocking
+    /// and async senders both wait for it to become true.
+    fn can_send_data(&self) -> bool {
+        !self.peer_closed && !self.send_free.is_empty() && self.send_credits > 0
+    }
 
+    /// Post one *data* message carrying `payload` (<= payload_cap), assuming a
+    /// slot + credit are available (caller checks [`can_send_data`](Self::can_send_data)).
+    /// Non-blocking: this is the shared posting primitive both the busy-poll
+    /// [`Write`] facade (via [`try_write`](Self::try_write)) and the async path
+    /// build on. Callers that need to block until a slot/credit frees up loop on
+    /// `can_send_data` + [`pump`](Self::pump) themselves.
+    fn post_data_message(&mut self, payload: &[u8]) -> io::Result<()> {
+        debug_assert!(payload.len() <= self.payload_cap);
+        debug_assert!(self.can_send_data());
         let slot = self.send_free.pop().unwrap();
         let grant = self.grant_pending.min(u16::MAX as u32);
         let env = Envelope {
@@ -527,25 +549,113 @@ impl HordStream {
     fn proactive_threshold(&self) -> u32 {
         (self.recv_pool as u32 / 4).max(1)
     }
-}
 
-impl Read for HordStream {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if out.is_empty() {
-            return Ok(0);
+    // ---- non-blocking API --------------------------------------------------
+    //
+    // These are the state machine without the wait. The blocking `Read`/`Write`
+    // impls below drive them by busy-polling (`pump(true)`); an async wrapper
+    // drives the *same* methods off the CQ completion-channel fd. Neither path
+    // duplicates the credit / control-lane logic.
+
+    /// Process every completion currently in the CQ, without waiting. Returns
+    /// the number handled. The async driver calls this after the CQ fd signals.
+    pub fn drain_completions(&mut self) -> io::Result<usize> {
+        let mut n = 0;
+        while self.pump(false)? {
+            n += 1;
         }
-        while self.rx_ready.is_empty() {
-            if self.peer_closed {
-                return Ok(0); // EOF
+        Ok(n)
+    }
+
+    /// Non-blocking write. Accepts as many bytes of `buf` as it can right now —
+    /// sending full messages and staging the sub-`payload_cap` remainder — and
+    /// returns the count accepted. A return of `0` for a non-empty `buf` means no
+    /// progress was possible (no send slot/credit); it has already returned any
+    /// owed credits over the control lane, so the caller should wait for a
+    /// completion and retry. Maintains the invariant that the staging buffer
+    /// holds `< payload_cap` bytes between calls.
+    pub fn try_write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.peer_closed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
+        }
+        let cap = self.payload_cap;
+        let mut input = buf;
+        let mut consumed = 0;
+
+        // 1. Top up an existing partial staged message.
+        if !self.tx_stage.is_empty() {
+            let need = cap - self.tx_stage.len();
+            let take = need.min(input.len());
+            if take < need {
+                // Too little to fill the stage; absorb it all, still partial.
+                self.tx_stage.extend_from_slice(input);
+                return Ok(consumed + input.len());
             }
-            self.pump(true)?;
-            self.maybe_return_credits(self.proactive_threshold())?;
+            // Filling the stage to `cap` means we must send it before accepting
+            // more (to keep the stage < cap). That needs a slot + credit.
+            if !self.can_send_data() {
+                self.maybe_return_credits(1)?;
+                return Ok(consumed);
+            }
+            let mut staged = std::mem::take(&mut self.tx_stage);
+            staged.extend_from_slice(&input[..take]);
+            self.post_data_message(&staged)?;
+            input = &input[take..];
+            consumed += take;
         }
 
-        // Copy payload straight out of the receive buffers (no intermediate
-        // reassembly copy). As each held message is fully drained, re-post its
-        // buffer and record that we now owe the peer one credit — so credit is
-        // returned on *consumption*, not receipt.
+        // 2. Whole messages straight from the caller's buffer.
+        while input.len() >= cap {
+            if !self.can_send_data() {
+                self.maybe_return_credits(1)?;
+                return Ok(consumed);
+            }
+            self.post_data_message(&input[..cap])?;
+            input = &input[cap..];
+            consumed += cap;
+        }
+
+        // 3. Stage the sub-cap remainder for the next write or flush.
+        if !input.is_empty() {
+            self.tx_stage.extend_from_slice(input);
+            consumed += input.len();
+        }
+        Ok(consumed)
+    }
+
+    /// Try to emit any staged (sub-`payload_cap`) bytes as a final message.
+    /// `Ok(true)` = nothing staged, or it was sent; `Ok(false)` = staged but no
+    /// slot/credit yet (owed credits have been returned; wait and retry).
+    pub fn try_flush_stage(&mut self) -> io::Result<bool> {
+        if self.tx_stage.is_empty() {
+            return Ok(true);
+        }
+        if !self.can_send_data() {
+            self.maybe_return_credits(1)?;
+            return Ok(false);
+        }
+        let chunk = std::mem::take(&mut self.tx_stage);
+        self.post_data_message(&chunk)?;
+        Ok(true)
+    }
+
+    /// Whether any *data* send is still unacknowledged (the control slot is
+    /// tracked separately). `flush` is complete once this is false.
+    pub fn sends_outstanding(&self) -> bool {
+        self.send_free.len() < self.send_pool
+    }
+
+    /// Non-blocking read. `Ok(None)` = no data buffered yet (would block);
+    /// `Ok(Some(0))` = EOF (peer/transport closed); `Ok(Some(n))` = `n` bytes
+    /// copied. Drains held receive buffers, re-posting and accruing credit on
+    /// consumption exactly like the blocking [`read`](Read::read).
+    pub fn try_read(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
+        if out.is_empty() {
+            return Ok(Some(0));
+        }
+        if self.rx_ready.is_empty() {
+            return Ok(if self.peer_closed { Some(0) } else { None });
+        }
         let mut written = 0;
         while written < out.len() {
             let Some(&ReadyMsg { slot, start, end }) = self.rx_ready.front() else {
@@ -555,58 +665,97 @@ impl Read for HordStream {
             self.recv.copy_out(start, &mut out[written..written + take]);
             written += take;
             if start + take == end {
-                // Message fully drained: free its buffer and owe a credit.
                 self.rx_ready.pop_front();
                 self.repost_recv(slot)?;
                 self.grant_pending += 1;
             } else {
-                // Partially drained: advance the read cursor and stop (`out` full).
                 self.rx_ready.front_mut().unwrap().start = start + take;
             }
         }
-
-        // Returning data frees receive capacity; let the peer know.
         self.maybe_return_credits(self.proactive_threshold())?;
-        Ok(written)
+        Ok(Some(written))
+    }
+
+    /// Return owed credits to the peer. `urgent` returns any owed credit (used
+    /// before an async wait, so a peer blocked on us — the #3 path — unblocks);
+    /// otherwise it uses the proactive threshold to avoid a credit-only storm.
+    pub fn return_owed_credits(&mut self, urgent: bool) -> io::Result<()> {
+        let threshold = if urgent { 1 } else { self.proactive_threshold() };
+        self.maybe_return_credits(threshold)
+    }
+
+    /// Whether the peer/transport has closed (reads will see EOF, writes error).
+    pub fn is_closed(&self) -> bool {
+        self.peer_closed
+    }
+
+    /// Mark the stream closed — e.g. when the async layer observes a CM
+    /// `DISCONNECTED` event (half-close). Subsequent reads see EOF.
+    pub fn mark_closed(&mut self) {
+        self.peer_closed = true;
+    }
+
+    // ---- async-reactor accessors (pass-throughs to the connection) ---------
+
+    /// CQ completion-channel fd to register with a reactor. See [`Connection::cq_fd`].
+    pub fn cq_fd(&self) -> io::Result<RawFd> {
+        self.conn.cq_fd()
+    }
+    /// Arm the CQ before waiting on [`cq_fd`](Self::cq_fd). See [`Connection::arm_cq`].
+    pub fn arm_cq(&self) -> io::Result<()> {
+        self.conn.arm_cq()
+    }
+    /// Drain + ack completion-channel notifications after the fd signals.
+    pub fn consume_cq_events(&self) -> usize {
+        self.conn.consume_cq_events()
+    }
+    /// CM event-channel fd, for half-close detection. See [`Connection::cm_fd`].
+    pub fn cm_fd(&self) -> io::Result<RawFd> {
+        self.conn.cm_fd()
+    }
+    /// Flip the CM channel non-blocking (call once, after the handshake).
+    pub fn set_cm_nonblock(&self) -> io::Result<()> {
+        self.conn.set_cm_nonblock()
+    }
+    /// Non-blocking check for a peer-initiated disconnect. See [`Connection::check_disconnect`].
+    pub fn check_disconnect(&self) -> io::Result<bool> {
+        self.conn.check_disconnect()
+    }
+}
+
+impl Read for HordStream {
+    /// Busy-poll facade over [`try_read`](HordStream::try_read): block until data
+    /// is available (or EOF), processing completions meanwhile.
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if let Some(n) = self.try_read(out)? {
+                return Ok(n);
+            }
+            // No data buffered and not closed: return owed credits, then wait.
+            self.return_owed_credits(false)?;
+            self.pump(true)?;
+        }
     }
 }
 
 impl Write for HordStream {
+    /// Busy-poll facade over [`try_write`](HordStream::try_write): accept all of
+    /// `data` (sending whole messages, staging the sub-`payload_cap` remainder),
+    /// blocking on send slots/credits as needed.
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         if self.peer_closed {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "connection closed",
-            ));
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
         }
-        let cap = self.payload_cap;
-        let mut input = data;
-
-        // `tx_stage` only ever holds a partial (sub-`cap`) message. First top it
-        // up from `input` and, if it fills, send it. We move it out to satisfy
-        // the borrow checker, since `send_message` borrows `&mut self`.
-        if !self.tx_stage.is_empty() {
-            let need = cap - self.tx_stage.len();
-            let take = need.min(input.len());
-            let mut staged = std::mem::take(&mut self.tx_stage);
-            staged.extend_from_slice(&input[..take]);
-            input = &input[take..];
-            if staged.len() == cap {
-                self.send_message(&staged)?;
-                staged.clear();
+        let mut off = 0;
+        while off < data.len() {
+            let n = self.try_write(&data[off..])?;
+            if n == 0 {
+                // Blocked on a send slot/credit; process completions and retry.
+                self.pump(true)?;
+            } else {
+                off += n;
             }
-            self.tx_stage = staged;
         }
-
-        // Send whole messages straight from the caller's buffer — no per-message
-        // front-draining, so the write path is O(n) in the body size.
-        while input.len() >= cap {
-            self.send_message(&input[..cap])?;
-            input = &input[cap..];
-        }
-
-        // Stage the remainder (< cap) for the next write or flush.
-        self.tx_stage.extend_from_slice(input);
         Ok(data.len())
     }
 
@@ -615,11 +764,18 @@ impl Write for HordStream {
     /// the peer's receive buffer and acknowledged — so once `flush` returns
     /// `Ok`, the data has been delivered and it is safe to disconnect.
     fn flush(&mut self) -> io::Result<()> {
-        if !self.tx_stage.is_empty() {
-            let chunk = std::mem::take(&mut self.tx_stage);
-            self.send_message(&chunk)?;
+        // Emit any staged partial message, blocking until it can be posted.
+        while !self.try_flush_stage()? {
+            if self.peer_closed {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "connection closed before all sends were acknowledged",
+                ));
+            }
+            self.pump(true)?;
         }
-        while self.send_free.len() < self.send_pool {
+        // Then wait for every posted data send to be acknowledged.
+        while self.sends_outstanding() {
             if self.peer_closed {
                 // The connection dropped with sends still outstanding, so we
                 // can NOT claim the data was delivered. Surface it rather than
@@ -716,7 +872,7 @@ mod fullduplex_tests {
         while s.send_credits > 0 && sent < to_send.len() {
             if !s.send_free.is_empty() {
                 let end = (sent + cap).min(to_send.len());
-                s.send_message(&to_send[sent..end]).expect("send_message");
+                s.post_data_message(&to_send[sent..end]).expect("post_data_message");
                 sent = end;
                 last = Instant::now();
             } else if !s.pump(false).expect("pump") && last.elapsed() > STALL {
@@ -736,7 +892,7 @@ mod fullduplex_tests {
 
             while sent < to_send.len() && !s.send_free.is_empty() && s.send_credits > 0 {
                 let end = (sent + cap).min(to_send.len());
-                s.send_message(&to_send[sent..end]).expect("send_message");
+                s.post_data_message(&to_send[sent..end]).expect("post_data_message");
                 sent = end;
                 progressed = true;
             }
