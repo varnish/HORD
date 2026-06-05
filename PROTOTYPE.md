@@ -40,8 +40,11 @@ should work unchanged on capable hardware).
   payload), so the *data plane* (`SplitReceiver` / async `next_split_completion`)
   collects payloads by ID — out of order, with no HTTP parsing — while the
   control plane still gets the `status=complete` HTTP response. Transfer credits
-  (§7.7.6) are pre-posted recv headroom; an immediate returns no stream data
-  credit. The `--split` flag on the async/hyper demo exercises it end to end.
+  (§7.7.6) are pre-posted recv headroom, advertised in the handshake and
+  enforced sender-side: a sender bounds its in-flight write-with-immediates by
+  the peer's advertised window and back-pressures rather than overrunning the
+  peer's recv WRs; an immediate returns no stream data credit. The `--split`
+  flag on the async/hyper demo exercises it end to end.
 
 Verified on this host's Soft-RoCE device (`rxe0`, loopback over `enp14s0`):
 ~0.7–0.75 GiB/s for bodies from 1 MiB to 1 GiB, flat with size, byte-pattern
@@ -252,8 +255,11 @@ Both of the remaining design-level items were then closed by the **async pass**:
 - **Handshake size (spec 12.1).** The spec's handshake is 60 bytes (14
   meaningful + 46 reserved). The RDMA CM private-data area for an RC connection
   is only ~56 bytes on IB/RoCE, so a 60-byte handshake does not reliably fit.
-  This prototype transmits just the 16 meaningful bytes and drops the reserved
-  tail. Recommend trimming the reserved field in the spec.
+  This prototype transmits just 16 bytes and drops the rest of the reserved
+  tail. Bytes 14..16 — reserved in the spec — now carry the `split_credits`
+  transfer-credit window (see below); a peer that leaves them zero (or sends only
+  14 bytes) reads as zero credits, so split mode declines gracefully. Recommend
+  trimming the reserved field in the spec and defining the credit field.
 - **Endianness.** Spec 12 doesn't state a byte order for the multi-byte
   envelope/handshake fields. This prototype uses big-endian (network order),
   which has the nice property that the magic `0x484F5244` serialises to the
@@ -294,12 +300,22 @@ Both of the remaining design-level items were then closed by the **async pass**:
   not in the consumed receive WR's buffer. §7.7.5 already says "contains no data
   ... reposted immediately"; worth adding that the completion's `byte_len` is
   therefore not a length into that buffer and MUST NOT be used to read it.
-- **Transfer-credit posting (spec §7.7.6).** §7.7.6 has the client post one extra
-  recv buffer *per* split request. This prototype instead pre-posts a fixed
-  `split_credits` headroom of recv WRs (a config knob, default 8) on top of the
-  data pool and control slack, reposting each on consumption. It satisfies the
-  intent (a recv WR is always available for an immediate, without starving the
-  data window) without dynamically growing the recv queue per request — simpler,
-  at the cost of bounding concurrent in-flight split transfers to that headroom.
-  Either model is spec-conformant on the wire; worth noting the headroom approach
-  as an option.
+- **Transfer-credit flow control (spec §7.7.6).** §7.7.6 frames transfer credits
+  as an *implicit per-request grant* (the client posts one extra recv buffer per
+  split request; "no explicit replenishment needed") and does not advertise a
+  count. This prototype instead uses a **negotiated static window**: each side
+  pre-posts a fixed `split_credits` headroom of recv WRs (config knob, default 8,
+  reposted on consumption per §7.7.5) *and advertises that count* in the
+  handshake (bytes 14..16). The sender then bounds its in-flight
+  write-with-immediates against the peer's advertised window
+  (`imm_outstanding <= peer_split_credits`), freeing a credit when each
+  imm-bearing WR is acked. An overrun **back-pressures** — the blocking path
+  reaps an in-flight transfer and retries, the async path returns `WouldBlock`
+  and re-polls — instead of silently RNR-stalling (the failure mode before this
+  change: with `rnr_retry=7` the transfer hung indefinitely; lower it and the QP
+  errored, with no diagnostic either way). Split mode declines (falls back to the
+  stream) against a peer that advertises the capability bit but a zero window.
+  Recommend §7.7.6 either adopt an advertised window or spell out the recv-queue
+  accounting an implicit-grant sender must do to avoid the same overrun. (The
+  earlier prototype enforced neither — `split_credits` was a local sizing
+  heuristic only.)

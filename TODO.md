@@ -28,22 +28,21 @@ Surfaced by the high-effort review of the protocol-splitting work and consciousl
 deferred — none is a live bug on the supported single-task path. Context kept so a
 future pass has what it needs.
 
-- [ ] **Transfer credits are neither enforced nor advertised (spec §7.7.6).** The
-      receiver pre-posts a fixed `split_credits` (default 8) recv-WR headroom, but
-      (a) the count never travels on the wire — the 16-byte handshake carries only
-      the `SPLIT_MODE_CAPABLE` bit — and (b) the sender's `begin_rdma_write_with_imm`
-      bounds a write only against local free send slots, never against how many recv
-      WRs the peer has posted. So `split_credits` is a *local sizing heuristic*, not
-      flow control. **Failure:** a concurrent split sender (not the demo, which
-      serialises over HTTP/1.1 keep-alive) with more in-flight write-with-immediates
-      than the peer's posted recv WRs — reachable when split traffic runs alongside
-      unread stream data holding recv slots, or when `send_pool_size` is configured
-      above the recv headroom — hits RNR. Under the default `rnr_retry=7` (infinite)
-      this *stalls* the transfer indefinitely; if `rnr_retry` is lowered the QP errors
-      and the connection dies, with no diagnostic. **Fix:** carry a credit count in
-      the handshake and add sender-side in-flight-transfer accounting (a real window)
-      so an overrun back-pressures instead of RNR-ing. This is a protocol feature
-      (wire-format change), not a local patch — hence deferred.
+- [x] **Transfer credits are now enforced and advertised (spec §7.7.6).** Done.
+      The handshake carries a `split_credits` count (bytes 14..16, previously
+      reserved); each side advertises the transfer-credit window it can receive.
+      The sender bounds in-flight write-with-immediates against the peer's
+      advertised window (`imm_outstanding <= peer_split_credits`, the imm-bearing
+      WR tagged `IMM_FLAG` so its ack frees a credit) and **back-pressures** on
+      overrun — the blocking path reaps a transfer and retries, the async path
+      returns `WouldBlock` and re-polls — instead of RNR-stalling. Split mode
+      declines to the stream against a peer advertising the capability bit but a
+      zero window (`negotiate_split`). Verified by the new rxe0 test
+      `split_credit_backpressure` (window of 2; the 3rd transfer back-pressures
+      then completes) and unaffected demo/`split_mode_round_trip`. The earlier
+      "local sizing heuristic" failure mode (a concurrent/pipelined sender out of
+      sync with the peer's posted recv WRs → indefinite RNR stall or silent QP
+      death) is closed.
 
 - [ ] **Multi-WR split write (> `WRITE_WR_MAX` = 1 GiB) can skip the immediate.** The
       immediate rides only the final WR (`begin_rdma_write_inner`); if a *non-final*
