@@ -82,9 +82,9 @@ fn zero_copy_async_round_trip() {
     let server = std::thread::spawn(move || {
         let listener = Listener::bind(IP, PORT).expect("bind");
         ready_tx.send(()).expect("signal ready");
-        let (conn, peer) = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
+        let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
         current_thread_rt().block_on(async move {
-            let stream = AsyncHordStream::from_accepted(conn, peer, &srv_config).expect("accept");
+            let stream = AsyncHordStream::from_accepted(conn, &srv_config).expect("accept");
             assert!(stream.zero_copy_negotiated(), "server: zero-copy not negotiated");
             let mut shared = SharedAsyncStream::new(stream);
 

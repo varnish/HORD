@@ -16,7 +16,7 @@
 //! cargo test -p hord-core -- --ignored --nocapture rdma_write_round_trip
 //! ```
 
-// Connection is Send but not Sync (its shim methods aren't safe to call
+// Connection is Send but not Sync (its methods aren't safe to call
 // concurrently); we use Arc purely for shared ownership on one thread, exactly
 // as the stream layer does.
 #![allow(clippy::arc_with_non_send_sync)]
@@ -31,7 +31,6 @@ use hord_core::{
 const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
 const PORT: u16 = 18520; // distinct from the demo (4791) and full_duplex_bulk (18519)
 const LEN: usize = 16 * 1024 * 1024; // 16 MiB — many MTUs in one WR
-const HS: &[u8] = b"hord-write-smoke"; // dummy CM private data (16 bytes)
 
 /// A position-sensitive byte pattern so the reader can verify exactly what was
 /// written (and that nothing landed where it should not).
@@ -62,8 +61,8 @@ fn rdma_write_round_trip() {
     let server = std::thread::spawn(move || {
         let listener = Listener::bind(IP, PORT).expect("bind");
         ready_tx.send(()).expect("signal ready");
-        let (conn, _peer) = listener
-            .accept(4, 4, HS.len(), CmParams::default())
+        let conn = listener
+            .accept(4, 4, CmParams::default())
             .expect("accept");
         let conn = Arc::new(conn);
         // Source region: filled with a known pattern; the NIC only reads it, so
@@ -72,7 +71,7 @@ fn rdma_write_round_trip() {
             .register_buffer(LEN, ACCESS_LOCAL_WRITE)
             .expect("register src");
         src.copy_in(0, &pattern(LEN, 0xC3));
-        conn.accept_finish(HS).expect("accept_finish"); // -> RTS
+        conn.accept_finish().expect("accept_finish"); // -> RTS
 
         let (raddr, rkey) = target_rx.recv().expect("recv target");
         // One WR for the whole 16 MiB region.
@@ -108,7 +107,7 @@ fn rdma_write_round_trip() {
     let dst = conn
         .register_buffer(LEN, ACCESS_LOCAL_WRITE | ACCESS_REMOTE_WRITE)
         .expect("register dst");
-    let _peer = conn.connect_finish(HS, HS.len()).expect("connect_finish"); // -> RTS
+    conn.connect_finish().expect("connect_finish"); // -> RTS
 
     // Advertise the destination, then wait until the server says the data landed.
     target_tx
@@ -150,15 +149,15 @@ fn rdma_write_with_imm_round_trip() {
     let server = std::thread::spawn(move || {
         let listener = Listener::bind(IP, PORT_IMM).expect("bind");
         ready_tx.send(()).expect("signal ready");
-        let (conn, _peer) = listener
-            .accept(4, 4, HS.len(), CmParams::default())
+        let conn = listener
+            .accept(4, 4, CmParams::default())
             .expect("accept");
         let conn = Arc::new(conn);
         let src = conn
             .register_buffer(LEN, ACCESS_LOCAL_WRITE)
             .expect("register src");
         src.copy_in(0, &pattern(LEN, 0x5A));
-        conn.accept_finish(HS).expect("accept_finish"); // -> RTS
+        conn.accept_finish().expect("accept_finish"); // -> RTS
 
         let (raddr, rkey) = target_rx.recv().expect("recv target");
         // One write-with-immediate for the whole region: lands the payload AND
@@ -213,7 +212,7 @@ fn rdma_write_with_imm_round_trip() {
         conn.post_recv(7, rx.as_mut_ptr(), rx.len() as u32, rx.lkey())
             .expect("post_recv");
     }
-    let _peer = conn.connect_finish(HS, HS.len()).expect("connect_finish"); // -> RTS
+    conn.connect_finish().expect("connect_finish"); // -> RTS
 
     target_tx
         .send((dst.as_mut_ptr() as u64, dst.rkey()))

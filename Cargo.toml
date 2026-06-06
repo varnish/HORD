@@ -17,15 +17,18 @@ repository = "https://github.com/varnish/HORD"
 # straight into a client-registered buffer, in hord-zerocopy. (Protocol
 # splitting / write-with-immediate, §7.7, is not yet implemented.)
 #
-# The core stack takes no third-party crate dependencies: hord-core talks to
-# libibverbs/librdmacm through a small C shim compiled by its build script, and
-# hord-stream and hord-zerocopy above it are plain std Rust. This keeps the
-# transport buildable on an air-gapped RDMA host with nothing but a C compiler
-# and rdma-core -dev.
+# hord-core wraps libibverbs/librdmacm through the `sideway` crate (a safe
+# rdma-core wrapper), plus `rdma-mummy-sys` for the few CQ-event-channel calls
+# sideway does not yet expose. hord-stream and hord-zerocopy above it are plain
+# std Rust. (Earlier revisions used a hand-written C shim and took no third-party
+# crate dependencies, building on an air-gapped host with just a C compiler and
+# rdma-core-dev; the sideway port traded that dep-free property for far less
+# unsafe code and no C — see git history. As part of the port the HORD handshake
+# moved out of RDMA-CM private data into a first message over the QP, so the
+# transport no longer touches the handshake at all.)
 #
-# The async milestone (hord-async) is the sole exception: it depends on tokio
-# (and the demo on hyper) to present AsyncRead/AsyncWrite + serve HTTP. Those
-# deps are confined to that crate, so hord-core/hord-stream stay dep-free.
+# The async milestone (hord-async) adds tokio (and the demo adds hyper) to
+# present AsyncRead/AsyncWrite + serve HTTP.
 
 [profile.release]
 opt-level = 3

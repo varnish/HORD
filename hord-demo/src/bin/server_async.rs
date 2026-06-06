@@ -251,7 +251,7 @@ async fn serve_zero_copy(stream: &SharedAsyncStream, req: &RdmaWriteReq, n: usiz
 /// Drive one accepted connection to completion on its own current-thread runtime.
 /// The stream is wrapped in a [`SharedAsyncStream`] so the request handler can
 /// reach it to perform a zero-copy RDMA write while hyper owns it for HTTP.
-fn serve_connection(conn: hord_stream::Connection, peer: Vec<u8>, config: &HordConfig) {
+fn serve_connection(conn: hord_stream::Connection, config: &HordConfig) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -263,7 +263,7 @@ fn serve_connection(conn: hord_stream::Connection, peer: Vec<u8>, config: &HordC
         }
     };
     rt.block_on(async move {
-        let stream = match AsyncHordStream::from_accepted(conn, peer, config) {
+        let stream = match AsyncHordStream::from_accepted(conn, config) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("[server] handshake failed: {e}");
@@ -319,11 +319,19 @@ fn main() -> ExitCode {
 
     // Blocking accept loop: each accepted connection is handed (as the Send
     // `Connection`) to its own thread, which builds and runs the !Send stream.
+    //
+    // sideway-port caveat: this *looping* acceptor needs per-connection CM event
+    // channels (the old shim migrated each accepted cm_id to its own channel via
+    // `rdma_migrate_id`). sideway 0.4.3 doesn't expose `migrate_id`, so accepted
+    // connections share the listener's channel; a worker's `accept_finish` (which
+    // waits for ESTABLISHED) then races the next `accept_begin` on the same
+    // channel. Single-connection use is fine; true concurrent accept needs the
+    // upstream `migrate_id` gap closed. See SIDEWAY-PORT.md.
     loop {
         match HordStream::accept_begin(&listener, &config) {
-            Ok((conn, peer)) => {
+            Ok(conn) => {
                 let config = config.clone();
-                std::thread::spawn(move || serve_connection(conn, peer, &config));
+                std::thread::spawn(move || serve_connection(conn, &config));
             }
             Err(e) => eprintln!("[server] accept failed: {e}"),
         }

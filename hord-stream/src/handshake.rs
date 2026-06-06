@@ -1,5 +1,15 @@
-//! HORD handshake, exchanged in the RDMA CM private-data field during
-//! connect/accept (spec section 12.1).
+//! HORD handshake, exchanged as the first messages over the established RC
+//! connection — one send + one recv per side, before any data flows.
+//!
+//! ## Transport: first message, not CM private data
+//!
+//! Spec §5.3 / §12.1 carry this in the RDMA CM private-data field during
+//! `rdma_connect` / `rdma_accept`. This build instead sends it as the first
+//! RDMA message over the QP (see `hord-stream`'s connection setup). The CM
+//! private-data area for an RC connection is only ~56 bytes on IB/RoCE — too
+//! small for the spec's 60-byte structure — so a first-message handshake lifts
+//! the size ceiling (the full structure now fits and can grow) and keeps the
+//! transport a pure pipe that needn't know the handshake format.
 //!
 //! All multi-byte fields are big-endian (network byte order). With big-endian
 //! the 32-bit magic `0x484F5244` serialises to the ASCII bytes `H O R D`,
@@ -7,11 +17,10 @@
 //!
 //! ## Deviations from the draft spec
 //!
-//! 1. **Size.** Spec 12.1 describes a 60-byte structure (14 meaningful bytes +
-//!    46 reserved). The RDMA CM private-data area for an RC connection is only
-//!    ~56 bytes on IB/RoCE, so a 60-byte handshake does not reliably fit. This
-//!    prototype transmits just the 16 meaningful bytes below and drops the
-//!    reserved tail.
+//! 1. **Transport.** First message over the QP rather than CM private data (see
+//!    above) — a spec-mechanism change that better matches the spec's intended
+//!    60-byte size. The wire form below still carries the 16 meaningful bytes
+//!    (the 46 reserved bytes are dropped — now by choice, not the CM size cap).
 //! 2. **Transfer credits.** Bytes 14..16 (reserved in the spec) carry a
 //!    `split_credits` count: the transfer-credit window (§7.7.6) this side can
 //!    receive. The spec describes transfer credits as an *implicit per-request

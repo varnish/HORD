@@ -47,9 +47,9 @@ fn async_request_response() {
     let server = std::thread::spawn(move || {
         let listener = Listener::bind(IP, PORT).expect("bind");
         ready_tx.send(()).expect("signal ready");
-        let (conn, peer) = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
+        let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
         current_thread_rt().block_on(async move {
-            let mut s = AsyncHordStream::from_accepted(conn, peer, &srv_config).expect("accept");
+            let mut s = AsyncHordStream::from_accepted(conn, &srv_config).expect("accept");
             // Read the (small) request, then stream the response body and close.
             let mut req = [0u8; 256];
             let n = s.read(&mut req).await.expect("read request");
