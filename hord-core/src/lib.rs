@@ -31,7 +31,7 @@
 //! needs. The completion model is busy-poll ([`Connection::poll`]); an event
 //! loop can instead wait on [`Connection::cq_fd`] after [`Connection::arm_cq`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -331,7 +331,7 @@ impl Listener {
                     id.migrate(&conn_channel).map_err(to_io)?;
                     let ep = Endpoint::build(&id, send_wr, recv_wr)?;
                     let conn = Connection::new(conn_channel, id, ep, Role::Server, cm);
-                    conn.modify_qp(QueuePairState::Init, true)?;
+                    conn.modify_qp(QueuePairState::Init)?;
                     return Ok(conn);
                 }
                 // Device removal on the listener is terminal — surface it rather
@@ -427,6 +427,10 @@ pub struct Connection {
     id: Arc<Identifier>,
     event_channel: Arc<EventChannel>,
     role: Role,
+    // Guards `rdma_disconnect` so it runs at most once across
+    // disconnect()/shutdown()/Drop. (`Cell` keeps `Connection` `!Sync` already
+    // via the `RefCell`, and it's only touched single-threaded.)
+    disconnected: Cell<bool>,
     // Retained for completeness / future use: sideway's `ConnectionParameter`
     // can't yet carry retry/rnr counts, and the resolve timeout is consumed in
     // `connect` before construction, so nothing reads this after setup.
@@ -455,6 +459,7 @@ impl Connection {
             id,
             event_channel,
             role,
+            disconnected: Cell::new(false),
             _cm: cm,
         }
     }
@@ -481,7 +486,7 @@ impl Connection {
 
         let ep = Endpoint::build(&id, send_wr, recv_wr)?;
         let conn = Connection::new(event_channel, id, ep, Role::Client, cm);
-        conn.modify_qp(QueuePairState::Init, true)?;
+        conn.modify_qp(QueuePairState::Init)?;
         Ok(conn)
     }
 
@@ -498,8 +503,8 @@ impl Connection {
         // External-QP mode (we created the QP, not librdmacm) reports a connect
         // *response* rather than ESTABLISHED; we ack it then establish manually.
         expect_event(&self.event_channel, EventType::ConnectResponse)?;
-        self.modify_qp(QueuePairState::ReadyToReceive, false)?;
-        self.modify_qp(QueuePairState::ReadyToSend, false)?;
+        self.modify_qp(QueuePairState::ReadyToReceive)?;
+        self.modify_qp(QueuePairState::ReadyToSend)?;
         self.id.establish().map_err(to_io)?;
         Ok(())
     }
@@ -510,8 +515,8 @@ impl Connection {
         debug_assert_eq!(self.role, Role::Server);
         let qp_number = self.with_qp(|qp| Ok(qp.qp_number()))?;
 
-        self.modify_qp(QueuePairState::ReadyToReceive, false)?;
-        self.modify_qp(QueuePairState::ReadyToSend, false)?;
+        self.modify_qp(QueuePairState::ReadyToReceive)?;
+        self.modify_qp(QueuePairState::ReadyToSend)?;
 
         let mut param = ConnectionParameter::default();
         param.setup_qp_number(qp_number);
@@ -797,9 +802,18 @@ impl Connection {
         }
     }
 
-    /// Begin a graceful disconnect. Best-effort.
+    /// Issue `rdma_disconnect` at most once. Best-effort — errors (e.g. on a
+    /// not-yet-established id) are ignored. Shared by `disconnect`/`shutdown`/Drop
+    /// so the peer never sees a redundant disconnect.
+    fn do_disconnect(&self) {
+        if !self.disconnected.replace(true) {
+            let _ = self.id.disconnect();
+        }
+    }
+
+    /// Begin a graceful disconnect. Best-effort; idempotent.
     pub fn disconnect(&self) {
-        let _ = self.id.disconnect();
+        self.do_disconnect();
     }
 
     /// Stop the NIC for this connection: disconnect and destroy the QP.
@@ -808,7 +822,7 @@ impl Connection {
     /// does on drop). The CQ/PD stay alive (held by `Arc`) so any outstanding
     /// `RegisteredBuffer` can still deregister against the PD.
     pub fn shutdown(&self) {
-        let _ = self.id.disconnect();
+        self.do_disconnect();
         // Dropping the QP runs `ibv_destroy_qp`. `take` makes this idempotent.
         let _ = self.qp.borrow_mut().take();
     }
@@ -823,14 +837,25 @@ impl Connection {
         f(qp)
     }
 
-    /// Drive the QP toward `state` using the CM-computed attributes, optionally
-    /// OR-ing in remote-write access (only meaningful on the INIT transition).
-    fn modify_qp(&self, state: QueuePairState, add_remote_write: bool) -> io::Result<()> {
+    /// Drive the QP toward `state` using the CM-computed attributes. At INIT
+    /// (where RC access flags are set) we additionally permit incoming remote
+    /// writes — the zero-copy destination side — since the CM-derived attrs don't
+    /// always include it; later transitions leave access flags untouched.
+    fn modify_qp(&self, state: QueuePairState) -> io::Result<()> {
         let mut attr = self.id.get_qp_attr(state).map_err(to_io)?;
-        if add_remote_write {
+        if matches!(state, QueuePairState::Init) {
             attr.setup_access_flags(AccessFlags::LocalWrite | AccessFlags::RemoteWrite);
         }
         self.with_qp(|qp| qp.modify(&attr).map_err(to_io))
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // Parity with the old shim's hord_conn_free: a Connection dropped without
+        // an explicit shutdown() still issues a graceful rdma_disconnect and
+        // destroys the QP. Idempotent if shutdown()/disconnect() already ran.
+        self.shutdown();
     }
 }
 
