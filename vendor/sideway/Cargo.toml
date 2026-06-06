@@ -1,0 +1,57 @@
+# Vendored copy of sideway 0.4.3 (crates.io) + a local patch adding
+# `Identifier::migrate` (rdma_migrate_id). See HORD-PATCH.md. Used via
+# `[patch.crates-io]` in the workspace root. Examples, tests, and their
+# dev-dependencies have been removed — only the library is built here. The
+# original manifest is otherwise preserved.
+
+[package]
+edition = "2021"
+name = "sideway"
+version = "0.4.3"
+authors = [
+    "Luke Yue <lukedyue@gmail.com>",
+    "FujiZ <i@fujiz.me>",
+]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "A better wrapper for using RDMA programming APIs in Rust flavor"
+readme = "README.md"
+keywords = [
+    "RDMA",
+    "verbs",
+    "cm",
+    "libibverbs",
+    "librdmacm",
+]
+license = "MPL-2.0"
+repository = "https://github.com/RDMA-Rust/sideway"
+
+[lib]
+name = "sideway"
+path = "src/lib.rs"
+
+[dependencies.bitmask-enum]
+version = "2.2"
+
+[dependencies.libc]
+version = "0.2"
+
+[dependencies.os_socketaddr]
+version = "0.2"
+
+[dependencies.rdma-mummy-sys]
+version = "0.2.4"
+
+[dependencies.serde]
+version = "1.0"
+features = ["derive"]
+
+[dependencies.tabled]
+version = "0.18"
+
+[dependencies.thiserror]
+version = "2.0"

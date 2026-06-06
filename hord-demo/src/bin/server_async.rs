@@ -319,14 +319,10 @@ fn main() -> ExitCode {
 
     // Blocking accept loop: each accepted connection is handed (as the Send
     // `Connection`) to its own thread, which builds and runs the !Send stream.
-    //
-    // sideway-port caveat: this *looping* acceptor needs per-connection CM event
-    // channels (the old shim migrated each accepted cm_id to its own channel via
-    // `rdma_migrate_id`). sideway 0.4.3 doesn't expose `migrate_id`, so accepted
-    // connections share the listener's channel; a worker's `accept_finish` (which
-    // waits for ESTABLISHED) then races the next `accept_begin` on the same
-    // channel. Single-connection use is fine; true concurrent accept needs the
-    // upstream `migrate_id` gap closed. See SIDEWAY-PORT.md.
+    // accept_begin migrates each accepted connection to its own CM event channel
+    // (Identifier::migrate / rdma_migrate_id), so this looping acceptor and the
+    // per-connection workers never compete on a shared channel. (migrate is a
+    // local sideway patch — see vendor/sideway/HORD-PATCH.md.)
     loop {
         match HordStream::accept_begin(&listener, &config) {
             Ok(conn) => {

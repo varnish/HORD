@@ -1,0 +1,1365 @@
+//! The device context is used for querying RDMA device attributes and creating the initial
+//! resources.
+use std::ffi::{CStr, CString};
+use std::fmt;
+use std::fs;
+use std::io;
+use std::mem::MaybeUninit;
+use std::ptr::{self, NonNull};
+use std::sync::Arc;
+
+use bitmask_enum::bitmask;
+use rdma_mummy_sys::{
+    ibv_alloc_pd, ibv_atomic_cap, ibv_close_device, ibv_context, ibv_device_attr_ex, ibv_device_cap_flags,
+    ibv_get_device_guid, ibv_get_device_name, ibv_gid_entry, ibv_mtu, ibv_pci_atomic_caps, ibv_pci_atomic_op_size,
+    ibv_port_attr, ibv_port_state, ibv_query_device_ex, ibv_query_gid, ibv_query_gid_ex, ibv_query_gid_table,
+    ibv_query_gid_type, ibv_query_port, ibv_query_rt_values_ex, ibv_values_ex, ibv_values_mask, IBV_GID_TYPE_IB,
+    IBV_GID_TYPE_ROCE_V1, IBV_GID_TYPE_ROCE_V2, IBV_GID_TYPE_SYSFS_IB_ROCE_V1, IBV_GID_TYPE_SYSFS_ROCE_V2,
+    IBV_LINK_LAYER_ETHERNET, IBV_LINK_LAYER_INFINIBAND, IBV_LINK_LAYER_UNSPECIFIED,
+};
+use serde::{Deserialize, Serialize};
+
+use super::address::{Gid, GidEntry};
+use super::completion::{CompletionChannel, CompletionQueueBuilder, CreateCompletionChannelError};
+use super::device::{DeviceInfo, TransportType};
+use super::protection_domain::ProtectionDomain;
+
+/// Error returned by [`DeviceContext::query_rt_values_ex`] for querying real-time values.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to query RT values")]
+#[non_exhaustive]
+pub struct QueryRealTimeValuesError(#[from] pub QueryRealTimeValuesErrorKind);
+
+/// The enum type for [`QueryRealTimeValuesError`].
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+#[non_exhaustive]
+pub enum QueryRealTimeValuesErrorKind {
+    Ibverbs(#[from] io::Error),
+    #[error("operation not supported by driver")]
+    NotSupported,
+}
+
+/// Error returned by [`DeviceContext::alloc_pd`] for allocating a new RDMA PD.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to alloc protection domain")]
+#[non_exhaustive]
+pub struct AllocateProtectionDomainError(#[from] pub AllocateProtectionDomainErrorKind);
+
+/// The enum type for [`AllocateProtectionDomainError`].
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+#[non_exhaustive]
+pub enum AllocateProtectionDomainErrorKind {
+    Ibverbs(#[from] io::Error),
+}
+
+/// Error returned by [`DeviceContext::query_device`] for querying device context's attributes.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to query device")]
+#[non_exhaustive]
+pub struct QueryDeviceError(#[from] pub QueryDeviceErrorKind);
+
+/// The enum type for [`QueryDeviceError`].
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+#[non_exhaustive]
+pub enum QueryDeviceErrorKind {
+    Ibverbs(#[from] io::Error),
+}
+
+/// Error returned by [`DeviceContext::query_port`] for querying physical port's attributes.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to query port (port_num={port_num})")]
+#[non_exhaustive]
+pub struct QueryPortError {
+    pub port_num: u8,
+    pub source: QueryPortErrorKind,
+}
+
+/// The enum type for [`QueryPortError`].
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+#[non_exhaustive]
+pub enum QueryPortErrorKind {
+    Ibverbs(#[from] io::Error),
+}
+
+/// Error returned by [`DeviceContext::query_gid_table`] for querying RDMA device's GID table, which
+/// includes all GID entries on an RDMA device.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to query GID table")]
+#[non_exhaustive]
+pub struct QueryGidTableError(#[from] pub QueryGidTableErrorKind);
+
+/// The enum type for [`QueryGidTableError`].
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+#[non_exhaustive]
+pub enum QueryGidTableErrorKind {
+    Ibverbs(#[from] io::Error),
+    QueryDevice(#[from] QueryDeviceError),
+    QueryPort(#[from] QueryPortError),
+    QueryGid(#[from] QueryGidError),
+    #[error("invalid device name")]
+    InvalidDeviceName,
+}
+
+/// Error returned by [`DeviceContext::query_gid`] and [`DeviceContext::query_gid_ex`] for querying
+/// GID / GID entry by specified GID index.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to query GID (port_num={port_num}, gid_idex={gid_index})")]
+#[non_exhaustive]
+pub struct QueryGidError {
+    pub port_num: u8,
+    pub gid_index: u32,
+    pub source: QueryGidErrorKind,
+}
+
+/// The enum type for [`QueryGidError`].
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+#[non_exhaustive]
+pub enum QueryGidErrorKind {
+    Ibverbs(#[from] io::Error),
+}
+
+/// Bitmask of values to request (or that were returned) by [`DeviceContext::query_rt_values_ex`].
+///
+/// Set the desired bits before calling [`DeviceContext::query_rt_values_ex`]; on success the
+/// returned [`RealTimeValues::comp_mask`] indicates which fields were actually populated by the driver.
+#[bitmask(u32)]
+#[bitmask_config(vec_debug)]
+pub enum ValuesMask {
+    /// Query / indicates the raw hardware clock value ([`RealTimeValues::raw_clock`]).
+    RawClock = ibv_values_mask::IBV_VALUES_MASK_RAW_CLOCK.0 as _,
+}
+
+/// Raw hardware clock counter returned by [`DeviceContext::query_rt_values_ex`].
+///
+/// The two fields are the high and low halves of a free-running hardware tick counter in
+/// device-specific units. They are **not** wall-clock seconds and nanoseconds despite the
+/// underlying C `timespec` field names. To convert to real time, combine the parts and divide
+/// by the device clock frequency (`hca_core_clock` from `ibv_query_device_ex`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawClock {
+    /// High part of the hardware counter (maps to `timespec.tv_sec` in the C struct).
+    pub counter_hi: u64,
+    /// Low part of the hardware counter (maps to `timespec.tv_nsec` in the C struct).
+    pub counter_lo: u64,
+}
+
+impl RawClock {
+    /// Combine both halves into a single 128-bit tick value.
+    pub fn to_ticks(&self) -> u128 {
+        ((self.counter_hi as u128) << 64) | (self.counter_lo as u128)
+    }
+}
+
+/// Real-time values queried from an RDMA device via [`DeviceContext::query_rt_values_ex`].
+pub struct RealTimeValues {
+    inner: ibv_values_ex,
+}
+
+impl RealTimeValues {
+    /// Returns the raw hardware clock counter, or [`None`] if [`ValuesMask::RawClock`] was not
+    /// set in [`RealTimeValues::comp_mask`] (i.e. the driver did not populate this field).
+    ///
+    /// See [`RawClock`] for details on how to interpret the returned value.
+    pub fn raw_clock(&self) -> Option<RawClock> {
+        if self.comp_mask().contains(ValuesMask::RawClock) {
+            Some(RawClock {
+                counter_hi: self.inner.raw_clock.tv_sec as u64,
+                counter_lo: self.inner.raw_clock.tv_nsec as u64,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Returns the `comp_mask` indicating which fields were actually populated by the driver.
+    pub fn comp_mask(&self) -> ValuesMask {
+        ValuesMask::from(self.inner.comp_mask)
+    }
+}
+
+/// A Global Unique Indentifier (GUID) for the RDMA device. Usually assigned to the device by its
+/// vendor during the manufacturing, may contain part of the MAC address on the ethernet device.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Guid(pub(crate) u64);
+
+impl Guid {
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for Guid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:04x}:{:04x}:{:04x}:{:04x}",
+            (self.0 >> 48) & 0xFFFF,
+            (self.0 >> 32) & 0xFFFF,
+            (self.0 >> 16) & 0xFFFF,
+            self.0 & 0xFFFF
+        )
+    }
+}
+
+/// A context of the RDMA device, could be used to query its resources or creating PD or CQ.
+#[derive(Debug)]
+pub struct DeviceContext {
+    pub(crate) context: NonNull<ibv_context>,
+}
+
+unsafe impl Send for DeviceContext {}
+unsafe impl Sync for DeviceContext {}
+
+/// RDMA Maximum Transmission Units (MTU), unlike ethernet MTU, there are only 5 allowed MTU sizes
+/// for RDMA transmission, and this only includes the RDMA payload size, which means if adding the
+/// RDMA header / UDP header / IP header into the packet, it requires you to set a bigger MTU size
+/// for the ethernet device, for example, `4200`.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Mtu {
+    Mtu256 = ibv_mtu::IBV_MTU_256,
+    Mtu512 = ibv_mtu::IBV_MTU_512,
+    Mtu1024 = ibv_mtu::IBV_MTU_1024,
+    Mtu2048 = ibv_mtu::IBV_MTU_2048,
+    Mtu4096 = ibv_mtu::IBV_MTU_4096,
+}
+
+impl From<u32> for Mtu {
+    fn from(mtu: u32) -> Self {
+        match mtu {
+            ibv_mtu::IBV_MTU_256 => Mtu::Mtu256,
+            ibv_mtu::IBV_MTU_512 => Mtu::Mtu512,
+            ibv_mtu::IBV_MTU_1024 => Mtu::Mtu1024,
+            ibv_mtu::IBV_MTU_2048 => Mtu::Mtu2048,
+            ibv_mtu::IBV_MTU_4096 => Mtu::Mtu4096,
+            _ => panic!("Unknown MTU value: {mtu}"),
+        }
+    }
+}
+
+/// The link width of a port.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PortWidth {
+    Width1X = 1,
+    Width2X = 2,
+    Width4X = 4,
+    Width8X = 8,
+    Width12X = 12,
+}
+
+impl From<u8> for PortWidth {
+    fn from(width: u8) -> Self {
+        match width {
+            1 => PortWidth::Width1X,
+            16 => PortWidth::Width2X,
+            2 => PortWidth::Width4X,
+            4 => PortWidth::Width8X,
+            8 => PortWidth::Width12X,
+            _ => panic!("Unknown port width value: {width}"),
+        }
+    }
+}
+
+/// The link speed of a port.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PortSpeed {
+    SingleDataRate = 1,
+    DoubleDataRate = (1 << 1),
+    QuadrupleDataRate = (1 << 2),
+    FourteenDataRateTen = (1 << 3),
+    FourteenDataRate = (1 << 4),
+    EnhancedDataRate = (1 << 5),
+    HighDataRate = (1 << 6),
+    NextDataRate = (1 << 7),
+    ExtendedDataRate = (1 << 8),
+}
+
+impl From<u32> for PortSpeed {
+    fn from(speed: u32) -> Self {
+        match speed {
+            1 => PortSpeed::SingleDataRate,
+            2 => PortSpeed::DoubleDataRate,
+            4 => PortSpeed::QuadrupleDataRate,
+            8 => PortSpeed::FourteenDataRateTen,
+            16 => PortSpeed::FourteenDataRate,
+            32 => PortSpeed::EnhancedDataRate,
+            64 => PortSpeed::HighDataRate,
+            128 => PortSpeed::NextDataRate,
+            256 => PortSpeed::ExtendedDataRate,
+            _ => panic!("Unknown port speed value: {speed}"),
+        }
+    }
+}
+
+impl PortSpeed {
+    /// According to the [wikipedia](https://en.wikipedia.org/wiki/InfiniBand),
+    /// InfiniBand speed has signaling rate and actual rate (throughput), just as below
+    ///
+    /// | Generation | Release Year | Line Code | Signaling Rate (Gbit/s) | Throughput (Gbit/s) | Latency (μs) |
+    /// |------------|--------------|-----------|-------------------------|---------------------|--------------|
+    /// | SDR        | 2001/2003    | 8b/10b    | 2.5                     | 2.0                 | 5.0          |
+    /// | DDR        | 2005         | 8b/10b    | 5.0                     | 4.0                 | 2.5          |
+    /// | QDR        | 2007         | 8b/10b    | 10.0                    | 8.0                 | 1.3          |
+    /// | FDR10      | 2011         | 64b/66b   | 10.3125                 | 10.0                | 0.7          |
+    /// | FDR        | 2011         | 64b/66b   | 14.0625                 | 13.64               | 0.7          |
+    /// | EDR        | 2014         | 64b/66b   | 25.78125                | 25.0                | 0.5          |
+    /// | HDR        | 2018         | PAM4      | 53.125                  | 50.0                | <0.6         |
+    /// | NDR        | 2022         | 256b/257b | 106.25                  | 100.0               | N/A          |
+    /// | XDR        | 2024         | TBD       | 200.0                   | 200.0               | TBD          |
+    /// | GDR        | TBA          | TBD       | 400.0                   | 400.0               | TBD          |
+    pub fn to_signaling_rate(&self) -> f64 {
+        match self {
+            PortSpeed::SingleDataRate => 2.5,
+            PortSpeed::DoubleDataRate => 5.0,
+            PortSpeed::QuadrupleDataRate => 10.0,
+            PortSpeed::FourteenDataRateTen => 10.3125,
+            PortSpeed::FourteenDataRate => 14.0625,
+            PortSpeed::EnhancedDataRate => 25.78125,
+            PortSpeed::HighDataRate => 53.125,
+            PortSpeed::NextDataRate => 106.25,
+            PortSpeed::ExtendedDataRate => 250.0,
+        }
+    }
+
+    pub fn to_throughput(&self) -> f64 {
+        match self {
+            PortSpeed::SingleDataRate => 2.0,
+            PortSpeed::DoubleDataRate => 4.0,
+            PortSpeed::QuadrupleDataRate => 8.0,
+            PortSpeed::FourteenDataRateTen => 10.0,
+            PortSpeed::FourteenDataRate => 13.64,
+            PortSpeed::EnhancedDataRate => 25.0,
+            PortSpeed::HighDataRate => 50.0,
+            PortSpeed::NextDataRate => 100.0,
+            PortSpeed::ExtendedDataRate => 250.0,
+        }
+    }
+}
+
+/// The link layer protocol of physical port.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LinkLayer {
+    Unspecified = IBV_LINK_LAYER_UNSPECIFIED,
+    InfiniBand = IBV_LINK_LAYER_INFINIBAND,
+    Ethernet = IBV_LINK_LAYER_ETHERNET,
+}
+
+impl From<u8> for LinkLayer {
+    fn from(link: u8) -> Self {
+        match link {
+            IBV_LINK_LAYER_UNSPECIFIED => LinkLayer::Unspecified,
+            IBV_LINK_LAYER_INFINIBAND => LinkLayer::InfiniBand,
+            IBV_LINK_LAYER_ETHERNET => LinkLayer::Ethernet,
+            _ => panic!("Unknown link layer value: {link}"),
+        }
+    }
+}
+
+/// The logical state of a port.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PortState {
+    /// Reserved value, shouldn't be observed.
+    Nop = ibv_port_state::IBV_PORT_NOP,
+    /// Logical link is down. The physical link of the port isn't up. In this state, the link layer
+    /// discards all packets presented to it for transmission.
+    Down = ibv_port_state::IBV_PORT_DOWN,
+    /// Logical link is initializing. The physical link of the port is up, but the subnet manager
+    /// haven't yet configured the logical link. In this state, the link layer can only receive and
+    /// transmit SMPs and flow control link packets, other types of packets presented to it for
+    /// transmission are discarded.
+    Initializing = ibv_port_state::IBV_PORT_INIT,
+    /// Logical link is armed. The physical link of the port is up, but the subnet manager haven't
+    /// yet fully configured the logical link. In this state, the link layer can receive and
+    /// transmit SMPs and flow control link packets, other types of packets can be received, but
+    /// discards non SMP packets for sending.
+    Armed = ibv_port_state::IBV_PORT_ARMED,
+    /// Logical link is active. The link layer can transmit and receive all packet types.
+    Active = ibv_port_state::IBV_PORT_ACTIVE,
+    /// Logical link is in active deferred. The logical link was active, but the physical link
+    /// suffered from a failure. If the error will be recovered within a timeout, the logical link
+    /// will return to [`PortState::Active`], otherwise it will move to [`PortState::Down`].
+    ActiveDefer = ibv_port_state::IBV_PORT_ACTIVE_DEFER,
+}
+
+impl From<u32> for PortState {
+    fn from(port_state: u32) -> Self {
+        match port_state {
+            ibv_port_state::IBV_PORT_NOP => PortState::Nop,
+            ibv_port_state::IBV_PORT_DOWN => PortState::Down,
+            ibv_port_state::IBV_PORT_INIT => PortState::Initializing,
+            ibv_port_state::IBV_PORT_ARMED => PortState::Armed,
+            ibv_port_state::IBV_PORT_ACTIVE => PortState::Active,
+            ibv_port_state::IBV_PORT_ACTIVE_DEFER => PortState::ActiveDefer,
+            _ => panic!("Unknown port state value: {port_state}"),
+        }
+    }
+}
+
+/// The physical link status.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PhysicalState {
+    NoStateChange,
+    /// The port drives its output to quiescent levels and does not respond to received data. In
+    /// this state, the link is deactivated without powering off the port.
+    Sleep,
+    /// The port transmits training sequences and responds to receive training sequences.
+    Polling,
+    /// The port drives its output to quiescent levels and does not respond to receive data.
+    Disabled,
+    /// Both transmitter and receive active and the port is attempting to configure and transition
+    /// to the [`PhysicalState::LinkUp`] state.
+    PortConfigurationTraining,
+    /// The port is available to send and receive packets.
+    LinkUp,
+    /// Port attempts to re-synchronize the link and return it to normal operation.
+    LinkErrorRecovery,
+    /// Port allows the transmitter and received circuitry to be tested by external test equipment
+    /// for compliance with the transmitter and receiver specifications.
+    PhyTest,
+}
+
+impl From<u8> for PhysicalState {
+    fn from(phy_state: u8) -> Self {
+        match phy_state {
+            0 => PhysicalState::NoStateChange,
+            1 => PhysicalState::Sleep,
+            2 => PhysicalState::Polling,
+            3 => PhysicalState::Disabled,
+            4 => PhysicalState::PortConfigurationTraining,
+            5 => PhysicalState::LinkUp,
+            6 => PhysicalState::LinkErrorRecovery,
+            7 => PhysicalState::PhyTest,
+            _ => panic!("Unknown port state value: {phy_state}"),
+        }
+    }
+}
+
+/// The atomic operation capability supported by this RDMA device.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AtomicCapability {
+    None = ibv_atomic_cap::IBV_ATOMIC_NONE,
+    HostChannelAdapter = ibv_atomic_cap::IBV_ATOMIC_HCA,
+    Global = ibv_atomic_cap::IBV_ATOMIC_GLOB,
+}
+
+impl From<u32> for AtomicCapability {
+    fn from(atomic_cap: u32) -> Self {
+        match atomic_cap {
+            ibv_atomic_cap::IBV_ATOMIC_NONE => AtomicCapability::None,
+            ibv_atomic_cap::IBV_ATOMIC_HCA => AtomicCapability::HostChannelAdapter,
+            ibv_atomic_cap::IBV_ATOMIC_GLOB => AtomicCapability::Global,
+            _ => panic!("Unknown atomic capability value: {atomic_cap}"),
+        }
+    }
+}
+
+/// The capabilities supported by this RDMA device.
+#[bitmask(u32)]
+#[bitmask_config(vec_debug)]
+pub enum DeviceCapabilityFlags {
+    ResizeMaxWorkRequest = ibv_device_cap_flags::IBV_DEVICE_RESIZE_MAX_WR.0 as _,
+    BadPartitionKeyCounter = ibv_device_cap_flags::IBV_DEVICE_BAD_PKEY_CNTR.0 as _,
+    BadQueueKeyCounter = ibv_device_cap_flags::IBV_DEVICE_BAD_QKEY_CNTR.0 as _,
+    RawMulticast = ibv_device_cap_flags::IBV_DEVICE_RAW_MULTI.0 as _,
+    AutoPathMigration = ibv_device_cap_flags::IBV_DEVICE_AUTO_PATH_MIG.0 as _,
+    ChangePhysicalPort = ibv_device_cap_flags::IBV_DEVICE_CHANGE_PHY_PORT.0 as _,
+    UnreliableDatagramAddressVectorPortEnforce = ibv_device_cap_flags::IBV_DEVICE_UD_AV_PORT_ENFORCE.0 as _,
+    CurrentQueuePairStateModification = ibv_device_cap_flags::IBV_DEVICE_CURR_QP_STATE_MOD.0 as _,
+    ShutdownPort = ibv_device_cap_flags::IBV_DEVICE_SHUTDOWN_PORT.0 as _,
+    InitType = ibv_device_cap_flags::IBV_DEVICE_INIT_TYPE.0 as _,
+    PortActiveEvent = ibv_device_cap_flags::IBV_DEVICE_PORT_ACTIVE_EVENT.0 as _,
+    SystemImageGuid = ibv_device_cap_flags::IBV_DEVICE_SYS_IMAGE_GUID.0 as _,
+    ReliableConnectionReceiverNotReadyNakGeneration = ibv_device_cap_flags::IBV_DEVICE_RC_RNR_NAK_GEN.0 as _,
+    SharedReceiveQueueResize = ibv_device_cap_flags::IBV_DEVICE_SRQ_RESIZE.0 as _,
+    NotifyCompletionQueueCount = ibv_device_cap_flags::IBV_DEVICE_N_NOTIFY_CQ.0 as _,
+    MemoryWindow = ibv_device_cap_flags::IBV_DEVICE_MEM_WINDOW.0 as _,
+    UnreliableDatagramIpChecksum = ibv_device_cap_flags::IBV_DEVICE_UD_IP_CSUM.0 as _,
+    ExtendedReliableConnection = ibv_device_cap_flags::IBV_DEVICE_XRC.0 as _,
+    MemoryManagementExtensions = ibv_device_cap_flags::IBV_DEVICE_MEM_MGT_EXTENSIONS.0 as _,
+    MemoryWindowType2A = ibv_device_cap_flags::IBV_DEVICE_MEM_WINDOW_TYPE_2A.0 as _,
+    MemoryWindowType2B = ibv_device_cap_flags::IBV_DEVICE_MEM_WINDOW_TYPE_2B.0 as _,
+    ReliableConnectionIpChecksum = ibv_device_cap_flags::IBV_DEVICE_RC_IP_CSUM.0 as _,
+    RawIpChecksum = ibv_device_cap_flags::IBV_DEVICE_RAW_IP_CSUM.0 as _,
+    ManagedFlowSteering = ibv_device_cap_flags::IBV_DEVICE_MANAGED_FLOW_STEERING.0 as _,
+}
+
+/// The supported PCI atomic operation sizes.
+#[bitmask(u16)]
+#[bitmask_config(vec_debug)]
+pub enum PciAtomicOperationSize {
+    Size4Byte = ibv_pci_atomic_op_size::IBV_PCI_ATOMIC_OPERATION_4_BYTE_SIZE_SUP.0 as _,
+    Size8Byte = ibv_pci_atomic_op_size::IBV_PCI_ATOMIC_OPERATION_8_BYTE_SIZE_SUP.0 as _,
+    Size16Byte = ibv_pci_atomic_op_size::IBV_PCI_ATOMIC_OPERATION_16_BYTE_SIZE_SUP.0 as _,
+}
+
+/// The PCI atomic operation capabilities supported by this RDMA device.
+#[derive(Clone, Copy)]
+pub struct PciAtomicCapabilities {
+    caps: ibv_pci_atomic_caps,
+}
+
+impl PciAtomicCapabilities {
+    /// Get the supported operation sizes for PCI fetch-add.
+    pub fn fetch_add(&self) -> PciAtomicOperationSize {
+        PciAtomicOperationSize::from(self.caps.fetch_add)
+    }
+
+    /// Get the supported operation sizes for PCI swap.
+    pub fn swap(&self) -> PciAtomicOperationSize {
+        PciAtomicOperationSize::from(self.caps.swap)
+    }
+
+    /// Get the supported operation sizes for PCI compare-and-swap.
+    pub fn compare_swap(&self) -> PciAtomicOperationSize {
+        PciAtomicOperationSize::from(self.caps.compare_swap)
+    }
+}
+
+/// The attributes of a port of an RDMA device context.
+pub struct PortAttr {
+    pub attr: ibv_port_attr,
+}
+
+impl PortAttr {
+    /// Get the maximum MTU supported by this port.
+    pub fn max_mtu(&self) -> Mtu {
+        self.attr.max_mtu.into()
+    }
+
+    /// Get the maximum MTU enabled on this port to transmit and receive.
+    pub fn active_mtu(&self) -> Mtu {
+        self.attr.active_mtu.into()
+    }
+
+    /// Get the length of GID table of this port.
+    pub fn gid_tbl_len(&self) -> i32 {
+        self.attr.gid_tbl_len
+    }
+
+    /// Get the base LID (Local Identifier) assigned to this port by the subnet manager.
+    pub fn lid(&self) -> u16 {
+        self.attr.lid
+    }
+
+    /// Get the LID (Local Identifier) of the SM (Subnet Manager) that manages this port.
+    pub fn sm_lid(&self) -> u16 {
+        self.attr.sm_lid
+    }
+
+    /// Get the link layer protocol used by this port.
+    pub fn link_layer(&self) -> LinkLayer {
+        self.attr.link_layer.into()
+    }
+
+    /// Get the logical port status of this port.
+    pub fn port_state(&self) -> PortState {
+        self.attr.state.into()
+    }
+
+    /// Get the physical link status of this port.
+    pub fn phys_state(&self) -> PhysicalState {
+        self.attr.phys_state.into()
+    }
+
+    /// Get the active link width of this port.
+    pub fn active_width(&self) -> PortWidth {
+        self.attr.active_width.into()
+    }
+
+    /// Get the active link speed of this port.
+    pub fn active_speed(&self) -> PortSpeed {
+        if self.attr.active_speed_ex != 0 {
+            return self.attr.active_speed_ex.into();
+        }
+        (self.attr.active_speed as u32).into()
+    }
+}
+
+/// The attributes of an RDMA device that is associated with a context.
+pub struct DeviceAttr {
+    pub attr: ibv_device_attr_ex,
+}
+
+impl DeviceAttr {
+    /// Get the number of physical ports on this device.
+    pub fn phys_port_cnt(&self) -> u8 {
+        self.attr.orig_attr.phys_port_cnt
+    }
+
+    /// Get the completion timestamp mask on this device, `0` for unsupported of hardware completion
+    /// timestamp.
+    pub fn completion_timestamp_mask(&self) -> u64 {
+        self.attr.completion_timestamp_mask
+    }
+
+    /// Get the HCA core clock frequency in KHz.
+    pub fn hca_core_clock(&self) -> u64 {
+        self.attr.hca_core_clock
+    }
+
+    /// Get the supported PCI atomic operation capabilities.
+    pub fn pci_atomic_caps(&self) -> PciAtomicCapabilities {
+        PciAtomicCapabilities {
+            caps: self.attr.pci_atomic_caps,
+        }
+    }
+
+    /// Get the IEEE device's vendor.
+    pub fn vendor_id(&self) -> u32 {
+        self.attr.orig_attr.vendor_id
+    }
+
+    /// Get the device's Part ID, as supplied by the vendor.
+    pub fn vendor_part_id(&self) -> u32 {
+        self.attr.orig_attr.vendor_part_id
+    }
+
+    /// Get the firmware version of the RDMA device, it would be empty string if no version filled.
+    pub fn firmware_version(&self) -> String {
+        self.attr
+            .orig_attr
+            .fw_ver
+            .iter()
+            .take_while(|&&c| c > 0)
+            .map(|&c| c as u8 as char)
+            .collect()
+    }
+
+    /// Get the hardware version of the RDMA device, as supplied by the vendor.
+    pub fn hardware_version(&self) -> u32 {
+        self.attr.orig_attr.hw_ver
+    }
+
+    /// Get the node [`Guid`] associated with this RDMA device.
+    pub fn node_guid(&self) -> Guid {
+        Guid(self.attr.orig_attr.node_guid)
+    }
+
+    /// Get the [`Guid`] associated with this RDMA device and other devices which are part of a
+    /// single system.
+    pub fn sys_image_guid(&self) -> Guid {
+        Guid(self.attr.orig_attr.sys_image_guid)
+    }
+
+    /// Get the maximum size of a memory region in bytes.
+    pub fn max_mr_size(&self) -> u64 {
+        self.attr.orig_attr.max_mr_size
+    }
+
+    /// Get the page size bitmap that can be supported by this device.
+    pub fn page_size_cap(&self) -> u64 {
+        self.attr.orig_attr.page_size_cap
+    }
+
+    /// Get the maximum number of Queue Pairs this device supports.
+    pub fn max_qp(&self) -> i32 {
+        self.attr.orig_attr.max_qp
+    }
+
+    /// Get the maximum number of outstanding work requests per Queue Pair.
+    pub fn max_qp_wr(&self) -> i32 {
+        self.attr.orig_attr.max_qp_wr
+    }
+
+    /// Get the capability flags supported by this device.
+    pub fn device_cap_flags(&self) -> DeviceCapabilityFlags {
+        DeviceCapabilityFlags::from(self.attr.orig_attr.device_cap_flags)
+    }
+
+    /// Get the maximum number of scatter / gather entries per work request.
+    pub fn max_sge(&self) -> i32 {
+        self.attr.orig_attr.max_sge
+    }
+
+    /// Get the maximum number of scatter / gather entries per RDMA read request.
+    pub fn max_sge_rd(&self) -> i32 {
+        self.attr.orig_attr.max_sge_rd
+    }
+
+    /// Get the maximum number of completion queues this device supports.
+    pub fn max_cq(&self) -> i32 {
+        self.attr.orig_attr.max_cq
+    }
+
+    /// Get the maximum number of completion queue entries per completion queue.
+    pub fn max_cqe(&self) -> i32 {
+        self.attr.orig_attr.max_cqe
+    }
+
+    /// Get the maximum number of memory regions this device supports.
+    pub fn max_mr(&self) -> i32 {
+        self.attr.orig_attr.max_mr
+    }
+
+    /// Get the maximum number of protection domains this device supports.
+    pub fn max_pd(&self) -> i32 {
+        self.attr.orig_attr.max_pd
+    }
+
+    /// Get the maximum number of outstanding RDMA read and atomic operations per Queue Pair.
+    pub fn max_qp_rd_atom(&self) -> i32 {
+        self.attr.orig_attr.max_qp_rd_atom
+    }
+
+    /// Get the maximum number of outstanding RDMA read and atomic operations per EE context.
+    pub fn max_ee_rd_atom(&self) -> i32 {
+        self.attr.orig_attr.max_ee_rd_atom
+    }
+
+    /// Get the maximum number of resources for outstanding RDMA read and atomic operations.
+    pub fn max_res_rd_atomic(&self) -> i32 {
+        self.attr.orig_attr.max_res_rd_atom
+    }
+
+    /// Get the maximum number of RDMA read and atomic operations that can be initiated by a Queue
+    /// Pair.
+    pub fn max_qp_init_rd_atom(&self) -> i32 {
+        self.attr.orig_attr.max_qp_init_rd_atom
+    }
+
+    /// Get the maximum number of RDMA read and atomic operations that can be initiated by an EE
+    /// context.
+    pub fn max_ee_init_rd_atom(&self) -> i32 {
+        self.attr.orig_attr.max_ee_init_rd_atom
+    }
+
+    /// Get the atomic operation capability supported by this device.
+    pub fn atomic_capability(&self) -> AtomicCapability {
+        self.attr.orig_attr.atomic_cap.into()
+    }
+
+    /// Get the maximum number of EE contexts this device supports.
+    pub fn max_ee(&self) -> i32 {
+        self.attr.orig_attr.max_ee
+    }
+
+    /// Get the maximum number of RDDs this device supports.
+    pub fn max_rdd(&self) -> i32 {
+        self.attr.orig_attr.max_rdd
+    }
+
+    /// Get the maximum number of memory windows this device supports.
+    pub fn max_mw(&self) -> i32 {
+        self.attr.orig_attr.max_mw
+    }
+
+    /// Get the maximum number of raw IPv6 Queue Pairs this device supports.
+    pub fn max_raw_ipv6_qp(&self) -> i32 {
+        self.attr.orig_attr.max_raw_ipv6_qp
+    }
+
+    /// Get the maximum number of raw Ethernet Queue Pairs this device supports.
+    pub fn max_raw_ethy_qp(&self) -> i32 {
+        self.attr.orig_attr.max_raw_ethy_qp
+    }
+
+    /// Get the maximum number of multicast groups this device supports.
+    pub fn max_mcast_grp(&self) -> i32 {
+        self.attr.orig_attr.max_mcast_grp
+    }
+
+    /// Get the maximum number of Queue Pairs that can be attached to a multicast group.
+    pub fn max_mcast_qp_attach(&self) -> i32 {
+        self.attr.orig_attr.max_mcast_qp_attach
+    }
+
+    /// Get the maximum total number of Queue Pair multicast attachments.
+    pub fn max_total_mcast_qp_attach(&self) -> i32 {
+        self.attr.orig_attr.max_total_mcast_qp_attach
+    }
+
+    /// Get the maximum number of address handles this device supports.
+    pub fn max_ah(&self) -> i32 {
+        self.attr.orig_attr.max_ah
+    }
+
+    /// Get the maximum number of Fast Memory Regions this device supports.
+    pub fn max_fmr(&self) -> i32 {
+        self.attr.orig_attr.max_fmr
+    }
+
+    /// Get the maximum number of page mappings per Fast Memory Region.
+    pub fn max_map_per_fmr(&self) -> i32 {
+        self.attr.orig_attr.max_map_per_fmr
+    }
+
+    /// Get the maximum number of shared receive queues this device supports.
+    pub fn max_srq(&self) -> i32 {
+        self.attr.orig_attr.max_srq
+    }
+
+    /// Get the maximum number of outstanding work requests per shared receive queue.
+    pub fn max_srq_wr(&self) -> i32 {
+        self.attr.orig_attr.max_srq_wr
+    }
+
+    /// Get the maximum number of scatter / gather entries per shared receive queue work request.
+    pub fn max_srq_sge(&self) -> i32 {
+        self.attr.orig_attr.max_srq_sge
+    }
+
+    /// Get the maximum number of supported PKEY entries per port.
+    pub fn max_pkeys(&self) -> u16 {
+        self.attr.orig_attr.max_pkeys
+    }
+
+    /// Get the local CA ACK delay.
+    pub fn local_ca_ack_delay(&self) -> u8 {
+        self.attr.orig_attr.local_ca_ack_delay
+    }
+}
+
+impl Drop for DeviceContext {
+    fn drop(&mut self) {
+        unsafe {
+            ibv_close_device(self.context.as_ptr());
+        }
+    }
+}
+
+impl DeviceContext {
+    /// Allocate a protection domain.
+    pub fn alloc_pd(self: &Arc<Self>) -> Result<Arc<ProtectionDomain>, AllocateProtectionDomainError> {
+        let pd = unsafe { ibv_alloc_pd(self.context.as_ptr()) };
+
+        if pd.is_null() {
+            return Err(AllocateProtectionDomainErrorKind::Ibverbs(io::Error::last_os_error()).into());
+        }
+
+        Ok(Arc::new(ProtectionDomain::new(Arc::clone(self), unsafe {
+            NonNull::new(pd).unwrap_unchecked()
+        })))
+    }
+
+    /// Create a completion event channel.
+    pub fn create_comp_channel(self: &Arc<Self>) -> Result<Arc<CompletionChannel>, CreateCompletionChannelError> {
+        CompletionChannel::new(self)
+    }
+
+    /// Create a factory for creating [`BasicCompletionQueue`] and [`ExtendedCompletionQueue`].
+    ///
+    /// [`BasicCompletionQueue`]: crate::ibverbs::completion::BasicCompletionQueue
+    /// [`ExtendedCompletionQueue`]: crate::ibverbs::completion::ExtendedCompletionQueue
+    ///
+    pub fn create_cq_builder(self: &Arc<Self>) -> CompletionQueueBuilder {
+        CompletionQueueBuilder::new(self)
+    }
+
+    /// Query the attributes of the RDMA device.
+    pub fn query_device(&self) -> Result<DeviceAttr, QueryDeviceError> {
+        let mut attr = MaybeUninit::<ibv_device_attr_ex>::uninit();
+        unsafe {
+            match ibv_query_device_ex(self.context.as_ptr(), ptr::null(), attr.as_mut_ptr()) {
+                0 => Ok(DeviceAttr {
+                    attr: attr.assume_init(),
+                }),
+                ret => Err(QueryDeviceErrorKind::Ibverbs(io::Error::from_raw_os_error(ret)).into()),
+            }
+        }
+    }
+
+    /// Query the attributes of a physical port.
+    pub fn query_port(&self, port_num: u8) -> Result<PortAttr, QueryPortError> {
+        let mut attr = MaybeUninit::<ibv_port_attr>::uninit();
+        unsafe {
+            match ibv_query_port(self.context.as_ptr(), port_num, attr.as_mut_ptr()) {
+                0 => Ok(PortAttr {
+                    attr: attr.assume_init(),
+                }),
+                ret => Err(QueryPortError {
+                    port_num,
+                    source: io::Error::from_raw_os_error(ret).into(),
+                }),
+            }
+        }
+    }
+
+    /// Query the [`Gid`] of the GID specified by GID index and port number.
+    pub fn query_gid(&self, port_num: u8, gid_index: u32) -> Result<Gid, QueryGidError> {
+        let mut gid = Gid::default();
+        unsafe {
+            match ibv_query_gid(self.context.as_ptr(), port_num, gid_index as i32, gid.as_mut()) {
+                0 => Ok(gid),
+                ret => Err(QueryGidError {
+                    port_num,
+                    gid_index,
+                    source: io::Error::from_raw_os_error(ret).into(),
+                }),
+            }
+        }
+    }
+
+    /// Query the [`GidEntry`] of the GID specified by GID index and port number.
+    pub fn query_gid_ex(&self, port_num: u8, gid_index: u32) -> Result<GidEntry, QueryGidError> {
+        let mut entry = GidEntry::default();
+        unsafe {
+            match ibv_query_gid_ex(self.context.as_ptr(), port_num as u32, gid_index, &mut entry.0, 0) {
+                0 => Ok(entry),
+                ret => Err(QueryGidError {
+                    port_num,
+                    gid_index,
+                    source: io::Error::from_raw_os_error(ret).into(),
+                }),
+            }
+        }
+    }
+
+    /// Query the type of the GID specified by GID index and port number.
+    /// Note that this gid type is represented by [`u32`]:
+    ///
+    /// - If return value is 0, the type is either [`GidType::InfiniBand`] or [`GidType::RoceV1`].
+    /// - If return value is 1, the type is [`GidType::RoceV2`].
+    ///
+    /// [`GidType::InfiniBand`]: crate::ibverbs::address::GidType::InfiniBand
+    /// [`GidType::RoceV1`]: crate::ibverbs::address::GidType::RoceV1
+    /// [`GidType::RoceV2`]: crate::ibverbs::address::GidType::RoceV2
+    ///
+    pub fn query_gid_type(&self, port_num: u8, gid_index: u32) -> Result<u32, QueryGidError> {
+        let mut gid_type = u32::default();
+        unsafe {
+            match ibv_query_gid_type(self.context.as_ptr(), port_num, gid_index, &mut gid_type) {
+                0 => Ok(gid_type),
+                ret => Err(QueryGidError {
+                    port_num,
+                    gid_index,
+                    source: io::Error::from_raw_os_error(ret).into(),
+                }),
+            }
+        }
+    }
+
+    pub(crate) fn query_gid_table_fallback(&self) -> Result<Vec<GidEntry>, QueryGidTableError> {
+        let mut res = Vec::new();
+        let dev_attr = self.query_device().unwrap();
+        let mut gid_type;
+
+        for port_num in 1..(dev_attr.phys_port_cnt() + 1) {
+            let port_attr = self.query_port(port_num).unwrap();
+
+            let name = self.name();
+
+            if !name.is_empty() {
+                for gid_index in 0..port_attr.gid_tbl_len() {
+                    let gid = self
+                        .query_gid(port_num, gid_index as u32)
+                        .map_err(QueryGidTableErrorKind::QueryGid)?;
+                    let netdev_index;
+
+                    if gid.is_zero() {
+                        continue;
+                    }
+
+                    gid_type = match self
+                        .query_gid_type(port_num, gid_index as u32)
+                        .map_err(QueryGidTableErrorKind::QueryGid)?
+                    {
+                        IBV_GID_TYPE_SYSFS_IB_ROCE_V1 if port_attr.link_layer() == LinkLayer::InfiniBand => {
+                            IBV_GID_TYPE_IB
+                        },
+                        IBV_GID_TYPE_SYSFS_IB_ROCE_V1 if port_attr.link_layer() == LinkLayer::Ethernet => {
+                            IBV_GID_TYPE_ROCE_V1
+                        },
+                        IBV_GID_TYPE_SYSFS_ROCE_V2 => IBV_GID_TYPE_ROCE_V2,
+                        num => panic!("unknown gid type {num}!"),
+                    };
+
+                    let netdev = fs::read_to_string(format!(
+                        "/sys/class/infiniband/{name}/ports/{port_num}/gid_attrs/ndevs/{gid_index}",
+                    ))
+                    .unwrap_or_default()
+                    .trim_ascii_end()
+                    .to_string();
+
+                    unsafe {
+                        netdev_index = libc::if_nametoindex(CString::new(netdev).unwrap_or_default().as_ptr());
+                    }
+
+                    res.push(GidEntry(ibv_gid_entry {
+                        gid: gid.into(),
+                        gid_index: gid_index as u32,
+                        port_num: port_num.into(),
+                        gid_type,
+                        ndev_ifindex: netdev_index,
+                    }))
+                }
+            } else {
+                return Err(QueryGidTableErrorKind::InvalidDeviceName.into());
+            }
+        }
+
+        Ok(res)
+    }
+
+    /// Query all [`GidEntry`]s on a RDMA device.
+    #[inline]
+    pub fn query_gid_table(&self) -> Result<Vec<GidEntry>, QueryGidTableError> {
+        let dev_attr = self.query_device().map_err(QueryGidTableErrorKind::QueryDevice)?;
+
+        let valid_size: isize;
+
+        // According to the man page, the gid table entries array should be able
+        // to contain all the valid GID. Thus we need to accmulate the gid table
+        // len of every port on the device.
+        let size: i32 = (1..(dev_attr.phys_port_cnt() + 1)).fold(0, |acc, port_num| {
+            acc + self.query_port(port_num).unwrap().gid_tbl_len()
+        });
+
+        let mut entries = vec![GidEntry::default(); size as _];
+
+        unsafe {
+            valid_size = ibv_query_gid_table(self.context.as_ptr(), entries.as_mut_ptr() as _, entries.len(), 0);
+        };
+
+        if valid_size == (-libc::EOPNOTSUPP).try_into().unwrap() {
+            return self.query_gid_table_fallback();
+        }
+        if valid_size < 0 {
+            return Err(QueryGidTableErrorKind::Ibverbs(io::Error::from_raw_os_error(-valid_size as i32)).into());
+        }
+
+        entries.truncate(valid_size.try_into().unwrap());
+        Ok(entries)
+    }
+
+    /// Query real-time values from the RDMA device.
+    ///
+    /// Set bits in `mask` to request which values to retrieve. Currently the only defined bit is
+    /// [`ValuesMask::RawClock`], which retrieves the device's free-running hardware clock — useful
+    /// for correlating CQ completion timestamps with wall-clock time.
+    ///
+    /// Returns [`QueryRealTimeValuesErrorKind::NotSupported`] if the driver does not implement this
+    /// operation.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use sideway::ibverbs::device::DeviceList;
+    /// use sideway::ibverbs::device_context::ValuesMask;
+    ///
+    /// let device_list = DeviceList::new().unwrap();
+    /// let device = device_list.get(0).unwrap();
+    /// let context = device.open().unwrap();
+    ///
+    /// let rt = context.query_rt_values_ex(ValuesMask::RawClock).unwrap();
+    /// println!("HW clock: {:?}", rt.raw_clock());
+    /// ```
+    pub fn query_rt_values_ex(&self, mask: ValuesMask) -> Result<RealTimeValues, QueryRealTimeValuesError> {
+        let mut values = std::mem::MaybeUninit::<ibv_values_ex>::uninit();
+        unsafe {
+            (*values.as_mut_ptr()).comp_mask = mask.bits();
+            match ibv_query_rt_values_ex(self.context.as_ptr(), values.as_mut_ptr()) {
+                0 => Ok(RealTimeValues {
+                    inner: values.assume_init(),
+                }),
+                ret if ret == libc::EOPNOTSUPP => Err(QueryRealTimeValuesErrorKind::NotSupported.into()),
+                ret => Err(QueryRealTimeValuesErrorKind::Ibverbs(io::Error::from_raw_os_error(ret)).into()),
+            }
+        }
+    }
+
+    /// # Safety
+    ///
+    /// Return the handle of device context.
+    /// We mark this method unsafe because the lifetime of `ibv_context` is not associated
+    /// with the return value.
+    pub unsafe fn context(&self) -> NonNull<ibv_context> {
+        self.context
+    }
+}
+
+impl DeviceInfo for DeviceContext {
+    fn name(&self) -> String {
+        unsafe {
+            let ctx = self.context.as_ref();
+            let name = ibv_get_device_name(ctx.device);
+            if name.is_null() {
+                String::new()
+            } else {
+                String::from_utf8_lossy(CStr::from_ptr(name).to_bytes()).to_string()
+            }
+        }
+    }
+
+    fn guid(&self) -> Guid {
+        unsafe {
+            let ctx = self.context.as_ref();
+            Guid(ibv_get_device_guid(ctx.device))
+        }
+    }
+
+    fn transport_type(&self) -> TransportType {
+        unsafe {
+            let ctx = self.context.as_ref();
+            (*ctx.device).transport_type.into()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ibverbs::device::{self, DeviceInfo};
+
+    #[test]
+    fn test_query_rt_values_ex() -> Result<(), Box<dyn std::error::Error>> {
+        let device_list = device::DeviceList::new()?;
+        for device in &device_list {
+            let ctx = device.open().unwrap();
+            match ctx.query_rt_values_ex(ValuesMask::RawClock) {
+                Ok(values) => {
+                    // comp_mask must have RawClock set when the driver supports it
+                    assert!(values.comp_mask().contains(ValuesMask::RawClock));
+                    // A running device should have a non-zero clock
+                    let clock = values
+                        .raw_clock()
+                        .expect("RawClock bit set but raw_clock() returned None");
+                    assert!(
+                        clock.counter_hi > 0 || clock.counter_lo > 0,
+                        "raw clock counter should be non-zero"
+                    );
+                },
+                Err(e) => {
+                    // NotSupported is acceptable on some drivers / simulators
+                    assert!(
+                        matches!(e.0, QueryRealTimeValuesErrorKind::NotSupported),
+                        "unexpected error: {e}"
+                    );
+                },
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_mtu_conversion() {
+        assert_eq!(Mtu::from(ibv_mtu::IBV_MTU_256), Mtu::Mtu256);
+        assert_eq!(Mtu::from(ibv_mtu::IBV_MTU_512), Mtu::Mtu512);
+        assert_eq!(Mtu::from(ibv_mtu::IBV_MTU_1024), Mtu::Mtu1024);
+        assert_eq!(Mtu::from(ibv_mtu::IBV_MTU_2048), Mtu::Mtu2048);
+        assert_eq!(Mtu::from(ibv_mtu::IBV_MTU_4096), Mtu::Mtu4096);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unknown MTU value")]
+    fn test_invalid_mtu_conversion() {
+        let _ = Mtu::from(999);
+    }
+
+    #[test]
+    fn test_port_width_conversion() {
+        assert_eq!(PortWidth::from(1), PortWidth::Width1X);
+        assert_eq!(PortWidth::from(16), PortWidth::Width2X);
+        assert_eq!(PortWidth::from(2), PortWidth::Width4X);
+        assert_eq!(PortWidth::from(4), PortWidth::Width8X);
+        assert_eq!(PortWidth::from(8), PortWidth::Width12X);
+    }
+
+    #[test]
+    fn test_port_width_multiplier() {
+        assert_eq!(PortWidth::Width1X as u8, 1);
+        assert_eq!(PortWidth::Width2X as u8, 2);
+        assert_eq!(PortWidth::Width4X as u8, 4);
+        assert_eq!(PortWidth::Width8X as u8, 8);
+        assert_eq!(PortWidth::Width12X as u8, 12);
+    }
+
+    #[test]
+    fn test_port_speed_conversion() {
+        assert_eq!(PortSpeed::from(1), PortSpeed::SingleDataRate);
+        assert_eq!(PortSpeed::from(2), PortSpeed::DoubleDataRate);
+        assert_eq!(PortSpeed::from(4), PortSpeed::QuadrupleDataRate);
+        assert_eq!(PortSpeed::from(8), PortSpeed::FourteenDataRateTen);
+        assert_eq!(PortSpeed::from(16), PortSpeed::FourteenDataRate);
+        assert_eq!(PortSpeed::from(32), PortSpeed::EnhancedDataRate);
+        assert_eq!(PortSpeed::from(64), PortSpeed::HighDataRate);
+        assert_eq!(PortSpeed::from(128), PortSpeed::NextDataRate);
+        assert_eq!(PortSpeed::from(256), PortSpeed::ExtendedDataRate);
+    }
+
+    #[test]
+    fn test_port_speed_rates() {
+        assert_eq!(PortSpeed::SingleDataRate.to_signaling_rate(), 2.5);
+        assert_eq!(PortSpeed::SingleDataRate.to_throughput(), 2.0);
+
+        assert_eq!(PortSpeed::DoubleDataRate.to_signaling_rate(), 5.0);
+        assert_eq!(PortSpeed::DoubleDataRate.to_throughput(), 4.0);
+
+        assert_eq!(PortSpeed::QuadrupleDataRate.to_signaling_rate(), 10.0);
+        assert_eq!(PortSpeed::QuadrupleDataRate.to_throughput(), 8.0);
+
+        assert_eq!(PortSpeed::FourteenDataRateTen.to_signaling_rate(), 10.3125);
+        assert_eq!(PortSpeed::FourteenDataRateTen.to_throughput(), 10.0);
+
+        assert_eq!(PortSpeed::FourteenDataRate.to_signaling_rate(), 14.0625);
+        assert_eq!(PortSpeed::FourteenDataRate.to_throughput(), 13.64);
+
+        assert_eq!(PortSpeed::EnhancedDataRate.to_signaling_rate(), 25.78125);
+        assert_eq!(PortSpeed::EnhancedDataRate.to_throughput(), 25.0);
+
+        assert_eq!(PortSpeed::HighDataRate.to_signaling_rate(), 53.125);
+        assert_eq!(PortSpeed::HighDataRate.to_throughput(), 50.0);
+
+        assert_eq!(PortSpeed::NextDataRate.to_signaling_rate(), 106.25);
+        assert_eq!(PortSpeed::NextDataRate.to_throughput(), 100.0);
+
+        assert_eq!(PortSpeed::ExtendedDataRate.to_signaling_rate(), 250.0);
+        assert_eq!(PortSpeed::ExtendedDataRate.to_throughput(), 250.0);
+    }
+
+    #[test]
+    fn test_link_layer_conversion() {
+        assert_eq!(LinkLayer::from(IBV_LINK_LAYER_UNSPECIFIED), LinkLayer::Unspecified);
+        assert_eq!(LinkLayer::from(IBV_LINK_LAYER_INFINIBAND), LinkLayer::InfiniBand);
+        assert_eq!(LinkLayer::from(IBV_LINK_LAYER_ETHERNET), LinkLayer::Ethernet);
+    }
+
+    #[test]
+    fn test_port_state_conversion() {
+        assert_eq!(PortState::from(0), PortState::Nop);
+        assert_eq!(PortState::from(1), PortState::Down);
+        assert_eq!(PortState::from(2), PortState::Initializing);
+        assert_eq!(PortState::from(3), PortState::Armed);
+        assert_eq!(PortState::from(4), PortState::Active);
+        assert_eq!(PortState::from(5), PortState::ActiveDefer);
+    }
+
+    #[test]
+    fn test_physical_state_conversion() {
+        assert_eq!(PhysicalState::from(0), PhysicalState::NoStateChange);
+        assert_eq!(PhysicalState::from(1), PhysicalState::Sleep);
+        assert_eq!(PhysicalState::from(2), PhysicalState::Polling);
+        assert_eq!(PhysicalState::from(3), PhysicalState::Disabled);
+        assert_eq!(PhysicalState::from(4), PhysicalState::PortConfigurationTraining);
+        assert_eq!(PhysicalState::from(5), PhysicalState::LinkUp);
+        assert_eq!(PhysicalState::from(6), PhysicalState::LinkErrorRecovery);
+        assert_eq!(PhysicalState::from(7), PhysicalState::PhyTest);
+    }
+
+    #[test]
+    fn test_atomic_and_capability_fields() {
+        let mut attr = unsafe { MaybeUninit::<ibv_device_attr_ex>::zeroed().assume_init() };
+        attr.orig_attr.atomic_cap = ibv_atomic_cap::IBV_ATOMIC_HCA;
+        attr.orig_attr.device_cap_flags =
+            (ibv_device_cap_flags::IBV_DEVICE_RESIZE_MAX_WR | ibv_device_cap_flags::IBV_DEVICE_RAW_MULTI).0;
+
+        let attr = DeviceAttr { attr };
+
+        assert_eq!(attr.atomic_capability(), AtomicCapability::HostChannelAdapter);
+        assert_eq!(
+            attr.device_cap_flags(),
+            DeviceCapabilityFlags::ResizeMaxWorkRequest | DeviceCapabilityFlags::RawMulticast
+        );
+    }
+
+    #[test]
+    fn test_hca_core_clock_and_pci_atomic_caps() {
+        let mut attr = unsafe { MaybeUninit::<ibv_device_attr_ex>::zeroed().assume_init() };
+        attr.hca_core_clock = 987_654;
+        attr.pci_atomic_caps.fetch_add = (ibv_pci_atomic_op_size::IBV_PCI_ATOMIC_OPERATION_4_BYTE_SIZE_SUP
+            | ibv_pci_atomic_op_size::IBV_PCI_ATOMIC_OPERATION_8_BYTE_SIZE_SUP)
+            .0 as u16;
+        attr.pci_atomic_caps.swap = ibv_pci_atomic_op_size::IBV_PCI_ATOMIC_OPERATION_16_BYTE_SIZE_SUP.0 as u16;
+        attr.pci_atomic_caps.compare_swap = (ibv_pci_atomic_op_size::IBV_PCI_ATOMIC_OPERATION_4_BYTE_SIZE_SUP
+            | ibv_pci_atomic_op_size::IBV_PCI_ATOMIC_OPERATION_8_BYTE_SIZE_SUP
+            | ibv_pci_atomic_op_size::IBV_PCI_ATOMIC_OPERATION_16_BYTE_SIZE_SUP)
+            .0 as u16;
+
+        let attr = DeviceAttr { attr };
+        let pci_atomic_caps = attr.pci_atomic_caps();
+
+        assert_eq!(attr.hca_core_clock(), 987_654);
+        assert_eq!(
+            pci_atomic_caps.fetch_add(),
+            PciAtomicOperationSize::Size4Byte | PciAtomicOperationSize::Size8Byte
+        );
+        assert_eq!(pci_atomic_caps.swap(), PciAtomicOperationSize::Size16Byte);
+        assert_eq!(
+            pci_atomic_caps.compare_swap(),
+            PciAtomicOperationSize::Size4Byte | PciAtomicOperationSize::Size8Byte | PciAtomicOperationSize::Size16Byte
+        );
+    }
+
+    #[test]
+    fn test_device_attr_raw_accessors() {
+        let mut attr = unsafe { MaybeUninit::<ibv_device_attr_ex>::zeroed().assume_init() };
+        attr.hca_core_clock = 123_456;
+        attr.orig_attr.max_qp = 1024;
+
+        let attr = DeviceAttr { attr };
+
+        assert_eq!(attr.attr.hca_core_clock, 123_456);
+        assert_eq!(attr.attr.orig_attr.max_qp, 1024);
+    }
+
+    #[test]
+    fn test_port_attr_raw_accessor() {
+        let mut attr = unsafe { MaybeUninit::<ibv_port_attr>::zeroed().assume_init() };
+        attr.gid_tbl_len = 128;
+
+        let port_attr = PortAttr { attr };
+
+        assert_eq!(port_attr.attr.gid_tbl_len, 128);
+    }
+
+    #[test]
+    fn test_query_gid_table_fallback() -> Result<(), Box<dyn std::error::Error>> {
+        let device_list = device::DeviceList::new()?;
+        for device in &device_list {
+            let ctx = device.open().unwrap();
+
+            let gid_entries = ctx.query_gid_table().unwrap();
+            let gid_entries_fallback = ctx.query_gid_table_fallback().unwrap();
+
+            assert_eq!(gid_entries.len(), gid_entries_fallback.len());
+            for i in 0..gid_entries.len() {
+                assert_eq!(gid_entries[i].gid(), gid_entries_fallback[i].gid());
+                assert_eq!(gid_entries[i].gid_index(), gid_entries_fallback[i].gid_index());
+                assert_eq!(gid_entries[i].gid_type(), gid_entries_fallback[i].gid_type());
+                assert_eq!(gid_entries[i].netdev_index(), gid_entries_fallback[i].netdev_index());
+                assert_eq!(gid_entries[i].netdev_name(), gid_entries_fallback[i].netdev_name());
+                assert_eq!(gid_entries[i].port_num(), gid_entries_fallback[i].port_num());
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_port_error() -> Result<(), Box<dyn std::error::Error>> {
+        let invalid_port_num: u8 = 255;
+        let device_list = device::DeviceList::new()?;
+        for device in &device_list {
+            let ctx = device.open().unwrap();
+            let error = ctx.query_port(invalid_port_num).err().unwrap();
+            assert_eq!(error.port_num, invalid_port_num);
+            match error.source {
+                QueryPortErrorKind::Ibverbs(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+            };
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_device_info_from_context() -> Result<(), Box<dyn std::error::Error>> {
+        let device_list = device::DeviceList::new()?;
+        for device in &device_list {
+            let ctx = device.open().unwrap();
+            assert_eq!(ctx.name(), device.name());
+            assert_eq!(ctx.guid(), device.guid());
+            assert_eq!(ctx.transport_type(), device.transport_type());
+        }
+        Ok(())
+    }
+}

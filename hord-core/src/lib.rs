@@ -280,15 +280,13 @@ impl RegisteredBuffer {
     }
 }
 
-/// A listening RDMA endpoint. Accepts one connection at a time.
+/// A listening RDMA endpoint. Accepts connections one at a time; each accepted
+/// connection is migrated to its **own** CM event channel, so it can be handed to
+/// another thread and finished/run there while this listener keeps accepting —
+/// a looping, multi-threaded acceptor is race-free.
 ///
-/// Holds the CM event channel its accepted connections share. (The old shim
-/// migrated each accepted `cm_id` to a private per-connection channel via
-/// `rdma_migrate_id`; sideway 0.4.3 doesn't expose that, so accepted connections
-/// observe their CM events on this shared channel. That is correct for a serial
-/// acceptor — one `accept` then run — but a *looping* acceptor that hands
-/// connections to other threads needs per-connection channels. See
-/// SIDEWAY-PORT.md.)
+/// (Per-connection channels rely on `Identifier::migrate` / `rdma_migrate_id`,
+/// currently carried as a local sideway patch — see vendor/sideway/HORD-PATCH.md.)
 pub struct Listener {
     event_channel: Arc<EventChannel>,
     _listen_id: Arc<Identifier>,
@@ -324,14 +322,15 @@ impl Listener {
                         .cm_id()
                         .ok_or_else(|| io::Error::other("connect request carried no cm id"))?;
                     event.ack().map_err(to_io)?;
+                    // Give this connection its own CM event channel, decoupled
+                    // from the listener's, so finishing it (and later watching it
+                    // for disconnect) never competes with the next accept() — a
+                    // looping, multi-threaded acceptor is then race-free. The
+                    // ConnectRequest must be acked (above) before migrating.
+                    let conn_channel = EventChannel::new().map_err(to_io)?;
+                    id.migrate(&conn_channel).map_err(to_io)?;
                     let ep = Endpoint::build(&id, send_wr, recv_wr)?;
-                    let conn = Connection::new(
-                        Arc::clone(&self.event_channel),
-                        id,
-                        ep,
-                        Role::Server,
-                        cm,
-                    );
+                    let conn = Connection::new(conn_channel, id, ep, Role::Server, cm);
                     conn.modify_qp(QueuePairState::Init, true)?;
                     return Ok(conn);
                 }

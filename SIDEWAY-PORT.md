@@ -4,8 +4,9 @@ This branch (`sideway-port`) replaces `hord-core`'s hand-written C shim over
 `librdmacm` + `libibverbs` with the [`sideway`](https://crates.io/crates/sideway)
 crate (a safe rdma-core wrapper), plus `rdma-mummy-sys` for the few calls sideway
 doesn't expose. It also moves the HORD handshake out of RDMA-CM private data into
-a first message over the QP. `main` keeps the C shim; switch between the two
-branches to compare.
+a first message over the QP, and carries one small local sideway patch
+(`Identifier::migrate`, under `vendor/sideway/`) while that lands upstream.
+`main` keeps the C shim; switch between the two branches to compare.
 
 ## The trade
 
@@ -47,13 +48,17 @@ the C.
    So sideway's safe `rdmacm` cannot carry the HORD handshake. **Avoided** by
    moving the handshake to a first message (which is a net win anyway).
 2. **`rdma_migrate_id`** — not exposed (and the raw `cm_id` is private, so it can't
-   be bridged). The C shim gave every accepted connection its own CM event channel
-   by migrating its `cm_id`; without it, accepted connections share the listener's
-   channel. **Correct for a serial acceptor** (accept one, run it — which is what
-   the whole test suite does, all green). A **looping** acceptor that hands
-   connections to other threads (the `server_async` demo) would have a worker's
-   `accept_finish` race the next `accept_begin` on the shared channel — that needs
-   `migrate_id`. This is the one real limitation of the port.
+   be bridged externally). The C shim gave every accepted connection its own CM
+   event channel by migrating its `cm_id`; without it, accepted connections share
+   the listener's channel, so a *looping* acceptor that hands connections to other
+   threads has a worker's `accept_finish` race the next `accept_begin`.
+   **Resolved on this branch** with a small carried patch: `vendor/sideway/` adds
+   `Identifier::migrate` (~30 lines wrapping `rdma_migrate_id`), wired via
+   `[patch.crates-io]`, and `Listener::accept` migrates each accepted connection to
+   its own channel. Exercised by `hord-core`'s `concurrent_accept` test (a looping
+   acceptor + concurrent workers — deadlocks on the shared-channel design, passes
+   here). Filed upstream; drop the patch when it ships (see
+   `vendor/sideway/HORD-PATCH.md`).
 3. **`ConnectionParameter` retry/rnr setters** — only `qp_number` is settable, so
    `CmParams.retry_count`/`rnr_retry_count` aren't plumbed through; sideway's
    defaults (7/7, same as the old shim) are used. Minor; loopback is reliable.
@@ -62,12 +67,15 @@ the C.
    using sideway's documented raw-handle escape hatches (`CompletionQueue::cq()`,
    `CompletionChannel::comp_channel()`) — no fork needed.
 
-Closing gaps 1–3 upstream would let this run on 100% stock sideway with the
-handshake either way and a clean concurrent-accept server.
+Gap 2 is carried as a local patch here (`vendor/sideway/`); closing gaps 1 & 3
+upstream too would let this run on 100% stock sideway with the handshake either
+way.
 
 ## Test status
 
 `cargo test --workspace -- --include-ignored --test-threads=1` is **fully green
 on the host's Soft-RoCE `rxe0`** — including the ignored RDMA tests: handshake +
 CM setup, send/recv/write/write-with-imm, the async reactor (CQ-fd parking +
-peer-disconnect detection), zero-copy, range requests, and protocol splitting.
+peer-disconnect detection), zero-copy, range requests, protocol splitting, and
+`concurrent_accept` (the looping-acceptor/per-connection-channel test for the
+migrate patch).
