@@ -317,7 +317,7 @@ impl Listener {
             match event.event_type() {
                 EventType::ConnectRequest => {
                     // A fresh cm_id for this connection (distinct from the
-                    // listener id). It rides this same event channel.
+                    // listener id); it is migrated to its own channel below.
                     let id = event
                         .cm_id()
                         .ok_or_else(|| io::Error::other("connect request carried no cm id"))?;
@@ -334,7 +334,17 @@ impl Listener {
                     conn.modify_qp(QueuePairState::Init, true)?;
                     return Ok(conn);
                 }
-                // Ignore anything else queued on the listener channel.
+                // Device removal on the listener is terminal — surface it rather
+                // than ack-and-spin (the next get_cm_event would block forever).
+                EventType::DeviceRemoval => {
+                    let _ = event.ack();
+                    return Err(io::Error::other(
+                        "RDMA device removed while listening for connections",
+                    ));
+                }
+                // Other events can legitimately appear on the listener channel
+                // (e.g. a stray TimewaitExit); they are benign — ack and keep
+                // waiting for the next connection request.
                 _ => {
                     let _ = event.ack();
                 }
@@ -657,7 +667,13 @@ impl Connection {
             let mut guard = qp.start_post_send();
             let handle = guard
                 .construct_wr(wr_id, WorkRequestFlags::Signaled)
-                .setup_write_imm(rkey, remote_addr, imm);
+                // The verbs `imm_data` field is `__be32` (network byte order); the
+                // API does no conversion, so we send the big-endian form of the
+                // caller's host-order value. `poll` reverses it with `from_be`.
+                // On a same-endian peer pair `to_be`∘`from_be` is the identity
+                // (loopback unaffected); on a mixed-endian pair the wire carries
+                // canonical network order so the peer reads the right value.
+                .setup_write_imm(rkey, remote_addr, imm.to_be());
             // SAFETY: caller guarantees the local buffer outlives the completion.
             handle.setup_sge(lkey, addr as u64, length);
             guard.post().map_err(to_io)
@@ -671,9 +687,11 @@ impl Connection {
                 Some(wc) => {
                     let opcode = Opcode::from_raw(wc.opcode());
                     // `imm_data` is only meaningful (and only valid to read) for
-                    // a write-with-immediate receive completion.
+                    // a write-with-immediate receive completion. It arrives as
+                    // `__be32` (network byte order); convert back to host order to
+                    // mirror the `to_be` in `post_write_with_imm`.
                     let imm_data = if opcode == Opcode::RecvRdmaWithImm {
-                        wc.imm_data()
+                        u32::from_be(wc.imm_data())
                     } else {
                         0
                     };

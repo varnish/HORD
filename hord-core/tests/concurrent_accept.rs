@@ -14,6 +14,9 @@
 //! to the acceptor (which ignores it) and a `ConnectRequest` to a worker (which
 //! rejects it). Passing this test is the evidence the migrate patch works.
 //!
+//! The whole exchange runs under a watchdog so a regression fails *deterministically*
+//! (a timeout panic) instead of hanging the test process.
+//!
 //! Needs the Soft-RoCE device (see CLAUDE.md), so it is `#[ignore]`d:
 //!
 //! ```sh
@@ -22,20 +25,49 @@
 
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use hord_core::{CmParams, Connection, Listener};
 
 const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
 const PORT: u16 = 18522; // distinct from the write smoke tests (18520/18521)
 const N: usize = 4; // concurrent connections
+const WATCHDOG: Duration = Duration::from_secs(30); // generous; loopback is ~instant
 
 #[test]
 #[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
 fn concurrent_accept_via_migrate() {
+    // Run the whole exchange on a worker thread and bound it: a migrate
+    // regression manifests as a deadlock (a worker's accept_finish never sees
+    // its ESTABLISHED), which without a watchdog would hang forever. recv_timeout
+    // turns that into a clean test failure.
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let runner = thread::spawn(move || {
+        run_concurrent_accept();
+        let _ = done_tx.send(());
+    });
+
+    match done_rx.recv_timeout(WATCHDOG) {
+        Ok(()) => runner.join().expect("test runner panicked"),
+        // Sender dropped without signalling -> the runner panicked; join surfaces it.
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            runner.join().expect("test runner panicked");
+            panic!("test runner exited without completing");
+        }
+        // Still running after the watchdog -> a real deadlock. Do NOT join (it
+        // would block forever); fail loudly. The leaked thread dies with the test.
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+            "concurrent_accept timed out after {WATCHDOG:?} — likely a per-connection \
+             channel (migrate) regression: a worker's accept_finish raced the acceptor"
+        ),
+    }
+}
+
+/// The actual exchange: a looping acceptor finishing each connection on its own
+/// worker thread, with N clients connecting concurrently.
+fn run_concurrent_accept() {
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
-    // Server: loop accepting, each connection finished on its own worker thread
-    // *concurrently* with the next accept().
     let server = thread::spawn(move || {
         let listener = Listener::bind(IP, PORT).expect("bind");
         ready_tx.send(()).expect("signal ready");

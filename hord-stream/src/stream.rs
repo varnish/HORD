@@ -46,6 +46,7 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::os::fd::RawFd;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use hord_core::{
     CmParams, Completion, Connection, Listener, Opcode, RegisteredBuffer, ACCESS_LOCAL_WRITE,
@@ -194,6 +195,12 @@ fn slot_of(wr_id: u64) -> usize {
 // they never reach `handle_completion`.
 const HS_RECV_WR_ID: u64 = u64::MAX;
 const HS_SEND_WR_ID: u64 = u64::MAX - 1;
+
+// Deadline for the first-message handshake exchange. The handshake is one round
+// trip after the QP is established, so this only bounds the pathological case
+// where a peer reaches ESTABLISHED but never sends its handshake (crash, or a
+// non-HORD endpoint) — without it, `exchange_handshake` would spin forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bytes per RDMA-write work request. The NIC segments a single WR into MTU-sized
 /// packets, so one WR can carry a very large payload; we cap it only so an
@@ -493,7 +500,11 @@ impl HordStream {
                 .post_send(HS_SEND_WR_ID, send_ptr, HANDSHAKE_LEN as u32, lkey)?;
         }
 
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
         let (mut got_recv, mut got_send) = (false, false);
+        // Bytes the peer actually sent in its handshake (from the recv
+        // completion); decode only these, never trailing buffer bytes.
+        let mut recv_len = 0usize;
         while !(got_recv && got_send) {
             match self.conn.poll()? {
                 Some(wc) => {
@@ -504,7 +515,10 @@ impl HordStream {
                         )));
                     }
                     match wc.wr_id {
-                        HS_RECV_WR_ID => got_recv = true,
+                        HS_RECV_WR_ID => {
+                            got_recv = true;
+                            recv_len = wc.byte_len as usize;
+                        }
                         HS_SEND_WR_ID => got_send = true,
                         other => {
                             return Err(io::Error::other(format!(
@@ -513,13 +527,25 @@ impl HordStream {
                         }
                     }
                 }
-                None => std::hint::spin_loop(),
+                None => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "peer did not complete the HORD handshake in time",
+                        ));
+                    }
+                    std::hint::spin_loop();
+                }
             }
         }
 
+        // Decode exactly the bytes received (capped at the buffer); a short first
+        // message must not be padded with stale buffer bytes. `Handshake::decode`
+        // rejects anything under 14 bytes.
+        let n = recv_len.min(HANDSHAKE_LEN);
         let mut buf = [0u8; HANDSHAKE_LEN];
         self._handshake.copy_out(0, &mut buf);
-        Handshake::decode(&buf)
+        Handshake::decode(&buf[..n])
     }
 
     fn apply_peer(&mut self, peer: &Handshake) -> io::Result<()> {
