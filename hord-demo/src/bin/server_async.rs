@@ -40,7 +40,7 @@ use hyper_util::rt::TokioIo;
 use hord_async::{AsyncHordStream, SharedAsyncStream};
 use hord_demo::{pattern_byte, pattern_fill_registered};
 use hord_stream::{HordConfig, HordStream, Listener};
-use hord_zerocopy::{RdmaWriteReq, RdmaWriteStatus, HEADER};
+use hord_zerocopy::{RdmaWriteAction, RdmaWriteReq, RdmaWriteStatus, HEADER};
 
 const DEFAULT_BIND: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
 const DEFAULT_PORT: u16 = 4791;
@@ -180,70 +180,69 @@ async fn serve(req: Request<Incoming>, stream: SharedAsyncStream) -> Result<Resp
 /// the client's CQ; otherwise a plain one-sided write. The HTTP response is the
 /// same either way (split vs. plain is purely the delivery mechanism, §7.7.4).
 async fn serve_zero_copy(stream: &SharedAsyncStream, req: &RdmaWriteReq, n: usize) -> Response<DemoBody> {
-    if n as u64 > req.len {
-        eprintln!("[server] -> 413 (zero-copy: too_large object_size={n})");
-        return zc_response(413, RdmaWriteStatus::TooLarge { object_size: n as u64 });
-    }
-    // Use split mode only if the client asked (id present) and we negotiated it
-    // (§7.7.3); otherwise the id is ignored and a plain write is used.
-    let split_id = req.id.filter(|_| stream.split_mode_negotiated());
-
-    if let Some(id) = split_id {
-        // On the *success* path the immediate is delivered (so the data plane's
-        // posted transfer credit is consumed and its poll returns) — even for an
-        // empty body, backed by a 1-byte source (the WR still writes 0 bytes).
-        // NOTE: the 413/too_large early return above and the register_source-500
-        // below do NOT deliver an immediate; per §7.7.7 those are control-plane
-        // fallbacks the client reconciles via the HTTP status, and a data-plane
-        // consumer must bound its wait with a timeout (§7.7.7) rather than assume
-        // every request yields a CQ completion.
-        let src = match stream.register_source(n.max(1)) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[server] register_source failed: {e}");
-                return respond(500, "text/plain", full(b"internal error\n"), None);
-            }
-        };
-        if n > 0 {
-            pattern_fill_registered(&src, n);
+    // The §7.3/§7.7 policy (too-large gate, split vs. plain, the zero-length
+    // 1-byte-source workaround) lives in the library so it can't drift from the
+    // sync `serve_rdma_write`; here we only run the chosen plan with async writes
+    // and map the outcome to HTTP.
+    match RdmaWriteAction::decide(req, n as u64, stream.split_mode_negotiated()) {
+        // Nothing to write — map the status to a code and respond. Matched
+        // exhaustively (no wildcard) so adding an RdmaWriteStatus variant is a
+        // compile error here rather than a silent 200; decide() only ever yields
+        // TooLarge or Complete in this path.
+        RdmaWriteAction::Respond(status) => {
+            let code = match status {
+                RdmaWriteStatus::TooLarge { .. } => 413,
+                RdmaWriteStatus::Complete { .. } | RdmaWriteStatus::Declined => 200,
+            };
+            eprintln!("[server] -> {code} (zero-copy: {})", status.header_value());
+            zc_response(code, status)
         }
-        return match stream.rdma_write_with_imm(&src, 0, req.addr, req.rkey, n, id).await {
-            Ok(()) => {
-                eprintln!("[server] -> 200 (split: complete id={id} bytes_written={n})");
-                zc_response(200, RdmaWriteStatus::Complete { bytes_written: n as u64 })
+        RdmaWriteAction::Write { payload_len, source_len, transfer_id } => {
+            // NOTE: the too_large response above and the register_source-500 below
+            // do NOT deliver an immediate; per §7.7.7 those are control-plane
+            // fallbacks the client reconciles via the HTTP status, and a data-plane
+            // consumer must bound its wait with a timeout rather than assume every
+            // request yields a completion.
+            let src = match stream.register_source(source_len) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[server] register_source failed: {e}");
+                    return respond(500, "text/plain", full(b"internal error\n"), None);
+                }
+            };
+            if payload_len > 0 {
+                pattern_fill_registered(&src, payload_len);
             }
-            Err(e) => {
-                eprintln!("[server] rdma_write_with_imm failed: {e}");
-                respond(500, "text/plain", full(b"rdma write failed\n"), None)
+            // Split mode delivers via write-with-immediate (signalling the client's
+            // data plane on its CQ); plain mode is a one-sided write. The HTTP
+            // response is identical either way (§7.7.4); a mid-write Err puts the QP
+            // in error and the connection will close, so returning anything is
+            // best-effort (§7.4). The logs keep the split/plain distinction (and the
+            // transfer id) so a §7.7 data-plane stall can be correlated server-side.
+            let result = match transfer_id {
+                Some(id) => stream.rdma_write_with_imm(&src, 0, req.addr, req.rkey, payload_len, id).await,
+                None => stream.rdma_write(&src, 0, req.addr, req.rkey, payload_len).await,
+            };
+            match result {
+                Ok(()) => {
+                    match transfer_id {
+                        Some(id) => eprintln!(
+                            "[server] -> 200 (split: complete id={id} bytes_written={payload_len})"
+                        ),
+                        None => eprintln!(
+                            "[server] -> 200 (zero-copy: complete bytes_written={payload_len})"
+                        ),
+                    }
+                    zc_response(200, RdmaWriteStatus::Complete { bytes_written: payload_len as u64 })
+                }
+                Err(e) => {
+                    match transfer_id {
+                        Some(_) => eprintln!("[server] rdma_write_with_imm failed: {e}"),
+                        None => eprintln!("[server] rdma_write failed: {e}"),
+                    }
+                    respond(500, "text/plain", full(b"rdma write failed\n"), None)
+                }
             }
-        };
-    }
-
-    // --- plain zero-copy write (§7.3) ---
-    if n == 0 {
-        // Nothing to place; a zero-length MR is not portable, so short-circuit
-        // (matching the sync hord_zerocopy::serve_rdma_write path) rather than
-        // calling register_source(0)/ibv_reg_mr(.., 0, ..).
-        return zc_response(200, RdmaWriteStatus::Complete { bytes_written: 0 });
-    }
-    let src = match stream.register_source(n) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[server] register_source failed: {e}");
-            return respond(500, "text/plain", full(b"internal error\n"), None);
-        }
-    };
-    pattern_fill_registered(&src, n);
-    match stream.rdma_write(&src, 0, req.addr, req.rkey, n).await {
-        Ok(()) => {
-            eprintln!("[server] -> 200 (zero-copy: complete bytes_written={n})");
-            zc_response(200, RdmaWriteStatus::Complete { bytes_written: n as u64 })
-        }
-        Err(e) => {
-            // Mid-write failure (§7.4): the QP is in error, the connection will
-            // close. Returning anything is best-effort.
-            eprintln!("[server] rdma_write failed: {e}");
-            respond(500, "text/plain", full(b"rdma write failed\n"), None)
         }
     }
 }

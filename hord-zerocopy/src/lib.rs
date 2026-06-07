@@ -246,6 +246,81 @@ impl ZeroCopyRequest {
 
 // ---- server orchestration ----------------------------------------------------
 
+/// The action [`serve_rdma_write`] takes for a given request and object size —
+/// the §7.3 / §7.7 *server policy*, factored out as a pure decision function so
+/// the synchronous library path here and the async demo server share one source
+/// of truth. (They can't share the *mechanism*: one drives the blocking
+/// [`HordStream::rdma_write_all`], the other an async `rdma_write` future — but
+/// the policy that used to drift between them is all here.)
+///
+/// Compute it with [`decide`](Self::decide); then either return the status (for
+/// [`Respond`](Self::Respond)) or run the write with your path's own register /
+/// fill / write calls (for [`Write`](Self::Write)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RdmaWriteAction {
+    /// No write is needed — respond with this status directly. Covers
+    /// [`RdmaWriteStatus::TooLarge`] (object exceeds the client's buffer, §7.4)
+    /// and the zero-length plain-mode case ([`RdmaWriteStatus::Complete`]
+    /// `{ bytes_written: 0 }` — a zero-length MR is not portable and, unlike split
+    /// mode, no data plane is waiting on an immediate, §7.3).
+    Respond(RdmaWriteStatus),
+    /// Deliver the body, then respond [`RdmaWriteStatus::Complete`]
+    /// `{ bytes_written: payload_len }`: register a `source_len`-byte source, fill
+    /// its first `payload_len` bytes, then RDMA-write `payload_len` bytes into the
+    /// client's buffer — with write-with-immediate carrying `transfer_id` if
+    /// `Some` (split mode, §7.7), else a plain one-sided write (§7.3).
+    Write {
+        /// Bytes to write into the client's buffer (the object size; `0` only in
+        /// split mode, where the immediate must still ride an empty body).
+        payload_len: usize,
+        /// Bytes to register as the source MR: `payload_len.max(1)` in split mode
+        /// (a zero-length MR is not portable, so a 1-byte source backs an empty
+        /// body — the WR still writes 0 bytes), `payload_len` otherwise.
+        source_len: usize,
+        /// `Some(id)` delivers via write-with-immediate (split mode, §7.7); `None`
+        /// is a plain one-sided write.
+        transfer_id: Option<u32>,
+    },
+}
+
+impl RdmaWriteAction {
+    /// Decide the action for delivering `object_size` bytes against the client's
+    /// request `req`, given whether protocol splitting was negotiated on the
+    /// connection (`split_negotiated` — pass [`HordStream::split_mode_negotiated`]).
+    /// Pure: no device and no I/O, so it unit-tests on its own.
+    pub fn decide(req: &RdmaWriteReq, object_size: u64, split_negotiated: bool) -> Self {
+        if object_size > req.len {
+            return RdmaWriteAction::Respond(RdmaWriteStatus::TooLarge { object_size });
+        }
+        // The object must fit `usize` to register a source MR and write it — and so
+        // the reported `bytes_written` round-trips `object_size` exactly. On a
+        // 64-bit target this always holds; if it somehow does not, we cannot serve
+        // it zero-copy, so report too_large rather than silently truncating the size.
+        let Ok(n) = usize::try_from(object_size) else {
+            return RdmaWriteAction::Respond(RdmaWriteStatus::TooLarge { object_size });
+        };
+        // Split mode only if the client asked (id present) and we negotiated it
+        // (§7.7.3); otherwise the id is ignored and a plain write is used.
+        let split_id = req.id.filter(|_| split_negotiated);
+        match split_id {
+            Some(transfer_id) => RdmaWriteAction::Write {
+                payload_len: n,
+                source_len: n.max(1),
+                transfer_id: Some(transfer_id),
+            },
+            // Plain mode with nothing to place: short-circuit, no write.
+            None if n == 0 => {
+                RdmaWriteAction::Respond(RdmaWriteStatus::Complete { bytes_written: 0 })
+            }
+            None => RdmaWriteAction::Write {
+                payload_len: n,
+                source_len: n,
+                transfer_id: None,
+            },
+        }
+    }
+}
+
 /// Perform the server side of a zero-copy response (spec §7.3, and §7.7 in split
 /// mode).
 ///
@@ -270,51 +345,42 @@ impl ZeroCopyRequest {
 /// The source region is registered per call and released once the write is
 /// acknowledged. A production server would amortize registration with a pool
 /// (spec §8.3) rather than register per response.
+///
+/// The §7.3/§7.7 decision — too-large, split vs. plain, the zero-length handling —
+/// is [`RdmaWriteAction::decide`]; this function just executes the resulting plan
+/// with the blocking write calls, so the async server can share the same policy.
 pub fn serve_rdma_write(
     stream: &mut HordStream,
     req: &RdmaWriteReq,
     object_size: u64,
     fill: impl FnOnce(&RegisteredBuffer),
 ) -> io::Result<RdmaWriteStatus> {
-    if object_size > req.len {
-        return Ok(RdmaWriteStatus::TooLarge { object_size });
-    }
-    // Use split mode only if the client asked (id present) and we negotiated it;
-    // otherwise the id is ignored (§7.7.3).
-    let split_id = req.id.filter(|_| stream.split_mode_negotiated());
-
-    match split_id {
-        // --- split mode: deliver via write-with-immediate (§7.7) ---
-        Some(transfer_id) => {
-            // The immediate must always be delivered so the data plane's posted
-            // transfer credit is consumed and its `poll_completion` returns — even
-            // for a zero-length object. A zero-length MR is not portable, so back
-            // an empty body with a 1-byte source (the WR still writes 0 bytes).
-            let n = object_size as usize;
-            let src = stream.register_source(n.max(1))?;
-            if n > 0 {
+    match RdmaWriteAction::decide(req, object_size, stream.split_mode_negotiated()) {
+        // Object too large, or an empty body in plain mode: nothing to write —
+        // return the status the caller puts in the response header.
+        RdmaWriteAction::Respond(status) => Ok(status),
+        // Deliver the body: register a source, fill it, and one-sided-write it —
+        // with a write-with-immediate in split mode, else a plain write.
+        RdmaWriteAction::Write {
+            payload_len,
+            source_len,
+            transfer_id,
+        } => {
+            let src = stream.register_source(source_len)?;
+            if payload_len > 0 {
                 fill(&src);
             }
-            stream.rdma_write_all_with_imm(&src, 0, req.addr, req.rkey, n, transfer_id)?;
-            Ok(RdmaWriteStatus::Complete {
-                bytes_written: object_size,
-            })
-        }
-        // --- plain zero-copy write (§7.3) ---
-        None => {
-            if object_size == 0 {
-                // Nothing to place; a zero-length MR is not portable, so
-                // short-circuit (no data plane is waiting in plain mode).
-                return Ok(RdmaWriteStatus::Complete { bytes_written: 0 });
+            match transfer_id {
+                Some(id) => {
+                    stream.rdma_write_all_with_imm(&src, 0, req.addr, req.rkey, payload_len, id)?
+                }
+                None => stream.rdma_write_all(&src, 0, req.addr, req.rkey, payload_len)?,
             }
-            let n = object_size as usize;
-            let src = stream.register_source(n)?;
-            fill(&src);
-            stream.rdma_write_all(&src, 0, req.addr, req.rkey, n)?;
-            // `src` drops here: rdma_write_all blocked until the write completed
-            // and was acked, so no DMA references the MR — deregistration is sound.
+            // `src` drops after the write returns: rdma_write_all{,_with_imm}
+            // blocked until the write completed and was acked, so no DMA
+            // references the MR — deregistration is sound.
             Ok(RdmaWriteStatus::Complete {
-                bytes_written: object_size,
+                bytes_written: payload_len as u64,
             })
         }
     }
@@ -463,6 +529,82 @@ mod tests {
         assert_eq!(RdmaWriteStatus::parse("status=complete"), None); // no bytes_written
         assert_eq!(RdmaWriteStatus::parse("status=too_large"), None); // no object_size
         assert_eq!(RdmaWriteStatus::parse("bytes_written=5"), None); // no status
+    }
+
+    // ---- RdmaWriteAction::decide (the §7.3/§7.7 server policy) ----------------
+
+    /// A request advertising a 1 KiB buffer, optionally requesting split mode.
+    fn req(len: u64, id: Option<u32>) -> RdmaWriteReq {
+        RdmaWriteReq { addr: 0x1000, rkey: 0x2a, len, id }
+    }
+
+    #[test]
+    fn decide_too_large_writes_nothing() {
+        // object_size > buffer -> TooLarge, regardless of split (precedence).
+        let a = RdmaWriteAction::decide(&req(1024, None), 2048, false);
+        assert_eq!(a, RdmaWriteAction::Respond(RdmaWriteStatus::TooLarge { object_size: 2048 }));
+        let split = RdmaWriteAction::decide(&req(1024, Some(7)), 2048, true);
+        assert_eq!(split, RdmaWriteAction::Respond(RdmaWriteStatus::TooLarge { object_size: 2048 }));
+    }
+
+    #[test]
+    fn decide_plain_zero_length_short_circuits() {
+        // Plain mode, empty object: respond Complete{0} with no write (no portable
+        // zero-length MR, and no data plane waiting).
+        let a = RdmaWriteAction::decide(&req(1024, None), 0, false);
+        assert_eq!(a, RdmaWriteAction::Respond(RdmaWriteStatus::Complete { bytes_written: 0 }));
+    }
+
+    #[test]
+    fn decide_plain_write() {
+        let a = RdmaWriteAction::decide(&req(1024, None), 512, false);
+        assert_eq!(
+            a,
+            RdmaWriteAction::Write { payload_len: 512, source_len: 512, transfer_id: None }
+        );
+    }
+
+    #[test]
+    fn decide_split_write() {
+        let a = RdmaWriteAction::decide(&req(1024, Some(42)), 512, true);
+        assert_eq!(
+            a,
+            RdmaWriteAction::Write { payload_len: 512, source_len: 512, transfer_id: Some(42) }
+        );
+    }
+
+    #[test]
+    fn decide_split_zero_length_keeps_immediate_with_one_byte_source() {
+        // Split + empty body: still a Write (the immediate must ride so the data
+        // plane's credit is consumed), backed by a 1-byte source.
+        let a = RdmaWriteAction::decide(&req(1024, Some(9)), 0, true);
+        assert_eq!(
+            a,
+            RdmaWriteAction::Write { payload_len: 0, source_len: 1, transfer_id: Some(9) }
+        );
+    }
+
+    #[test]
+    fn decide_ignores_id_when_split_not_negotiated() {
+        // id present but split not negotiated (§7.7.3): falls back to a plain
+        // write — and to the plain zero-length short-circuit for an empty body.
+        let a = RdmaWriteAction::decide(&req(1024, Some(5)), 512, false);
+        assert_eq!(
+            a,
+            RdmaWriteAction::Write { payload_len: 512, source_len: 512, transfer_id: None }
+        );
+        let empty = RdmaWriteAction::decide(&req(1024, Some(5)), 0, false);
+        assert_eq!(empty, RdmaWriteAction::Respond(RdmaWriteStatus::Complete { bytes_written: 0 }));
+    }
+
+    #[test]
+    fn decide_exact_fit_is_not_too_large() {
+        // object_size == buffer len fits (the gate is strictly greater-than).
+        let a = RdmaWriteAction::decide(&req(1024, None), 1024, false);
+        assert_eq!(
+            a,
+            RdmaWriteAction::Write { payload_len: 1024, source_len: 1024, transfer_id: None }
+        );
     }
 
     #[test]
