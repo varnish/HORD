@@ -26,16 +26,25 @@
 //!
 //! ## Driver model
 //!
-//! The stream is meant to be driven by a **single task** — one state machine
-//! that reads and writes in turn. That is exactly how `hyper` drives a
-//! connection (read the request, write the response), so it is the case that
-//! matters. Splitting the stream with [`tokio::io::split`] and driving the read
-//! and write halves from two *independent* tasks is **not** supported: both
-//! halves would wait on the one completion-channel fd, and a single completion
-//! stream carries events for both directions, so waking the correct half would
-//! need a multi-waiter scheme this prototype does not implement. Concurrent
-//! bidirectional traffic from one task (the busy-poll path's
-//! `full_duplex_bulk`) is fine; two tasks over `split` can stall.
+//! [`AsyncHordStream`] itself is meant to be driven by a **single task** — one
+//! state machine that reads and writes in turn. That is exactly how `hyper`
+//! drives a connection (read the request, write the response), so it is the case
+//! that matters, and it is the only mode in which `AsyncHordStream`'s own
+//! `AsyncRead`/`AsyncWrite` impls are sound: every `poll_*` arms and drains the
+//! one completion-channel fd itself, so two *independent* tasks each polling it
+//! (e.g. via [`tokio::io::split`]) would clobber each other's waker and steal
+//! each other's completions.
+//!
+//! For genuinely concurrent, independently-scheduled halves, use
+//! [`AsyncHordStream::into_split`] instead of `tokio::io::split`: it spawns one
+//! **pump** task that owns the fd and drains the CQ, and hands back a
+//! [`ReadHalf`], [`WriteHalf`], and [`DataPlane`] that each park on a shared
+//! waker list rather than on the fd. That is the multi-waiter scheme — it makes
+//! two-task duplex and a separate split-mode (§7.7) data-plane consumer work
+//! (see [`into_split`](AsyncHordStream::into_split)). The underlying
+//! [`HordStream`] was always full-duplex-correct (the sync `full_duplex_bulk`
+//! test proves it); it only lacked a way to be driven from more than one async
+//! task.
 //!
 //! ## Zero-copy (spec §7)
 //!
@@ -61,7 +70,7 @@ use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -236,79 +245,168 @@ impl AsyncHordStream {
     /// `poll_rdma_write`: same reactor, no flow-control logic duplicated.
     fn poll_split_completion(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<u32>>> {
         loop {
-            // Queued completions win even after a half-close — the payload landed
-            // before the peer went away.
-            if let Some(id) = self.stream.next_completed_transfer() {
-                return Poll::Ready(Ok(Some(id)));
+            if let Some(result) = next_transfer(&mut self.stream) {
+                return Poll::Ready(Ok(result));
             }
-            if self.stream.is_closed() {
-                return Poll::Ready(Ok(None));
-            }
-            match self.poll_events(cx)? {
-                Poll::Ready(()) => continue,
-                Poll::Pending => return Poll::Pending,
-            }
+            std::task::ready!(self.poll_events(cx))?;
         }
     }
 
-    /// Best-effort, non-blocking half-close check via the CM fd. Returns `true`
-    /// if it just marked the stream closed.
-    fn poll_cm_disconnect(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
-        let Some(cm) = self.cm.as_ref() else {
-            return Ok(false);
-        };
+    /// Drive the completion (and CM) fds for the single-task driver: a thin
+    /// wrapper that hands its owned `stream`/`cq`/`cm` to the shared
+    /// [`poll_reactor`] (the multi-waiter pump drives the same core through a
+    /// `RefCell`). `Ready(())` means the state advanced — completions were drained
+    /// or the peer closed — so the caller should retry its `try_*` operation;
+    /// `Pending` means the task is parked on the reactor.
+    fn poll_events(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        poll_reactor(&mut self.stream, &self.cq, &self.cm, cx)
+    }
+}
+
+// ---- shared reactor core (single-task driver + multi-waiter pump) -----------
+//
+// These free functions are the non-blocking heart of both drivers. The
+// single-task `AsyncHordStream` owns `stream`/`cq`/`cm` and drives them inline
+// (looping on `poll_events`); the multi-waiter pump ([`pump_loop`]) reaches the
+// same `stream` through a `RefCell`. Both call these, so the credit logic, the
+// EOF/closed semantics, the flush barrier, and the completion-channel race guard
+// live in exactly one place rather than drifting between the two paths.
+
+/// One reactor step: drain the CQ, check for a peer half-close, then arm + park
+/// on the completion-channel fd. `Ready(())` means the state advanced (drained,
+/// or the peer closed) and the caller should retry its `try_*` op; `Pending`
+/// means parked on the fd(s).
+///
+/// The arm/drain ordering closes the classic completion-channel race: we arm the
+/// CQ and then drain again, so a completion landing between the first drain and
+/// the arm is still seen (it is now in the CQ), and any later one triggers a
+/// notification on the armed channel.
+fn poll_reactor(
+    stream: &mut HordStream,
+    cq: &AsyncFd<ReactorFd>,
+    cm: &Option<AsyncFd<ReactorFd>>,
+    cx: &mut Context<'_>,
+) -> Poll<io::Result<()>> {
+    // 1. Anything already sitting in the CQ.
+    if stream.drain_completions()? > 0 {
+        return Poll::Ready(Ok(()));
+    }
+    // 2. Peer-initiated half-close.
+    if poll_cm_event(stream, cm, cx)? {
+        return Poll::Ready(Ok(()));
+    }
+    // 3. Arm, then drain again to close the arm race.
+    stream.arm_cq()?;
+    if stream.drain_completions()? > 0 {
+        return Poll::Ready(Ok(()));
+    }
+    // 4. Park on the completion-channel fd.
+    loop {
+        let mut guard = std::task::ready!(cq.poll_read_ready(cx))?;
+        // The fd signalled: consume the notification (drains the fd so it is no
+        // longer readable), re-arm for the next one, and drain the CQ.
+        stream.consume_cq_events();
+        stream.arm_cq()?;
+        let drained = stream.drain_completions()?;
+        guard.clear_ready();
+        if drained > 0 {
+            return Poll::Ready(Ok(()));
+        }
+        // The notification carried no work we hadn't already drained (or was
+        // spurious). We re-armed and cleared readiness, so loop to re-park.
+    }
+}
+
+/// Best-effort, non-blocking peer-half-close check via the CM fd. Returns `true`
+/// if it just marked the stream closed.
+///
+/// On a *non-teardown* CM event it loops: the next `poll_read_ready` re-checks
+/// the fd and, once no event remains, returns `Pending` and re-registers the
+/// waker — so a *later* disconnect still wakes the driver. Without this re-arm a
+/// driver that consumed a non-teardown event would stop watching the CM fd until
+/// some unrelated CQ completion happened to re-enter the reactor (harmless for
+/// the single-task path, which re-enters on every poll, but a latent miss for the
+/// pump, which only re-enters on a wake).
+fn poll_cm_event(
+    stream: &mut HordStream,
+    cm: &Option<AsyncFd<ReactorFd>>,
+    cx: &mut Context<'_>,
+) -> io::Result<bool> {
+    let Some(cm) = cm.as_ref() else {
+        return Ok(false);
+    };
+    loop {
         match cm.poll_read_ready(cx) {
             Poll::Ready(Ok(mut guard)) => {
-                let disconnected = self.stream.check_disconnect()?;
+                let disconnected = stream.check_disconnect()?;
                 guard.clear_ready();
                 if disconnected {
-                    self.stream.mark_closed();
+                    stream.mark_closed();
+                    return Ok(true);
                 }
-                Ok(disconnected)
+                // Non-teardown event (or spurious readiness): loop to re-poll,
+                // which re-registers the waker on the next `Pending`.
             }
-            Poll::Ready(Err(e)) => Err(e),
-            Poll::Pending => Ok(false),
+            Poll::Ready(Err(e)) => return Err(e),
+            Poll::Pending => return Ok(false),
         }
     }
+}
 
-    /// Drive the completion (and CM) fds. `Ready(())` means the state advanced —
-    /// completions were drained or the peer closed — so the caller should retry
-    /// its `try_*` operation; `Pending` means the task is parked on the reactor.
-    ///
-    /// The arm/drain ordering closes the classic completion-channel race: we arm
-    /// the CQ and then drain again, so a completion that lands between the first
-    /// drain and the arm is still seen (it is now in the CQ), and any later one
-    /// triggers a notification on the armed channel.
-    fn poll_events(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // 1. Anything already sitting in the CQ.
-        if self.stream.drain_completions()? > 0 {
-            return Poll::Ready(Ok(()));
+/// One non-blocking read attempt into `buf`. `Ok(true)` means resolve `poll_read`
+/// as `Ready` (bytes were read, or EOF); `Ok(false)` means no data is buffered
+/// yet and the caller should park — owed credits have been returned first, so a
+/// peer blocked on us (the #3 path) can make progress.
+fn try_read_into(stream: &mut HordStream, buf: &mut ReadBuf<'_>) -> io::Result<bool> {
+    match stream.try_read(buf.initialize_unfilled())? {
+        // EOF (or the caller passed a full buffer): no bytes, Ready.
+        Some(0) => Ok(true),
+        Some(n) => {
+            buf.advance(n);
+            Ok(true)
         }
-        // 2. Peer-initiated half-close.
-        if self.poll_cm_disconnect(cx)? {
-            return Poll::Ready(Ok(()));
-        }
-        // 3. Arm, then drain again to close the arm race.
-        self.stream.arm_cq()?;
-        if self.stream.drain_completions()? > 0 {
-            return Poll::Ready(Ok(()));
-        }
-        // 4. Park on the completion-channel fd.
-        loop {
-            let mut guard = std::task::ready!(self.cq.poll_read_ready(cx))?;
-            // The fd signalled: consume the notification (drains the fd so it is
-            // no longer readable), re-arm for the next one, and drain the CQ.
-            self.stream.consume_cq_events();
-            self.stream.arm_cq()?;
-            let drained = self.stream.drain_completions()?;
-            guard.clear_ready();
-            if drained > 0 {
-                return Poll::Ready(Ok(()));
-            }
-            // The notification carried no work we hadn't already drained (or was
-            // spurious). We re-armed and cleared readiness, so loop to re-park.
+        None => {
+            stream.return_owed_credits(true)?;
+            Ok(false)
         }
     }
+}
+
+/// One non-blocking write attempt. `Some(n)` means `n` bytes were accepted
+/// (resolve `poll_write` as `Ready`); `None` means no slot/credit right now and
+/// the caller should park. `try_write` errors if the stream is closed.
+fn try_write_from(stream: &mut HordStream, buf: &[u8]) -> io::Result<Option<usize>> {
+    let n = stream.try_write(buf)?;
+    Ok((n > 0).then_some(n))
+}
+
+/// The flush delivery barrier. `Ok(true)` means every staged message is sent and
+/// every data send *and* one-sided RDMA write is acknowledged (an RC completion
+/// == delivered + acked); `Ok(false)` means the caller should park;
+/// `Err(BrokenPipe)` if the connection closed before all sends were acked.
+fn poll_flush_ready(stream: &mut HordStream) -> io::Result<bool> {
+    let stage_clear = stream.try_flush_stage()?;
+    if stage_clear && !stream.sends_outstanding() && !stream.writes_pending() {
+        return Ok(true);
+    }
+    if stream.is_closed() {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "connection closed before all sends were acknowledged",
+        ));
+    }
+    Ok(false)
+}
+
+/// Next split-mode (§7.7) transfer outcome, or `None` if the caller should park.
+/// `Some(Some(id))` is a completed transfer; `Some(None)` is end-of-stream (the
+/// connection closed with none queued). Queued completions win even after a
+/// half-close — the payload landed before the peer went away.
+fn next_transfer(stream: &mut HordStream) -> Option<Option<u32>> {
+    if let Some(id) = stream.next_completed_transfer() {
+        return Some(Some(id));
+    }
+    stream.is_closed().then_some(None)
 }
 
 impl AsyncRead for AsyncHordStream {
@@ -319,21 +417,10 @@ impl AsyncRead for AsyncHordStream {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         loop {
-            match this.stream.try_read(buf.initialize_unfilled())? {
-                // EOF (or the caller passed a full buffer): no bytes, Ready.
-                Some(0) => return Poll::Ready(Ok(())),
-                Some(n) => {
-                    buf.advance(n);
-                    return Poll::Ready(Ok(()));
-                }
-                None => {} // no data buffered yet — wait for a completion
+            if try_read_into(&mut this.stream, buf)? {
+                return Poll::Ready(Ok(()));
             }
-            // Return owed credits so the peer can keep sending, then park.
-            this.stream.return_owed_credits(true)?;
-            match this.poll_events(cx)? {
-                Poll::Ready(()) => continue,
-                Poll::Pending => return Poll::Pending,
-            }
+            std::task::ready!(this.poll_events(cx))?;
         }
     }
 }
@@ -349,44 +436,26 @@ impl AsyncWrite for AsyncHordStream {
             return Poll::Ready(Ok(0));
         }
         loop {
-            // try_write errors if the stream is closed, accepts >0 bytes if it
-            // can make progress, or returns 0 when blocked on a slot/credit.
-            let n = this.stream.try_write(buf)?;
-            if n > 0 {
+            if let Some(n) = try_write_from(&mut this.stream, buf)? {
                 return Poll::Ready(Ok(n));
             }
-            match this.poll_events(cx)? {
-                Poll::Ready(()) => continue,
-                Poll::Pending => return Poll::Pending,
-            }
+            std::task::ready!(this.poll_events(cx))?;
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         loop {
-            // Emit any staged partial message, then wait for every data send
-            // *and* one-sided RDMA write to be acknowledged (an RC completion ==
-            // delivered + acked) — flush is a full delivery barrier.
-            let stage_clear = this.stream.try_flush_stage()?;
-            if stage_clear && !this.stream.sends_outstanding() && !this.stream.writes_pending() {
+            if poll_flush_ready(&mut this.stream)? {
                 return Poll::Ready(Ok(()));
             }
-            if this.stream.is_closed() {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "connection closed before all sends were acknowledged",
-                )));
-            }
-            match this.poll_events(cx)? {
-                Poll::Ready(()) => continue,
-                Poll::Pending => return Poll::Pending,
-            }
+            std::task::ready!(this.poll_events(cx))?;
         }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Deliver everything, then begin a graceful disconnect.
+        // This type owns the whole stream, so a shutdown closes the connection:
+        // deliver everything, then begin a graceful disconnect.
         std::task::ready!(self.as_mut().poll_flush(cx))?;
         self.stream.disconnect();
         Poll::Ready(Ok(()))
@@ -571,5 +640,301 @@ impl AsyncWrite for SharedAsyncStream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut inner = self.get_mut().0.borrow_mut();
         Pin::new(&mut *inner).poll_shutdown(cx)
+    }
+}
+
+// ======================= Multi-waiter split (pump model) =====================
+//
+// One RC connection has a single CQ and a single completion-channel fd, and the
+// completions on it are interleaved across directions (recv data, send acks,
+// one-sided RDMA-write acks, split-mode immediates). `AsyncHordStream` drives all
+// of that from one task by having each `poll_*` arm + drain the fd itself — fine
+// for a single state machine, but two independent tasks each parking on the one
+// fd would clobber each other's waker (Tokio's `AsyncFd` holds ~one waker per
+// direction) and steal each other's completions.
+//
+// `into_split` closes that gap with a classic reactor split: exactly one **pump**
+// task owns the fd, drains the CQ, and wakes every parked handle after each
+// drain; the handles never touch the fd — they run the same non-blocking
+// `HordStream` primitives the single-task path does, and re-park on a shared
+// waker list. The state machine is unchanged; it gains a second (and third)
+// driving task, nothing more.
+
+/// State shared between the pump task and the split handles for one connection.
+struct Shared {
+    /// Wakers of handles parked waiting for the CQ to advance. Wake-all: after any
+    /// drain every parked handle re-checks its own predicate (cheap, and it keeps
+    /// the pump oblivious to which completion belongs to which handle). Drained
+    /// when the pump wakes everyone, so it stays bounded by the live parked count.
+    wakers: RefCell<Vec<Waker>>,
+    // Drop order is load-bearing (as in `AsyncHordStream`): the `AsyncFd`s must
+    // deregister from the reactor *before* `HordStream`'s Drop closes their fds.
+    // Struct fields drop in declaration order, so the fds precede `stream`.
+    cq: AsyncFd<ReactorFd>,
+    cm: Option<AsyncFd<ReactorFd>>,
+    stream: RefCell<HordStream>,
+}
+
+impl Shared {
+    /// Park the **pump** on the reactor and drain the CQ, via the shared
+    /// [`poll_reactor`] — the borrow is taken only across `poll_reactor`'s
+    /// synchronous work and dropped when it returns, so the pump never holds it
+    /// across the `.await` in [`pump_loop`] and the handles can borrow freely when
+    /// they run (the current-thread executor never interleaves them mid-poll).
+    /// `Ready(())` means the state advanced; `Pending` means parked on the fd(s).
+    fn drive_once(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        poll_reactor(&mut self.stream.borrow_mut(), &self.cq, &self.cm, cx)
+    }
+
+    /// Record `cx`'s waker so the pump wakes this handle on the next drain.
+    /// De-duplicated via [`Waker::will_wake`]; because the pump drains the list
+    /// when it wakes everyone, it stays bounded by the count of parked handles.
+    fn register(&self, cx: &Context<'_>) {
+        let waker = cx.waker();
+        let mut wakers = self.wakers.borrow_mut();
+        if !wakers.iter().any(|w| w.will_wake(waker)) {
+            wakers.push(waker.clone());
+        }
+    }
+
+    /// Wake every parked handle (wake-all). Takes the list first so the wakes
+    /// happen with no borrow held and it is left empty for re-registration.
+    fn wake_all(&self) {
+        let woken = std::mem::take(&mut *self.wakers.borrow_mut());
+        for w in woken {
+            w.wake();
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.stream.borrow().is_closed()
+    }
+}
+
+/// The single task that owns the completion fd for a split stream: park, drain,
+/// wake every handle, repeat — until the connection closes (then wake once more
+/// so parked handles observe EOF/abort, and exit). Spawned by
+/// [`AsyncHordStream::into_split`] and aborted by [`PumpGuard`] when the last
+/// handle drops, so it never outlives the handles nor spins on a dead connection.
+async fn pump_loop(shared: Rc<Shared>) {
+    loop {
+        match std::future::poll_fn(|cx| shared.drive_once(cx)).await {
+            // The state advanced (a drain or a CM close) — wake everyone to
+            // re-check their predicate, then stop if the connection has closed.
+            Ok(()) => {
+                shared.wake_all();
+                if shared.is_closed() {
+                    break;
+                }
+            }
+            // The reactor fd errored: no further progress is possible, so mark the
+            // stream closed and wake every handle to surface it, then stop.
+            Err(_) => {
+                shared.stream.borrow_mut().mark_closed();
+                shared.wake_all();
+                break;
+            }
+        }
+    }
+}
+
+/// Aborts the pump task when the last split handle drops. Held by every handle
+/// behind an `Rc`, so the pump lives exactly as long as some handle does. The
+/// pump also holds its own `Rc<Shared>`, so `Shared` (and the fds + stream it
+/// owns) is torn down only once the pump has stopped — never out from under it.
+struct PumpGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for PumpGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The handles [`AsyncHordStream::into_split`] yields. Move each to its own task;
+/// the shared pump keeps driving the connection until all of them are dropped.
+/// Take the ones you need and drop the rest (dropping a subset does not stop the
+/// pump — only dropping the last handle does).
+pub struct SplitParts {
+    /// Read half — [`AsyncRead`], drivable from its own task.
+    pub read: ReadHalf,
+    /// Write half — [`AsyncWrite`], drivable from its own task.
+    pub write: WriteHalf,
+    /// Split-mode (§7.7) data plane + buffer registration / negotiation accessors.
+    pub data: DataPlane,
+}
+
+/// Read half of a split [`AsyncHordStream`] — an [`AsyncRead`] that can be driven
+/// from a task independent of the [`WriteHalf`].
+pub struct ReadHalf {
+    shared: Rc<Shared>,
+    _pump: Rc<PumpGuard>,
+}
+
+/// Write half of a split [`AsyncHordStream`] — an [`AsyncWrite`] that can be
+/// driven from a task independent of the [`ReadHalf`].
+pub struct WriteHalf {
+    shared: Rc<Shared>,
+    _pump: Rc<PumpGuard>,
+}
+
+/// Data-plane handle of a split [`AsyncHordStream`]: split-mode (§7.7) transfer
+/// completions, plus the buffer-registration and negotiation accessors. Drivable
+/// from its own task, concurrently with the HTTP control plane on the
+/// [`ReadHalf`] / [`WriteHalf`] — the multi-waiter case the single-task driver
+/// could not serve.
+///
+/// In split mode, hold this for as long as the peer may RDMA-write-with-immediate
+/// (i.e. while the [`WriteHalf`] issues id-bearing requests) and keep calling
+/// [`next_split_completion`](Self::next_split_completion): each arriving transfer
+/// pushes its id onto an in-stream queue, which only the `DataPlane` drains.
+/// Dropping it while transfers keep arriving lets that queue grow unbounded (the
+/// pre-existing §7.7.5 "repost immediately" backpressure gap — entries are 4
+/// bytes, bounded by the peer's outstanding requests), so dropping `DataPlane`
+/// while still issuing split requests is unsupported.
+pub struct DataPlane {
+    shared: Rc<Shared>,
+    _pump: Rc<PumpGuard>,
+}
+
+impl AsyncHordStream {
+    /// Split into independently-pollable handles that can be driven from
+    /// **separate tasks** — the multi-waiter scheme that the single-task driver
+    /// (and [`tokio::io::split`]) cannot provide for a HORD stream.
+    ///
+    /// Spawns one **pump** task (via [`tokio::task::spawn_local`]) that owns the
+    /// completion fd and drains the CQ for all handles, so each handle just runs
+    /// its non-blocking `HordStream` primitive and parks on a shared waker list.
+    /// The pump is `!Send` (it drives the `!Send` stream), so **this must be
+    /// called from within a [`tokio::task::LocalSet`]** — e.g. the current-thread
+    /// runtime + `LocalSet` the async server/demo already use — and panics
+    /// otherwise, like any `spawn_local`. The pump is aborted automatically once
+    /// every returned handle has been dropped.
+    ///
+    /// Returns a [`SplitParts`]; use the [`ReadHalf`] / [`WriteHalf`] for two-task
+    /// duplex and/or the [`DataPlane`] for a separate split-mode consumer.
+    pub fn into_split(self) -> SplitParts {
+        // `AsyncHordStream` has no `Drop` impl, so destructuring moves the fds and
+        // the stream out wholesale (the careful field-drop order now lives on
+        // `Shared` instead).
+        let AsyncHordStream { cq, cm, stream } = self;
+        let shared = Rc::new(Shared {
+            wakers: RefCell::new(Vec::new()),
+            cq,
+            cm,
+            stream: RefCell::new(stream),
+        });
+        let pump = tokio::task::spawn_local(pump_loop(Rc::clone(&shared)));
+        let guard = Rc::new(PumpGuard(pump));
+        SplitParts {
+            read: ReadHalf {
+                shared: Rc::clone(&shared),
+                _pump: Rc::clone(&guard),
+            },
+            write: WriteHalf {
+                shared: Rc::clone(&shared),
+                _pump: Rc::clone(&guard),
+            },
+            data: DataPlane { shared, _pump: guard },
+        }
+    }
+}
+
+impl AsyncRead for ReadHalf {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if try_read_into(&mut this.shared.stream.borrow_mut(), buf)? {
+            return Poll::Ready(Ok(()));
+        }
+        // Register *before* yielding: the pump runs only once we return Pending
+        // (single-threaded executor), so a drain that wakes us can't be lost.
+        this.shared.register(cx);
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for WriteHalf {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if let Some(n) = try_write_from(&mut this.shared.stream.borrow_mut(), buf)? {
+            return Poll::Ready(Ok(n));
+        }
+        this.shared.register(cx);
+        Poll::Pending
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if poll_flush_ready(&mut this.shared.stream.borrow_mut())? {
+            return Poll::Ready(Ok(()));
+        }
+        this.shared.register(cx);
+        Poll::Pending
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Flush ONLY — do not disconnect. HORD has no wire-level half-close, and
+        // the connection is shared with the ReadHalf (and DataPlane), so shutting
+        // down the writer must not tear the whole connection down (which would
+        // abort an independent reader mid-response). The connection closes when
+        // every handle is dropped; for an explicit close use `DataPlane::disconnect`.
+        self.poll_flush(cx)
+    }
+}
+
+impl DataPlane {
+    /// Whether the zero-copy extension was negotiated. See
+    /// [`AsyncHordStream::zero_copy_negotiated`].
+    pub fn zero_copy_negotiated(&self) -> bool {
+        self.shared.stream.borrow().zero_copy_negotiated()
+    }
+
+    /// Whether protocol splitting (§7.7) was negotiated. See
+    /// [`AsyncHordStream::split_mode_negotiated`].
+    pub fn split_mode_negotiated(&self) -> bool {
+        self.shared.stream.borrow().split_mode_negotiated()
+    }
+
+    /// Register a destination buffer the peer may RDMA-write into (consumer side).
+    /// See [`AsyncHordStream::register_remote_writable`].
+    pub fn register_remote_writable(&self, len: usize) -> io::Result<RegisteredBuffer> {
+        self.shared.stream.borrow().register_remote_writable(len)
+    }
+
+    /// Register a source buffer to RDMA-write from (producer side).
+    /// See [`AsyncHordStream::register_source`].
+    pub fn register_source(&self, len: usize) -> io::Result<RegisteredBuffer> {
+        self.shared.stream.borrow().register_source(len)
+    }
+
+    /// Best-effort graceful disconnect of the whole connection.
+    pub fn disconnect(&self) {
+        self.shared.stream.borrow().disconnect();
+    }
+
+    fn poll_next(&self, cx: &mut Context<'_>) -> Poll<io::Result<Option<u32>>> {
+        if let Some(result) = next_transfer(&mut self.shared.stream.borrow_mut()) {
+            return Poll::Ready(Ok(result));
+        }
+        self.shared.register(cx);
+        Poll::Pending
+    }
+
+    /// Receive the next split-mode (§7.7) transfer completion off the CQ,
+    /// returning its 32-bit transfer ID — or `None` once the connection has closed
+    /// with none left queued. Parks on the shared pump, so it can run on its own
+    /// task concurrently with the HTTP control plane on the read/write halves.
+    pub async fn next_split_completion(&self) -> io::Result<Option<u32>> {
+        std::future::poll_fn(|cx| self.poll_next(cx)).await
     }
 }

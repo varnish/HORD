@@ -13,7 +13,10 @@ repository.workspace = true
 # host with only a C compiler and rdma-core).
 [dependencies]
 hord-stream = { path = "../hord-stream" }
-tokio = { version = "1", features = ["net", "io-util", "time"] }
+# "rt" is needed for `spawn_local` + `JoinHandle`: the multi-waiter split
+# (`AsyncHordStream::into_split`) drives the shared completion fd from one pump
+# task while the read/write/data handles run on their own tasks.
+tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros", "sync"] }

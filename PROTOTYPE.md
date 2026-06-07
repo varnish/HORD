@@ -195,14 +195,22 @@ demos) cleared the last copy on the data path:
 
 What remains:
 
-- **Single-task driver.** The async stream is built for one driving task (as
-  `hyper` uses it); two tasks over `tokio::io::split` would both wait on the one
-  completion fd and need a multi-waiter scheme. (`SharedAsyncStream` keeps a
-  zero-copy write on that *same* one task — it does not add a second waiter.)
-  This is also why the §7.7 *data plane* shares the control plane's task rather
-  than running as an independent HTTP-unaware consumer thread polling the shared
-  CQ directly — the spec's intended split. The mechanism (write-with-immediate,
-  opcode demux, demux-by-ID) is all there; only the second waiter is deferred.
+- **Multi-task driving — done (`AsyncHordStream::into_split`).** A single RC
+  connection has one CQ and one completion fd carrying interleaved completions
+  for every direction, so two tasks each parking on that fd (e.g. via
+  `tokio::io::split`) clobber each other's waker and steal each other's
+  completions — the async stream's own `poll_*` impls are sound only for one
+  driving task (as `hyper` uses it). `into_split` resolves this with a reactor
+  split: one **pump** task owns the fd, drains the CQ, and wakes every parked
+  handle after each drain; the returned `ReadHalf` / `WriteHalf` / `DataPlane`
+  never touch the fd — they run the same non-blocking `HordStream` primitives and
+  re-park on a shared waker list. This makes two-task full-duplex work (test
+  `async_full_duplex_split`, 16 MiB each way) and lets the §7.7 *data plane* run
+  as an independent HTTP-unaware consumer on its own task, concurrent with the
+  control plane (test `split_data_plane_separate_task`) — the spec's intended
+  split. The `HordStream` state machine was unchanged; it only ever lacked a way
+  to be driven from more than one async task. (`SharedAsyncStream` still keeps a
+  zero-copy write on the *single* hyper task and is the right tool there.)
 - **Thread-per-connection, not thread-per-core.** A real server would use a
   bounded worker pool with `spawn_local`, not one OS thread per connection.
 - **Zero-copy source registered per response.** The server registers (and frees)

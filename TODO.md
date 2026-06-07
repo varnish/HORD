@@ -5,10 +5,19 @@
 - [ ] A zero-copy *source* buffer pool on the server (amortize registration —
       §8.3) instead of registering per response. Also covers the split-mode
       source registered per response.
-- [ ] Concurrent independent read+write on one async stream (two tasks over
-      `tokio::io::split`) needs a multi-waiter scheme on the completion fd. The
-      same gap blocks a true HTTP-unaware split *data-plane* consumer running on
-      its own thread; for now it shares the control plane's driver task.
+- [x] **Multi-waiter completion-fd scheme — done (`AsyncHordStream::into_split`).**
+      Concurrent independent read+write on one async stream (two tasks, replacing
+      `tokio::io::split`) and a true HTTP-unaware split *data-plane* consumer on
+      its own task both needed a multi-waiter scheme on the one completion fd.
+      Done as a reactor split: one **pump** task owns the fd / drains the CQ /
+      wakes all parked handles (wake-all), and `into_split` hands back
+      `ReadHalf` + `WriteHalf` + `DataPlane` that re-park on a shared waker list
+      instead of touching the fd. No transport/hord-core/wire change — pure
+      `hord-async` (the `HordStream` state machine was already full-duplex-correct,
+      it just lacked a second driving task). Tests (rxe0): `duplex.rs`
+      (`async_full_duplex_split`, 16 MiB each way, reader+writer tasks) and
+      `split_consumer.rs` (`split_data_plane_separate_task`, data plane on its own
+      task concurrent with the HTTP control plane).
 - [ ] Half-close detection on the *synchronous* stream (the async path has it).
 - [ ] Wire `--range` (single-range §7.6, done in the sync demo) into the async bins
       (`*_async`). The `Range`/`Content-Range` codec + base-offset fill/verify already
@@ -53,7 +62,7 @@ future pass has what it needs.
       receives must be pre-posted before the QP goes live (the two-phase RNR-avoidance
       design). **Fix:** register the split headroom into a *separate* MR and post it
       lazily in `apply_peer` only when split mode survives negotiation. Interacts with
-      the source-buffer-pool and multi-waiter items above.
+      the source-buffer-pool item above (the multi-waiter item is now done).
 
 - [x] **`serve_zero_copy` (async demo) forked `hord_zerocopy::serve_rdma_write`** —
       done. The §7.7/§7.3 *policy* (too-large gate, split-vs-plain selection, the
