@@ -2,11 +2,16 @@
 //!
 //! Usage:
 //!   hord-client [--server <ip>] [--port <port>] [--path <path>]
-//!               [--zero-copy] [--zc-buf <bytes>] [--quiet]
+//!               [--zero-copy] [--zc-buf <bytes>] [--range <spec>] [--quiet]
 //!
 //! For a `/size/<n>` path the client verifies the body against the server's
 //! deterministic byte pattern, proving end-to-end integrity through the
 //! envelope framing, segmentation and reassembly.
+//!
+//! `--range <spec>` (spec §7.6) requests a single byte range of a `/size/<n>`
+//! object — `<spec>` is `a-b`, `a-`, or `-n` — yielding `206 Partial Content`
+//! (composed with `--zero-copy`), or `416` if it lies past the end. Delivered
+//! bytes are verified at their absolute object offset.
 //!
 //! With `--zero-copy` (and a server that negotiated the capability), the client
 //! registers a destination buffer, advertises it via `X-HORD-RDMA-Write`, and —
@@ -20,7 +25,10 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use hord_demo::{read_body, read_head, size_from_path, verify_stream_body, verify_zero_copy, Head};
+use hord_demo::{
+    parse_range, read_body, read_head, size_from_path, verify_stream_body_at, verify_zero_copy_at,
+    Head, RangeSpec,
+};
 use hord_stream::{HordConfig, HordStream};
 use hord_zerocopy::{RdmaWriteStatus, ZeroCopyRequest, HEADER};
 
@@ -35,6 +43,7 @@ fn main() -> ExitCode {
     let mut quiet = false;
     let mut zero_copy = false;
     let mut zc_buf: Option<usize> = None;
+    let mut range: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -44,11 +53,12 @@ fn main() -> ExitCode {
             "--path" => path = args.next().unwrap_or(path),
             "--zero-copy" => zero_copy = true,
             "--zc-buf" => zc_buf = args.next().and_then(|n| n.parse().ok()),
+            "--range" => range = args.next(),
             "--quiet" => quiet = true,
             "-h" | "--help" => {
                 eprintln!(
                     "usage: hord-client [--server <ip>] [--port <port>] [--path <path>] \
-                     [--zero-copy] [--zc-buf <bytes>] [--quiet]"
+                     [--zero-copy] [--zc-buf <bytes>] [--range <spec>] [--quiet]"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -59,7 +69,7 @@ fn main() -> ExitCode {
         }
     }
 
-    match run(&server, port, &path, zero_copy, zc_buf, quiet) {
+    match run(&server, port, &path, zero_copy, zc_buf, range, quiet) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("[client] error: {e}");
@@ -74,6 +84,7 @@ fn run(
     path: &str,
     zero_copy: bool,
     zc_buf: Option<usize>,
+    range: Option<String>,
     quiet: bool,
 ) -> io::Result<()> {
     let config = HordConfig::default();
@@ -91,9 +102,23 @@ fn run(
         );
     }
 
+    // §7.6: when a range is requested against a known `/size/<n>` object, resolve
+    // it locally so we register a destination sized to the range (not the whole
+    // object) and verify the delivered bytes at the right absolute offset.
+    let total = size_from_path(path);
+    let (range_base, range_len) = match (&range, total) {
+        (Some(spec), Some(t)) => match parse_range(&format!("bytes={spec}"), t) {
+            RangeSpec::Range { start, end } => (start, Some(end - start + 1)),
+            // Full (ignored → whole object) or Unsatisfiable (expect 416): no
+            // concrete sub-range to size the buffer to.
+            _ => (0, None),
+        },
+        _ => (0, None),
+    };
+
     // Offer zero-copy only if both we asked and the peer negotiated it. Register
     // the destination buffer up front so its address/rkey can ride in the GET.
-    let capacity = zc_buf.or_else(|| size_from_path(path)).unwrap_or(DEFAULT_ZC_BUF);
+    let capacity = zc_buf.or(range_len).or(total).unwrap_or(DEFAULT_ZC_BUF);
     let zc = if zero_copy && stream.zero_copy_negotiated() && capacity > 0 {
         let req = ZeroCopyRequest::new(&stream, capacity)?;
         if !quiet {
@@ -121,6 +146,9 @@ fn run(
          User-Agent: hord-client/0.1\r\n\
          Connection: close\r\n"
     );
+    if let Some(spec) = &range {
+        request.push_str(&format!("Range: bytes={spec}\r\n"));
+    }
     if let Some(zc) = &zc {
         request.push_str(&zc.header_line());
         request.push_str("\r\n");
@@ -137,6 +165,17 @@ fn run(
     let (version, status, reason) = &head.start;
     if !quiet {
         eprintln!("[client] {version} {status} {reason}");
+    }
+
+    // §7.6: an unsatisfiable range → 416 with `Content-Range: bytes */total` and
+    // no body. Nothing to verify; report and finish.
+    if status == "416" {
+        let cr = head.header("Content-Range").unwrap_or("(none)");
+        drop(stream);
+        println!("status:      {status} {reason}");
+        println!("delivery:    none (range not satisfiable)");
+        println!("content-range: {cr}");
+        return Ok(());
     }
 
     // Interpret the zero-copy response header, if we offered zero-copy.
@@ -158,7 +197,7 @@ fn run(
                 )));
             }
             // The body is already in our buffer — verify it in place.
-            let verified = verify_zero_copy(zc, n, path).map_err(to_io)?;
+            let verified = verify_zero_copy_at(zc, range_base, n, path).map_err(to_io)?;
             (n, "zero-copy (RDMA write)", verified)
         }
         Some(RdmaWriteStatus::TooLarge { object_size }) => {
@@ -176,7 +215,9 @@ fn run(
                 eprintln!("[client] Content-Length: {content_length}");
             }
             let body = read_body(&mut stream, leftover, content_length)?;
-            let verified = verify_stream_body(&body, status == "200", path).map_err(to_io)?;
+            let verified =
+                verify_stream_body_at(&body, status == "200" || status == "206", path, range_base)
+                    .map_err(to_io)?;
             (body.len(), "stream", verified)
         }
     };
@@ -193,6 +234,9 @@ fn run(
 
     println!("status:      {status} {reason}");
     println!("delivery:    {delivery}");
+    if let Some(cr) = head.header("Content-Range") {
+        println!("content-range: {cr}");
+    }
     println!("body bytes:  {body_len}");
     println!("elapsed:     {elapsed:?}");
     println!("throughput:  {throughput:.1} MiB/s");

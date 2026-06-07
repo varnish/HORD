@@ -9,9 +9,10 @@ one-sided `IBV_WR_RDMA_WRITE` straight into a client-registered buffer, advertis
 via `X-HORD-RDMA-Write` — **and protocol splitting (spec §7.7)**:
 `IBV_WR_RDMA_WRITE_WITH_IMM` delivers the payload plus a transfer-ID immediate to
 the client's CQ, so a data-plane consumer collects payloads off the completion
-queue without parsing HTTP. The only spec feature still unbuilt is §7.5 GPUDirect
-(untestable here — no GPU/real NIC — though the addr/rkey path is opaque, so it
-should work unchanged on capable hardware).
+queue without parsing HTTP. Single-range `Range` requests (spec §7.6) compose with
+the zero-copy path in the sync demo. The only spec feature still unbuilt is §7.5
+GPUDirect (untestable here — no GPU/real NIC — though the addr/rkey path is opaque,
+so it should work unchanged on capable hardware).
 
 ## What works
 
@@ -32,6 +33,17 @@ should work unchanged on capable hardware).
   the body never touches the stream. The `too_large` (413) and `declined`
   (stream fallback) outcomes are handled too. Works on both the sync and
   async/hyper demos.
+- **Range requests (spec §7.6).** A `GET /size/<n>` carrying a single-range
+  `Range: bytes=…` (`a-b`, `a-`, or `-n`) is answered with `206 Partial Content`
+  and `Content-Range: bytes start-end/total`, composed with the zero-copy path:
+  the server RDMA-writes just the sub-range into the client's buffer. This needed
+  *no* transport change — the one-sided write is offset-agnostic, so serving a
+  range is the whole-object path with the source filled from the range's absolute
+  offset. A range past the end of the object returns `416` + `Content-Range: bytes
+  */total` with no write (and, being bodiless, no `X-HORD-RDMA-Write` per §7.4); a
+  multi-range request is served as a full `200` (no `multipart/byteranges`). The
+  sync demo's `--range` exercises it (stream and zero-copy); the async bins are a
+  follow-up.
 - **Protocol splitting (spec §7.7).** When both peers also advertise
   `SPLIT_MODE_CAPABLE`, a request carrying `;id=<n>` is served with
   `IBV_WR_RDMA_WRITE_WITH_IMM`: the write lands the payload and delivers the
@@ -197,6 +209,9 @@ What remains:
   a source MR per zero-copy *or split-mode* response; a real server would
   amortize this with a pool (spec §8.3). §7.5 GPUDirect remains unbuilt
   (untestable on this host — see above).
+- **Range requests are sync-demo only.** §7.6 is wired into `hord-server` /
+  `hord-client`; the async/hyper bins are a fast-follow — the range logic belongs
+  in the forked `serve_zero_copy` (see TODO.md).
 
 ## Open issues from code review (deferred, by design)
 
@@ -319,3 +334,15 @@ Both of the remaining design-level items were then closed by the **async pass**:
   accounting an implicit-grant sender must do to avoid the same overrun. (The
   earlier prototype enforced neither — `split_credits` was a local sizing
   heuristic only.)
+- **Range requests (spec §7.6).** §7.6 only says ranges "compose naturally" with
+  zero-copy. In practice the composition is *free*: a one-sided RDMA write is
+  offset-agnostic, so serving `bytes=a-b` is exactly the whole-object path with
+  `object_size = b-a+1` and the source filled from offset `a` — no transport
+  change, and `X-HORD-RDMA-Write`'s `len`/`bytes_written` simply describe the
+  *range* length rather than the whole object. Worth pinning down in §7.6 the two
+  HTTP edges it currently leaves implicit: an unsatisfiable range → `416` +
+  `Content-Range: bytes */total` (a bodiless response, so per §7.4 it omits
+  `X-HORD-RDMA-Write`), and a multi-range request → served as a full `200` (HORD
+  has no `multipart/byteranges`, §4.1.2). This prototype implements the sync demo
+  that way; the same offset-agnostic mechanism would cover split mode (§7.7)
+  unchanged.

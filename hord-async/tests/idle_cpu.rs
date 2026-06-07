@@ -59,9 +59,9 @@ fn async_idle_read_parks() {
     let server = std::thread::spawn(move || {
         let listener = Listener::bind(IP, PORT).expect("bind");
         ready_tx.send(()).expect("ready");
-        let (conn, peer) = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
+        let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
         current_thread_rt().block_on(async move {
-            let _s = AsyncHordStream::from_accepted(conn, peer, &srv_config).expect("accept");
+            let _s = AsyncHordStream::from_accepted(conn, &srv_config).expect("accept");
             tokio::time::sleep(IDLE + Duration::from_millis(500)).await;
             // _s dropped here -> disconnect.
         });

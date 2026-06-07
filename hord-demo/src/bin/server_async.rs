@@ -251,7 +251,7 @@ async fn serve_zero_copy(stream: &SharedAsyncStream, req: &RdmaWriteReq, n: usiz
 /// Drive one accepted connection to completion on its own current-thread runtime.
 /// The stream is wrapped in a [`SharedAsyncStream`] so the request handler can
 /// reach it to perform a zero-copy RDMA write while hyper owns it for HTTP.
-fn serve_connection(conn: hord_stream::Connection, peer: Vec<u8>, config: &HordConfig) {
+fn serve_connection(conn: hord_stream::Connection, config: &HordConfig) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -263,7 +263,7 @@ fn serve_connection(conn: hord_stream::Connection, peer: Vec<u8>, config: &HordC
         }
     };
     rt.block_on(async move {
-        let stream = match AsyncHordStream::from_accepted(conn, peer, config) {
+        let stream = match AsyncHordStream::from_accepted(conn, config) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("[server] handshake failed: {e}");
@@ -319,11 +319,15 @@ fn main() -> ExitCode {
 
     // Blocking accept loop: each accepted connection is handed (as the Send
     // `Connection`) to its own thread, which builds and runs the !Send stream.
+    // accept_begin migrates each accepted connection to its own CM event channel
+    // (Identifier::migrate / rdma_migrate_id), so this looping acceptor and the
+    // per-connection workers never compete on a shared channel. (migrate is a
+    // local sideway patch — see vendor/sideway/HORD-PATCH.md.)
     loop {
         match HordStream::accept_begin(&listener, &config) {
-            Ok((conn, peer)) => {
+            Ok(conn) => {
                 let config = config.clone();
-                std::thread::spawn(move || serve_connection(conn, peer, &config));
+                std::thread::spawn(move || serve_connection(conn, &config));
             }
             Err(e) => eprintln!("[server] accept failed: {e}"),
         }

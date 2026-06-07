@@ -515,7 +515,7 @@ Implementations SHOULD enforce:
 
 ## 12. Wire Format Reference
 
-All multi-byte integer fields in HORD wire formats are transmitted in network byte order (big-endian). The handshake magic value `0x484F5244` is the ASCII sequence `H`, `O`, `R`, `D` (bytes `0x48 0x4F 0x52 0x44`) and appears verbatim in packet captures. The `imm_data` field used by RDMA write-with-immediate ([Section 7.7](#77-protocol-splitting)) is presented to applications in host byte order by the verbs API regardless of host architecture; the IBA wire format is big-endian and the verbs implementation handles conversion transparently.
+All multi-byte integer fields in HORD wire formats are transmitted in network byte order (big-endian). The handshake magic value `0x484F5244` is the ASCII sequence `H`, `O`, `R`, `D` (bytes `0x48 0x4F 0x52 0x44`) and appears verbatim in packet captures. The `imm_data` field used by RDMA write-with-immediate ([Section 7.7](#77-protocol-splitting)) is likewise transmitted in network byte order: the verbs API types it as `__be32` and performs **no** conversion, so the application MUST convert between host and network byte order itself (`htonl` on send, `ntohl` on receive, or `u32::to_be`/`from_be`). A `transfer ID` whose four octets differ will be corrupted on a mixed-endian peer pair if this conversion is omitted.
 
 ### 12.1 Handshake (CM Private Data)
 

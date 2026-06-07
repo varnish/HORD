@@ -7,9 +7,15 @@ license.workspace = true
 authors.workspace = true
 
 [lib]
-# Links against librdmacm + libibverbs via a C shim (see build.rs). The shim is
-# required because the verbs data-path calls (ibv_post_send, ibv_poll_cq, ...)
-# are `static inline` in the rdma-core headers and therefore not exported
-# symbols we could bind to directly.
+# Safe Rust over librdmacm + libibverbs via the `sideway` wrapper (and its
+# `rdma-mummy-sys` raw bindings, which statically link a vendored rdma-core).
+# This replaces the previous hand-written C shim: sideway already gives the
+# `static inline` verbs data-path calls (ibv_post_send, ibv_poll_cq, ...) real
+# linkable addresses, so no shim is needed. `rdma-mummy-sys` is used directly
+# only for the three CQ-event-channel calls sideway does not yet wrap
+# (ibv_req_notify_cq / ibv_get_cq_event / ibv_ack_cq_events), reached through
+# sideway's documented raw-handle escape hatches.
 
 [dependencies]
+sideway = "0.4.3"
+rdma-mummy-sys = "0.2.4"

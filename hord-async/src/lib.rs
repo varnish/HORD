@@ -106,12 +106,8 @@ impl AsyncHordStream {
     /// (register buffers, post receives, complete the handshake) and wrap it.
     /// Call on the thread that will drive the connection — the resulting stream
     /// is `!Send`.
-    pub fn from_accepted(
-        conn: Connection,
-        peer_bytes: Vec<u8>,
-        config: &HordConfig,
-    ) -> io::Result<Self> {
-        Self::wrap(HordStream::from_accepted(conn, peer_bytes, config)?)
+    pub fn from_accepted(conn: Connection, config: &HordConfig) -> io::Result<Self> {
+        Self::wrap(HordStream::from_accepted(conn, config)?)
     }
 
     /// Register a freshly-handshaked stream's fds with the reactor.
