@@ -393,6 +393,11 @@ async fn serve_connection(stream: AsyncHordStream, peer: SocketAddr) {
 }
 
 fn main() -> ExitCode {
+    // A `log` backend so HordListener's diagnostics (accept errors, handshake
+    // failures, drain timeout, "all workers unavailable") reach stderr; without
+    // one they would be silently dropped. RUST_LOG overrides the default level.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     let mut bind = DEFAULT_BIND.to_string();
     let mut port = DEFAULT_PORT;
     let mut workers: Option<usize> = None;

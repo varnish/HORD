@@ -104,7 +104,6 @@
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
 
 use tokio::io::unix::AsyncFd;
@@ -112,7 +111,9 @@ use tokio::sync::{mpsc, watch};
 
 use hord_stream::{Connection, HordConfig, HordStream, Listener};
 
-use crate::AsyncHordStream;
+// `ReactorFd` (crate root) is the shared "raw fd owned elsewhere; drop deregisters
+// but does not close" AsyncFd wrapper — reused here for the listener's CM fd.
+use crate::{AsyncHordStream, ReactorFd};
 
 /// Default per-connection-drain bound on shutdown. Matches the 30 s the Carapace
 /// direct service already allows its `GracefulShutdown`, so the two layers' bounds
@@ -131,6 +132,11 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// down rather than retry a permanently-broken listener forever. A run is reset by
 /// any successful accept or a clean "queue empty".
 const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 50;
+
+/// Max connections the acceptor dispatches per fd wakeup before yielding back to
+/// the `select!`, so a sustained connection flood can't starve the (biased)
+/// shutdown branch. The fd stays readable, so draining resumes on the next wakeup.
+const MAX_DRAIN_PER_WAKEUP: u32 = 64;
 
 /// One accepted connection plus the peer address to label it with, handed from the
 /// acceptor to a worker.
@@ -287,7 +293,7 @@ async fn acceptor_loop(
     // Non-blocking + fd-driven so the shutdown signal can interrupt accepting
     // instead of us blocking inside the CM channel waiting for the next peer.
     listener.set_nonblocking(true)?;
-    let fd = AsyncFd::new(ListenerFd(listener.cm_fd()))?;
+    let fd = AsyncFd::new(ReactorFd(listener.cm_fd()))?;
     let mut next = 0usize;
     // Consecutive accept failures; a sustained run terminates the acceptor (see
     // MAX_CONSECUTIVE_ACCEPT_ERRORS) instead of spinning on a broken listener.
@@ -319,12 +325,19 @@ async fn acceptor_loop(
                 // *error* would discard readiness we never observed as consumed —
                 // the AsyncFd footgun that hot-spins on a persistent error.
                 let mut drained = false;
+                let mut accepted = 0u32;
                 loop {
                     match HordStream::try_accept_begin(&listener, &config) {
                         Ok(Some(conn)) => {
                             consecutive_errors = 0;
                             let peer = conn.peer_addr().unwrap_or(UNKNOWN_PEER);
                             dispatch(&senders, &mut next, conn, peer);
+                            accepted += 1;
+                            if accepted >= MAX_DRAIN_PER_WAKEUP {
+                                // Yield to the `select!` so a flood can't starve
+                                // shutdown; the fd stays readable, so we resume.
+                                break;
+                            }
                         }
                         Ok(None) => {
                             consecutive_errors = 0;
@@ -349,12 +362,15 @@ async fn acceptor_loop(
                         "hord: stopping acceptor after {consecutive_errors} consecutive accept errors"
                     );
                     break 'accept;
-                } else {
+                } else if consecutive_errors > 0 {
                     // Transient error: the bad event was acked, so the fd drains on
                     // the next attempt (which clears readiness). Back off briefly so
                     // a *persistent* error climbs to the cap without hot-spinning.
                     tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 }
+                // else: hit the per-wakeup accept cap with no error — fall through to
+                // re-enter the `select!` (biased, so shutdown is re-checked) without
+                // clearing readiness, so draining resumes immediately next wakeup.
             }
         }
     }
@@ -430,32 +446,47 @@ async fn worker_loop<F, Fut>(
     F: FnMut(AsyncHordStream, SocketAddr) -> Fut,
     Fut: Future<Output = ()> + 'static,
 {
-    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // A JoinSet reaps finished connection tasks in O(1) per task (no per-accept
+    // scan of a handle Vec) and surfaces a handler panic instead of swallowing it.
+    let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     while let Some((conn, peer)) = rx.recv().await {
-        // Keep the handle list bounded by the count of *live* connections.
-        tasks.retain(|t| !t.is_finished());
+        // Reap any connection tasks that have finished since the last accept.
+        while let Some(res) = tasks.try_join_next() {
+            log_task_result(res);
+        }
         // Build the !Send stream on this worker thread — the handshake runs here
         // (see the type's "synchronous handshake" caveat). On failure, drop the
         // connection and keep serving the rest.
         match AsyncHordStream::from_accepted(conn, &config) {
             Ok(stream) => {
-                let fut = serve_fn(stream, peer);
-                tasks.push(tokio::task::spawn_local(fut));
+                tasks.spawn_local(serve_fn(stream, peer));
             }
             Err(e) => log::warn!("hord: handshake failed for {peer}: {e}"),
         }
     }
 
     // Channel closed → shutdown. Let in-flight connections finish, bounded by
-    // `grace`. Awaiting the handles sequentially is fine: they run concurrently on
-    // this LocalSet (driven by the enclosing `run_until`), so the total is the max.
+    // `grace`; they run concurrently on this LocalSet (driven by the enclosing
+    // `run_until`), so the wall-clock is the slowest one, not the sum. On timeout
+    // `tasks` drops, aborting anything still running.
     let drain = async {
-        for t in tasks {
-            let _ = t.await;
+        while let Some(res) = tasks.join_next().await {
+            log_task_result(res);
         }
     };
     if tokio::time::timeout(grace, drain).await.is_err() {
         log::warn!("hord: graceful drain timed out after {grace:?}; abandoning in-flight connections");
+    }
+}
+
+/// Log a connection task's join result, surfacing a panic (which a bare
+/// `let _ = handle.await` would have swallowed) rather than letting it vanish.
+/// A cancellation (abort at the grace-timeout / `JoinSet` drop) is expected.
+fn log_task_result(res: Result<(), tokio::task::JoinError>) {
+    if let Err(e) = res {
+        if e.is_panic() {
+            log::error!("hord: connection task panicked: {e}");
+        }
     }
 }
 
@@ -466,15 +497,4 @@ fn default_workers() -> usize {
         .map(|n| n.get())
         .unwrap_or(1)
         .max(1)
-}
-
-/// A raw fd owned elsewhere (by the [`Listener`]), wrapped only so [`AsyncFd`] can
-/// register it with the reactor. Dropping it deregisters but does **not** close the
-/// fd — the listener closes it on drop.
-struct ListenerFd(RawFd);
-
-impl AsRawFd for ListenerFd {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
-    }
 }

@@ -141,15 +141,19 @@ acceptor error-spin on a fatal CM event (now only `clear_ready`s on a clean drai
 backs off, and terminates after `MAX_CONSECUTIVE_ACCEPT_ERRORS`); the `peer_addr`
 AF_INET6 out-of-provenance read (now copies through a `cm_id`-wide pointer); and two
 flaky/lossy tests (listener binds before the serving thread spawns; the keep-alive
-test cleans up before asserting). The following were consciously deferred — none is a
-correctness bug on the supported single-host path.
+test cleans up before asserting).
 
-- [ ] **Demo (and any logger-less embedder) drops `HordListener` diagnostics.**
-      `HordListener` logs via the `log` facade (accept errors, handshake failures,
-      drain timeout, "all workers unavailable"); the `hord-server-async` demo installs
-      no `log` backend, so those records vanish — the pre-refactor demo printed them
-      via `eprintln!`. **Fix:** init `env_logger` (or equivalent) in the demo `main`.
-      Carapace already has a `log` backend, so it is unaffected.
+A **follow-up cleanup pass** then cleared the cheap items: the demo installs an
+`env_logger` backend (so `HordListener` diagnostics surface again — the pre-refactor
+demo printed them via `eprintln!`); the acceptor caps its per-wakeup drain
+(`MAX_DRAIN_PER_WAKEUP`) so a connection flood can't starve the shutdown signal;
+`ListenerFd` was folded into the crate's `ReactorFd`; `HordStream::connect` shares the
+`qp_sizing` helper with the accept paths; and the worker uses a `tokio::task::JoinSet`
+(O(1) reaping instead of an O(n²) `retain`, and it surfaces handler panics instead of
+swallowing them).
+
+The following remain consciously deferred — none is a correctness bug on the
+supported single-host path.
 
 - [ ] **Idle keep-alive connections pay the full `grace_timeout` at shutdown.**
       `HordListener` stops accepting and bounds the drain, but does not signal the
@@ -160,13 +164,6 @@ correctness bug on the supported single-host path.
       but the demo doesn't wire it, so Ctrl-C with an idle client appears to hang for
       `grace`. **Fix:** wire the demo's per-connection graceful shutdown; consider
       passing the serve closure a cancel token so the common case isn't a footgun.
-
-- [ ] **Acceptor inner drain loop has no shutdown re-check.** The fd-readable arm
-      drains all queued connect requests before returning to the `select!`; a sustained
-      inbound flood that never drains to empty would delay the shutdown signal past
-      `grace`'s intent. Bounded in practice (each accept does real CM work, so the
-      queue empties between bursts). **Fix:** cap the per-wakeup drain count, or
-      re-check shutdown inside the inner loop.
 
 - [ ] **`peer_addr` unknown-peer is a lossy sentinel.** The acceptor folds a
       missing/unmappable peer address into `UNKNOWN_PEER` (`0.0.0.0:0`), so a host
@@ -190,16 +187,6 @@ correctness bug on the supported single-host path.
       documented handshake **stage** — run establishment/handshake off the worker (or
       async) so a slow peer never blocks a worker's reactor. Deferred (bigger; the
       bound makes it non-urgent).
-
-- [ ] **Minor cleanup.** (a) `ListenerFd` (`hord-async/src/listener.rs`) duplicates
-      `ReactorFd` (`hord-async/src/lib.rs`) — same crate, same no-op-`Drop`
-      `AsRawFd(RawFd)` wrapper; reuse one. (b) `HordStream::connect` still inlines the
-      QP-sizing tuple that `accept_qp_sizing` was added to single-source (third copy;
-      rename to `qp_sizing` and call it from `connect` too). (c) `worker_loop`'s
-      `tasks.retain(!is_finished)` rescans the live-handle Vec on every accept (O(n²)
-      for n concurrent connections on one worker) and the drain's `let _ = t.await`
-      swallows handler panics — a `tokio::task::JoinSet` would reap in O(1) and surface
-      panics.
 
 ### Milestone 1 — HTTP/1.1 over RDMA (byte-stream parity)
 

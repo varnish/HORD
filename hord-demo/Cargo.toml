@@ -21,6 +21,9 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body = "1"
 http-body-util = "0.1"
 bytes = "1"
+# A `log` backend so HordListener's diagnostics (accept/handshake/drain) surface
+# on stderr when running the demo binaries; RUST_LOG overrides the default level.
+env_logger = "0.11"
 
 # Synchronous prototype (busy-polled, one connection at a time).
 [[bin]]
