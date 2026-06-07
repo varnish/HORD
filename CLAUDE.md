@@ -104,11 +104,11 @@ cargo llvm-cov --workspace --summary-only -- --include-ignored --test-threads=1
 cargo llvm-cov --workspace --lcov --output-path lcov.info -- --include-ignored --test-threads=1
 ```
 
-Library coverage sits around **~88% lines** (`hord-core` ~91%, `hord-stream`
-92–100%, `hord-zerocopy` ~84%, `hord-async` ~69%). The `hord-demo` binaries are
-run by hand and show 0%, which pulls the workspace *total* down to ~60% — read
-the per-file table, not the total. Add `--ignore-filename-regex 'hord-demo/'`
-to exclude the demos from the figure.
+Library coverage sits around **~90% lines** (`hord-core` ~93%, `hord-stream`
+~91–100%, `hord-zerocopy` ~92%, `hord-async` ~83%). The `hord-demo` binaries are
+run by hand and show 0% (the demo *lib* — the codec — is ~47%), which pulls the
+workspace *total* down to ~65% — read the per-file table, not the total. Add
+`--ignore-filename-regex 'hord-demo/'` to exclude the demos from the figure.
 
 ### CI
 
