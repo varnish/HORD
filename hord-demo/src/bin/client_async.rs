@@ -21,7 +21,10 @@ use hyper::Request;
 use hyper_util::rt::TokioIo;
 
 use hord_async::{AsyncHordStream, SharedAsyncStream};
-use hord_demo::{size_from_path, verify_stream_body, verify_zero_copy};
+use hord_demo::{
+    parse_range, size_from_path, verify_stream_body_at, verify_zero_copy, verify_zero_copy_at,
+    RangeSpec,
+};
 use hord_stream::HordConfig;
 use hord_zerocopy::{RdmaWriteStatus, ZeroCopyRequest, HEADER};
 
@@ -40,6 +43,7 @@ fn main() -> ExitCode {
     let mut quiet = false;
     let mut zero_copy = false;
     let mut zc_buf: Option<usize> = None;
+    let mut range: Option<String> = None;
     let mut split = false;
     let mut count = DEFAULT_SPLIT_COUNT;
 
@@ -51,13 +55,16 @@ fn main() -> ExitCode {
             "--path" => path = args.next().unwrap_or(path),
             "--zero-copy" => zero_copy = true,
             "--zc-buf" => zc_buf = args.next().and_then(|n| n.parse().ok()),
+            "--range" => range = args.next(),
             "--split" => split = true,
             "--count" => count = args.next().and_then(|n| n.parse().ok()).unwrap_or(count),
             "--quiet" => quiet = true,
             "-h" | "--help" => {
                 eprintln!(
                     "usage: hord-client-async [--server <ip>] [--port <port>] [--path <path>] \
-                     [--zero-copy] [--zc-buf <bytes>] [--split] [--count <n>] [--quiet]\n\
+                     [--zero-copy] [--zc-buf <bytes>] [--range <spec>] [--split] [--count <n>] [--quiet]\n\
+                     \n  --range <spec>  request a single byte range (§7.6) of a /size/<n> object \
+                     (<spec> is a-b, a-, or -n); yields 206 (composed with --zero-copy) or 416.\
                      \n  --split   issue --count GETs (default {DEFAULT_SPLIT_COUNT}) in split mode (§7.7); \
                      payloads are collected off the CQ by transfer id, not from the HTTP body."
                 );
@@ -83,7 +90,7 @@ fn main() -> ExitCode {
     // A LocalSet lets us spawn_local the hyper connection task (the stream is
     // !Send, so it cannot use tokio::spawn on a multi-thread runtime).
     let local = tokio::task::LocalSet::new();
-    let opts = Opts { server, port, path, zero_copy, zc_buf, split, count, quiet };
+    let opts = Opts { server, port, path, zero_copy, zc_buf, range, split, count, quiet };
     let fut = async {
         if opts.split {
             run_split(opts).await
@@ -106,13 +113,14 @@ struct Opts {
     path: String,
     zero_copy: bool,
     zc_buf: Option<usize>,
+    range: Option<String>,
     split: bool,
     count: usize,
     quiet: bool,
 }
 
 async fn run(opts: Opts) -> Result<(), BoxError> {
-    let Opts { server, port, path, zero_copy, zc_buf, quiet, .. } = opts;
+    let Opts { server, port, path, zero_copy, zc_buf, range, quiet, .. } = opts;
     let config = HordConfig::default();
     if !quiet {
         eprintln!("[client] connecting to {server}:{port} ...");
@@ -128,12 +136,26 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
         );
     }
 
+    // §7.6: when a range is requested against a known /size/<n> object, resolve it
+    // locally so we size the destination to the range (not the whole object) and
+    // verify the delivered bytes at the right absolute offset (mirrors the sync
+    // client). Full (ignored → whole object) / Unsatisfiable (expect 416) leave no
+    // concrete sub-range to size to.
+    let total = size_from_path(&path);
+    let (range_base, range_len) = match (&range, total) {
+        (Some(spec), Some(t)) => match parse_range(&format!("bytes={spec}"), t) {
+            RangeSpec::Range { start, end } => (start, Some(end - start + 1)),
+            _ => (0, None),
+        },
+        _ => (0, None),
+    };
+
     // Offer zero-copy only if we asked and the peer negotiated it. Register the
     // destination buffer up front, before the stream is handed to hyper, so its
     // address/rkey can ride in the request header. The buffer (inside the
     // ZeroCopyRequest) is independent of the stream — it owns its own connection
     // handle — so we keep it alongside and it outlives the stream's teardown.
-    let capacity = zc_buf.or_else(|| size_from_path(&path)).unwrap_or(DEFAULT_ZC_BUF);
+    let capacity = zc_buf.or(range_len).or(total).unwrap_or(DEFAULT_ZC_BUF);
     let dest: Option<ZeroCopyRequest> = if zero_copy && stream.zero_copy_negotiated() && capacity > 0 {
         let zc = ZeroCopyRequest::from_buffer(stream.register_remote_writable(capacity)?);
         if !quiet {
@@ -167,6 +189,9 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
         .header("host", server.as_str())
         .header("user-agent", "hord-client-async/0.1")
         .header("connection", "close");
+    if let Some(spec) = &range {
+        builder = builder.header("range", format!("bytes={spec}"));
+    }
     if let Some(zc) = &dest {
         builder = builder.header(HEADER, zc.request().header_value());
     }
@@ -177,7 +202,7 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
     // errors here rather than hanging forever (review item #11). Returns the
     // status, the parsed zero-copy response status (if any), and the stream body.
     let offered_zc = dest.is_some();
-    let (status, zc_status, body) = tokio::time::timeout(DEADLINE, async {
+    let (status, zc_status, content_range, body) = tokio::time::timeout(DEADLINE, async {
         let res = sender.send_request(request).await?;
         let status = res.status();
         if !quiet {
@@ -191,14 +216,33 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
         } else {
             None
         };
+        // §7.6: a 206/416 carries Content-Range; capture it while the response is
+        // in hand (the body collect below consumes it).
+        let content_range = res
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let collected = res.into_body().collect().await?;
-        Ok::<_, BoxError>((status, zc_status, collected.to_bytes()))
+        Ok::<_, BoxError>((status, zc_status, content_range, collected.to_bytes()))
     })
     .await
     .map_err(|_| -> BoxError { "request timed out".into() })??;
     let elapsed = req_start.elapsed();
 
-    // Determine where the body came from and verify the pattern.
+    // §7.6: an unsatisfiable range → 416 with `Content-Range: bytes */total` and no
+    // body. Nothing to verify; report and finish.
+    if status.as_u16() == 416 {
+        drop(sender);
+        let _ = conn_task.await;
+        println!("status:      {status}");
+        println!("delivery:    none (range not satisfiable)");
+        println!("content-range: {}", content_range.as_deref().unwrap_or("(none)"));
+        return Ok(());
+    }
+
+    // Determine where the body came from and verify the pattern (at the range's
+    // absolute object offset — `range_base` is 0 for a whole object).
     let to_err = |m: String| -> BoxError { m.into() };
     let (body_len, delivery, verified) = match zc_status {
         Some(RdmaWriteStatus::Complete { bytes_written }) => {
@@ -209,7 +253,7 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
             if n > zc.capacity() {
                 return Err(format!("server reported bytes_written={n} > buffer {}", zc.capacity()).into());
             }
-            let verified = verify_zero_copy(zc, n, &path).map_err(to_err)?;
+            let verified = verify_zero_copy_at(zc, range_base, n, &path).map_err(to_err)?;
             (n, "zero-copy (RDMA write)", verified)
         }
         Some(RdmaWriteStatus::TooLarge { object_size }) => {
@@ -220,7 +264,9 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
         }
         // Declined / no zero-copy: the body arrived on the stream.
         _ => {
-            let verified = verify_stream_body(&body, status.as_u16() == 200, &path).map_err(to_err)?;
+            let is_success = matches!(status.as_u16(), 200 | 206);
+            let verified =
+                verify_stream_body_at(&body, is_success, &path, range_base).map_err(to_err)?;
             (body.len(), "stream", verified)
         }
     };
@@ -235,6 +281,9 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
 
     println!("status:      {status}");
     println!("delivery:    {delivery}");
+    if let Some(cr) = &content_range {
+        println!("content-range: {cr}");
+    }
     println!("body bytes:  {body_len}");
     println!("elapsed:     {elapsed:?}");
     println!("throughput:  {throughput:.1} MiB/s");

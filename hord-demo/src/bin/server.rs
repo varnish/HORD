@@ -27,11 +27,20 @@ use hord_demo::{
     pattern_fill_registered_from, read_head, Head, RangeSpec,
 };
 use hord_stream::{HordConfig, HordStream, Listener};
-use hord_zerocopy::{serve_rdma_write, RdmaWriteReq, RdmaWriteStatus, HEADER};
+use hord_zerocopy::{serve_rdma_write_pooled, RdmaWriteReq, RdmaWriteStatus, SourcePool, HEADER};
 
 const DEFAULT_BIND: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
 const DEFAULT_PORT: u16 = 4791;
 const MAX_BODY: usize = 1usize << 30; // 1 GiB guard on /size/<n>
+// Per-connection zero-copy source pool (§8.3): up to this many reusable source
+// buffers of this size, grown lazily and reused across a connection's responses
+// instead of registering an MR per response. A response larger than the slab — or
+// past the cap — falls back to a one-off registration (§8.4), so these only tune
+// efficiency, not correctness. (This demo closes the connection per request, so it
+// registers one buffer per connection — no worse than per-response; the win shows
+// on a keep-alive or split workload that reuses the connection.)
+const SOURCE_POOL_CAP: usize = 4;
+const SOURCE_POOL_BUF_SIZE: usize = 4 << 20; // 4 MiB
 
 fn main() -> ExitCode {
     let mut bind = DEFAULT_BIND.to_string();
@@ -74,7 +83,10 @@ fn main() -> ExitCode {
     loop {
         match HordStream::accept(&listener, &config) {
             Ok(mut stream) => {
-                if let Err(e) = serve_one(&mut stream) {
+                // One source pool per connection (MRs are PD-scoped). Lazy, so it
+                // costs nothing until the first zero-copy response.
+                let pool = SourcePool::new(SOURCE_POOL_CAP, SOURCE_POOL_BUF_SIZE);
+                if let Err(e) = serve_one(&mut stream, &pool) {
                     eprintln!("[server] connection error: {e}");
                 }
                 // Dropping the stream flushes nothing implicitly; serve_one is
@@ -88,7 +100,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn serve_one(stream: &mut HordStream) -> io::Result<()> {
+fn serve_one(stream: &mut HordStream, pool: &SourcePool) -> io::Result<()> {
     let (head_bytes, _leftover) = read_head(stream)?;
     let head = Head::parse(&head_bytes)?;
     let (method, path, version) = &head.start;
@@ -132,7 +144,7 @@ fn serve_one(stream: &mut HordStream) -> io::Result<()> {
                     RangeSpec::Range { start, end } => {
                         let len = end - start + 1;
                         if let Some(req) = zc_req {
-                            return serve_size_zero_copy(stream, &req, start, len, n, true);
+                            return serve_size_zero_copy(stream, pool, &req, start, len, n, true);
                         }
                         let mut body = vec![0u8; len];
                         pattern_fill_from(&mut body, start);
@@ -148,7 +160,7 @@ fn serve_one(stream: &mut HordStream) -> io::Result<()> {
                     }
                     RangeSpec::Full => {
                         if let Some(req) = zc_req {
-                            return serve_size_zero_copy(stream, &req, 0, n, n, false);
+                            return serve_size_zero_copy(stream, pool, &req, 0, n, n, false);
                         }
                         let mut body = vec![0u8; n];
                         pattern_fill(&mut body);
@@ -182,18 +194,20 @@ fn serve_one(stream: &mut HordStream) -> io::Result<()> {
 /// Content` + `Content-Range` over a plain `200`.
 fn serve_size_zero_copy(
     stream: &mut HordStream,
+    pool: &SourcePool,
     req: &RdmaWriteReq,
     base: usize,
     len: usize,
     total: usize,
     partial: bool,
 ) -> io::Result<()> {
-    // serve_rdma_write registers a source region, fills it with the pattern at
-    // the object's absolute offset (so a sub-range carries the right bytes), and
-    // RDMA-writes it into the client's [addr, rkey] — blocking until the write is
-    // acknowledged before it returns. The HTTP response is sent *after*, so the
-    // payload has provably landed by the time the client reads the head.
-    let status = serve_rdma_write(stream, req, len as u64, |buf| {
+    // serve_rdma_write_pooled leases a source region from the per-connection pool
+    // (§8.3 — reusing its registration), fills it with the pattern at the object's
+    // absolute offset (so a sub-range carries the right bytes), and RDMA-writes it
+    // into the client's [addr, rkey] — blocking until the write is acknowledged
+    // before it returns. The HTTP response is sent *after*, so the payload has
+    // provably landed by the time the client reads the head.
+    let status = serve_rdma_write_pooled(stream, pool, req, len as u64, |buf| {
         pattern_fill_registered_from(buf, base, len)
     })?;
     let (code, reason) = match status {
