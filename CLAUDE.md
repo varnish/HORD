@@ -2,6 +2,12 @@
 
 Guidance for working on the HORD project on this host.
 
+## Git workflow
+
+Commit changes **directly on `main`** by default. Only create a branch when
+explicitly asked for one. (This overrides the usual harness default of branching
+off the default branch before committing.)
+
 ## Development environment: Soft-RoCE
 
 This host has no RDMA-capable NIC, so HORD is tested against **Soft-RoCE**
