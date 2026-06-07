@@ -9,7 +9,7 @@ license = "Apache-2.0"
 authors = ["Per Buer, Varnish Software"]
 repository = "https://github.com/varnish/HORD"
 
-# A first prototype of HORD (HTTP Over RDMA). See README.md for the spec.
+# A first prototype of HORD (HTTP Over RDMA). See SPEC.md for the spec.
 #
 # This workspace implements the HORD *stream* path — RC queue pairs, two-sided
 # send/recv, the message envelope, credit-based flow control — plus the
