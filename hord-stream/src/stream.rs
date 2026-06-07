@@ -202,6 +202,14 @@ const HS_SEND_WR_ID: u64 = u64::MAX - 1;
 // non-HORD endpoint) — without it, `exchange_handshake` would spin forever.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+// How many empty CQ polls the blocking busy-poll spins through before it checks
+// the CM channel for a peer half-close. A `get_cm_event` is a syscall, so we
+// rate-limit it well below the spin rate — large enough that a data-carrying
+// `pump` (which reaps a completion and returns immediately) never reaches it, so
+// throughput is untouched, yet small enough to detect a graceful disconnect in
+// tens of microseconds. Only consulted when the CQ has been idle this long.
+const CM_DISCONNECT_POLL_SPINS: u32 = 4096;
+
 /// Bytes per RDMA-write work request. The NIC segments a single WR into MTU-sized
 /// packets, so one WR can carry a very large payload; we cap it only so an
 /// enormous object maps to a bounded number of WRs (`begin_rdma_write` requires
@@ -253,6 +261,11 @@ pub struct HordStream {
     tx_stage: Vec<u8>,        // bytes buffered by write(), drained into messages
     rx_ready: VecDeque<ReadyMsg>, // received data, still in its recv buffer, awaiting read()
     peer_closed: bool,        // observed a flush/transport error -> treat as EOF/broken pipe
+    // The CM channel has been flipped non-blocking (after the handshake), so the
+    // blocking busy-poll may check it for a peer-initiated graceful half-close.
+    // `false` if the flip failed at setup — half-close detection is then simply
+    // off (the data path is unaffected), matching the async wrapper's stance.
+    cm_watch: bool,
 
     // ---- zero-copy extension (spec §7) ----
     // Our config's `zero_copy` at construction, AND-ed with the peer's handshake
@@ -431,6 +444,7 @@ impl HordStream {
             tx_stage: Vec::new(),
             rx_ready: VecDeque::new(),
             peer_closed: false,
+            cm_watch: false,
             zero_copy: config.zero_copy,
             writes_outstanding: 0,
             split_mode: config.split_mode,
@@ -568,6 +582,14 @@ impl HordStream {
         // write-with-imm transfers the peer can receive concurrently. Only
         // meaningful when split negotiated, which guarantees it is >= 1.
         self.peer_split_credits = peer.split_credits as u32;
+        // Enable synchronous half-close detection: flip the CM channel non-blocking
+        // so the busy-poll can notice a peer-initiated *graceful* disconnect. Unlike
+        // a hard teardown, a graceful disconnect (peer `rdma_disconnect`) leaves our
+        // recv WRs un-flushed, so without watching the CM channel a blocked reader
+        // would never see EOF. Best-effort: on failure we run without it (data path
+        // unaffected), exactly as the async wrapper does. Safe here — all of setup's
+        // *blocking* CM waits (resolve / establish) have completed by now.
+        self.cm_watch = self.conn.set_cm_nonblock().is_ok();
         Ok(())
     }
 
@@ -651,7 +673,17 @@ impl HordStream {
     /// Poll for and process exactly one completion. With `block`, busy-waits
     /// until a completion is available; otherwise returns `Ok(false)` when the
     /// CQ is empty. Returns `Ok(true)` if a completion was processed.
+    ///
+    /// While blocking, it periodically consults the CM channel for a peer-initiated
+    /// graceful half-close (see [`poll_cm_disconnect`](Self::poll_cm_disconnect)):
+    /// such a disconnect need not flush our recv WRs, so without this a reader
+    /// blocked on data that will never come would spin forever. On detecting it the
+    /// stream is marked closed and `pump` returns `Ok(false)` (no completion
+    /// processed) so the caller re-checks `peer_closed` — `read` then sees EOF,
+    /// `poll_completed_transfer` returns `None`. The non-blocking path is untouched:
+    /// the async reactor handles the CM channel itself and must not double-consume it.
     fn pump(&mut self, block: bool) -> io::Result<bool> {
+        let mut spins: u32 = 0;
         loop {
             match self.conn.poll()? {
                 Some(wc) => {
@@ -659,14 +691,37 @@ impl HordStream {
                     return Ok(true);
                 }
                 None => {
-                    if block {
-                        std::hint::spin_loop();
-                        continue;
+                    if !block {
+                        return Ok(false);
                     }
-                    return Ok(false);
+                    spins += 1;
+                    if spins >= CM_DISCONNECT_POLL_SPINS {
+                        spins = 0;
+                        if self.poll_cm_disconnect()? {
+                            return Ok(false);
+                        }
+                    }
+                    std::hint::spin_loop();
                 }
             }
         }
+    }
+
+    /// Non-blocking peer half-close check for the synchronous busy-poll: if the CM
+    /// channel is being watched (flipped non-blocking after the handshake — see
+    /// [`apply_peer`](Self::apply_peer)), poll it once for a peer-initiated
+    /// disconnect and mark the stream closed if one is seen. Returns whether the
+    /// peer is now observed gone. A no-op (`Ok(false)`) when the flip failed at
+    /// setup. This is the sync analogue of the async reactor's `poll_cm_event`.
+    fn poll_cm_disconnect(&mut self) -> io::Result<bool> {
+        if !self.cm_watch {
+            return Ok(false);
+        }
+        if self.conn.check_disconnect()? {
+            self.peer_closed = true;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn handle_completion(&mut self, wc: Completion) -> io::Result<()> {
@@ -1662,6 +1717,77 @@ mod fullduplex_tests {
         teardown.wait();
         drop(client);
 
+        server.join().expect("server thread panicked");
+    }
+}
+
+#[cfg(test)]
+mod half_close_tests {
+    //! Synchronous half-close detection (the async path already had it).
+    //!
+    //! A peer's *graceful* disconnect (`rdma_disconnect`, which delivers a CM
+    //! `DISCONNECTED` event but leaves the peer's QP — and so our recv WRs —
+    //! un-flushed) gives a blocked `read()` no completion to wake on. Without
+    //! watching the CM channel the reader would busy-spin forever; with it, the
+    //! busy-poll notices the disconnect and `read()` returns EOF.
+    //!
+    //! The reader runs on its own thread so the test enforces a deadline rather
+    //! than hanging if detection regresses (a regression makes this *fail*, not
+    //! hang the suite). The server holds its QP alive until the client has
+    //! observed EOF, so the CM event is the *only* close signal in play.
+    //!
+    //! Needs the host's Soft-RoCE device (see CLAUDE.md), so it is `#[ignore]`d:
+    //! ```sh
+    //! cargo test -p hord-stream -- --ignored --nocapture sync_half_close
+    //! ```
+    use super::*;
+    use std::io::Read;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+    const PORT: u16 = 18526; // distinct from the other in-crate loopback tests
+    const DEADLINE: Duration = Duration::from_secs(15);
+
+    #[test]
+    #[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+    fn sync_half_close_unblocks_read() {
+        let config = HordConfig::default();
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        // Released by the test once the client has seen EOF, so the server keeps
+        // its QP up until then (no teardown that could flush the client by
+        // another path — the CM event must be what unblocks the read).
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let srv_config = config.clone();
+        let server = std::thread::spawn(move || {
+            let listener = Listener::bind(IP, PORT).expect("bind");
+            ready_tx.send(()).expect("signal ready");
+            let s = HordStream::accept(&listener, &srv_config).expect("accept");
+            s.disconnect(); // graceful half-close: DREQ → client's CM DISCONNECTED
+            release_rx.recv().expect("client EOF signal");
+            drop(s);
+        });
+
+        ready_rx.recv().expect("server ready");
+
+        // Blocking read on its own thread, so the test below can bound the wait.
+        let (eof_tx, eof_rx) = mpsc::channel::<io::Result<usize>>();
+        let cfg = config.clone();
+        let reader = std::thread::spawn(move || {
+            let mut c = HordStream::connect(IP, PORT, &cfg).expect("connect");
+            let mut buf = [0u8; 64];
+            eof_tx.send(c.read(&mut buf)).ok();
+        });
+
+        match eof_rx.recv_timeout(DEADLINE) {
+            Ok(Ok(0)) => {} // EOF — half-close detected.
+            Ok(other) => panic!("expected EOF (Ok(0)) on peer half-close, got {other:?}"),
+            Err(_) => panic!("read() blocked past {DEADLINE:?} — sync half-close not detected"),
+        }
+
+        release_tx.send(()).expect("release server");
+        reader.join().expect("reader thread panicked");
         server.join().expect("server thread panicked");
     }
 }
