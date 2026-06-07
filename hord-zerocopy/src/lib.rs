@@ -27,7 +27,9 @@
 //! body into the client's buffer and returns the [`RdmaWriteStatus`] to put in
 //! the response (with `Content-Length: 0`).
 
+use std::cell::RefCell;
 use std::io;
+use std::rc::Rc;
 
 use hord_stream::{HordStream, RegisteredBuffer};
 
@@ -367,15 +369,7 @@ pub fn serve_rdma_write(
             transfer_id,
         } => {
             let src = stream.register_source(source_len)?;
-            if payload_len > 0 {
-                fill(&src);
-            }
-            match transfer_id {
-                Some(id) => {
-                    stream.rdma_write_all_with_imm(&src, 0, req.addr, req.rkey, payload_len, id)?
-                }
-                None => stream.rdma_write_all(&src, 0, req.addr, req.rkey, payload_len)?,
-            }
+            run_write_plan(stream, &src, req, payload_len, transfer_id, fill)?;
             // `src` drops after the write returns: rdma_write_all{,_with_imm}
             // blocked until the write completed and was acked, so no DMA
             // references the MR — deregistration is sound.
@@ -383,6 +377,225 @@ pub fn serve_rdma_write(
                 bytes_written: payload_len as u64,
             })
         }
+    }
+}
+
+/// Like [`serve_rdma_write`], but draws the source region from a [`SourcePool`]
+/// (spec §8.3) instead of registering a fresh MR per response — `ibv_reg_mr` is
+/// expensive (§8.1), so a server reusing a connection (HTTP keep-alive, or a split
+/// run that serves many transfers on one connection) amortizes it. The HTTP-facing
+/// behaviour is identical to [`serve_rdma_write`]: same status, same `Content-Length:
+/// 0`, same §7.3/§7.7 policy via [`RdmaWriteAction::decide`].
+///
+/// The pool lends a pre-registered buffer when the payload fits its slab and one is
+/// available, growing lazily to its cap and otherwise falling back to a one-off
+/// registration (an oversized object — §8.4 — or a momentarily exhausted pool), so
+/// correctness never depends on the pool being large enough. The leased buffer is
+/// returned to the pool for reuse only after the write is acknowledged.
+pub fn serve_rdma_write_pooled(
+    stream: &mut HordStream,
+    pool: &SourcePool,
+    req: &RdmaWriteReq,
+    object_size: u64,
+    fill: impl FnOnce(&RegisteredBuffer),
+) -> io::Result<RdmaWriteStatus> {
+    match RdmaWriteAction::decide(req, object_size, stream.split_mode_negotiated()) {
+        RdmaWriteAction::Respond(status) => Ok(status),
+        RdmaWriteAction::Write {
+            payload_len,
+            source_len,
+            transfer_id,
+        } => {
+            // The lease holds its buffer (and only an `Rc` to the pool) until it
+            // drops at the end of this block — after `run_write_plan` has blocked
+            // for the write's completion, so no DMA references the buffer when it
+            // returns to the pool. The fallback registrar borrows `stream` only for
+            // the call; the subsequent `&mut stream` write is unaffected.
+            let lease = pool.acquire(source_len, |n| stream.register_source(n))?;
+            run_write_plan(stream, lease.buffer(), req, payload_len, transfer_id, fill)?;
+            Ok(RdmaWriteStatus::Complete {
+                bytes_written: payload_len as u64,
+            })
+        }
+    }
+}
+
+/// Execute a decided [`RdmaWriteAction::Write`] against an already-acquired source
+/// buffer: fill its first `payload_len` bytes, then one-sided-write them into the
+/// client's `[addr, rkey]` — with a write-with-immediate carrying `transfer_id`
+/// (split mode, §7.7) or a plain write. Blocks until the write is acknowledged.
+/// Shared by [`serve_rdma_write`] and [`serve_rdma_write_pooled`] so the only thing
+/// that differs between them is where the source comes from.
+fn run_write_plan(
+    stream: &mut HordStream,
+    src: &RegisteredBuffer,
+    req: &RdmaWriteReq,
+    payload_len: usize,
+    transfer_id: Option<u32>,
+    fill: impl FnOnce(&RegisteredBuffer),
+) -> io::Result<()> {
+    if payload_len > 0 {
+        fill(src);
+    }
+    match transfer_id {
+        Some(id) => stream.rdma_write_all_with_imm(src, 0, req.addr, req.rkey, payload_len, id),
+        None => stream.rdma_write_all(src, 0, req.addr, req.rkey, payload_len),
+    }
+}
+
+// ---- server source buffer pool (spec §8.1 / §8.3) ----------------------------
+
+/// A pool of registered source buffers for zero-copy responses, so a server
+/// amortizes memory registration (`ibv_reg_mr` is expensive — spec §8.1) across
+/// responses on a connection instead of registering one MR per response (§8.3).
+///
+/// MRs are scoped to a protection domain, so a pool belongs to **one connection**
+/// (one [`HordStream`] / async stream); pass that stream's `register_source` to
+/// [`acquire`](Self::acquire). The pool grows **lazily**: it pre-registers nothing,
+/// registers a slab-sized buffer on first need (up to `capacity`), and reuses it
+/// thereafter — so a single-response connection costs exactly one registration
+/// (no worse than registering per response) while a reused connection pays only
+/// `capacity` registrations no matter how many responses it serves.
+///
+/// [`acquire`](Self::acquire) lends a buffer when the payload fits the slab
+/// (`buf_size`); a larger object (§8.4) or a moment the pool is at capacity and
+/// fully lent falls back to a one-off registration, so correctness never depends
+/// on the pool size — only efficiency. The returned [`SourceLease`] hands a pooled
+/// buffer back on drop.
+///
+/// `Clone` is an `Rc` bump: share one pool across a connection's request handlers
+/// (e.g. into a `hyper` `service_fn`). The lease owns its buffer and holds only an
+/// `Rc`, so it is safe to keep across an `.await` — no pool borrow is held. `!Send`
+/// (its buffers hold raw pointers), like everything on the zero-copy path.
+#[derive(Clone)]
+pub struct SourcePool(Rc<RefCell<PoolInner>>);
+
+struct PoolInner {
+    buf_size: usize,           // slab size; a request larger than this falls back
+    capacity: usize,           // max pooled buffers (bounds pinned memory)
+    free: Vec<RegisteredBuffer>,
+    registered: usize,         // pooled buffers in existence (free + lent out)
+    fallbacks: u64,            // one-off registrations (oversized / pool exhausted)
+}
+
+impl SourcePool {
+    /// A pool of up to `capacity` reusable source buffers, each `buf_size` bytes.
+    /// Registers nothing up front (lazy growth — see the type docs); cheap and
+    /// infallible. `buf_size` should be the common response size (larger objects
+    /// fall back, §8.4) and `capacity` the responses a connection may have in
+    /// flight at once (e.g. the split transfer window) so the steady state never
+    /// falls back.
+    pub fn new(capacity: usize, buf_size: usize) -> SourcePool {
+        SourcePool(Rc::new(RefCell::new(PoolInner {
+            buf_size: buf_size.max(1), // a zero-length MR is not portable
+            capacity,
+            free: Vec::new(),
+            registered: 0,
+            fallbacks: 0,
+        })))
+    }
+
+    /// The per-buffer slab size; a request larger than this falls back to a one-off.
+    pub fn buf_size(&self) -> usize {
+        self.0.borrow().buf_size
+    }
+
+    /// Pooled buffers currently free (lendable without registering or falling back).
+    pub fn available(&self) -> usize {
+        self.0.borrow().free.len()
+    }
+
+    /// Pooled buffers registered so far (grows lazily up to `capacity`).
+    pub fn registered(&self) -> usize {
+        self.0.borrow().registered
+    }
+
+    /// One-off (fallback) registrations made: an oversized object, or a moment the
+    /// pool was at capacity and fully lent out. `0` means every response reused (or
+    /// grew) a pooled buffer; a rising count means the slab or capacity is too small
+    /// for the workload.
+    pub fn fallbacks(&self) -> u64 {
+        self.0.borrow().fallbacks
+    }
+
+    /// Borrow a source buffer holding at least `len` bytes. Reuses a free pooled
+    /// buffer when `len <= buf_size`; otherwise, if the request fits the slab and
+    /// the pool is below `capacity`, registers a new slab buffer (lazy growth) that
+    /// will return to the pool on drop; otherwise registers a one-off via `register`
+    /// (oversized §8.4, or pool exhausted). `register` — the owning stream's
+    /// `register_source` — is called only when a registration is actually needed,
+    /// and with no pool borrow held (so it may freely touch the stream).
+    pub fn acquire(
+        &self,
+        len: usize,
+        register: impl FnOnce(usize) -> io::Result<RegisteredBuffer>,
+    ) -> io::Result<SourceLease> {
+        // Fast path: hand out a free pooled buffer that fits, under a momentary
+        // borrow (never held across the caller's write/await — the lease owns the
+        // buffer and only an Rc). Otherwise decide whether to grow the pool.
+        let (grow, slab) = {
+            let mut inner = self.0.borrow_mut();
+            let fits = len <= inner.buf_size;
+            if fits {
+                if let Some(buf) = inner.free.pop() {
+                    return Ok(self.lent(buf));
+                }
+            }
+            (fits && inner.registered < inner.capacity, inner.buf_size)
+        };
+
+        if grow {
+            // Lazily register a fresh slab buffer that joins the pool for reuse.
+            let buf = register(slab)?;
+            let mut inner = self.0.borrow_mut();
+            inner.registered += 1;
+            return Ok(self.lent(buf));
+        }
+
+        // Fallback: oversized for the slab, or the pool is at capacity and empty.
+        let buf = register(len.max(1))?;
+        self.0.borrow_mut().fallbacks += 1;
+        Ok(SourceLease { buf: Some(buf), pool: None })
+    }
+
+    /// Wrap a pooled buffer in a lease that returns it to this pool on drop.
+    fn lent(&self, buf: RegisteredBuffer) -> SourceLease {
+        SourceLease {
+            buf: Some(buf),
+            pool: Some(Rc::clone(&self.0)),
+        }
+    }
+}
+
+/// A source buffer lent by a [`SourcePool`]. Reach it via [`buffer`](Self::buffer)
+/// to fill and RDMA-write from; hold the lease until the write is acknowledged
+/// (the NIC DMA-reads the buffer until then). On drop a pooled buffer returns to
+/// the pool for reuse; a one-off fallback buffer is deregistered. It owns its
+/// buffer and holds only an `Rc` to the pool, so it is safe to keep across an
+/// `.await`.
+pub struct SourceLease {
+    buf: Option<RegisteredBuffer>,
+    // Some -> pooled (return to the pool on drop); None -> one-off (deregister).
+    pool: Option<Rc<RefCell<PoolInner>>>,
+}
+
+impl SourceLease {
+    /// The leased registered source buffer (capacity >= the requested length).
+    pub fn buffer(&self) -> &RegisteredBuffer {
+        self.buf
+            .as_ref()
+            .expect("a SourceLease holds its buffer until it is dropped")
+    }
+}
+
+impl Drop for SourceLease {
+    fn drop(&mut self) {
+        if let (Some(buf), Some(pool)) = (self.buf.take(), self.pool.take()) {
+            // Return the pooled buffer for reuse. The write drained before the
+            // lease dropped, so no DMA references it.
+            pool.borrow_mut().free.push(buf);
+        }
+        // else: a one-off fallback buffer drops here (its MR is deregistered).
     }
 }
 
