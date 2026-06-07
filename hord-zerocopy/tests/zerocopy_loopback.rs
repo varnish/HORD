@@ -14,6 +14,11 @@
 //! a single newline-terminated header value each way — the HTTP layer lives in
 //! the demo; here we test the zero-copy mechanics directly.
 
+// Exercises the RDMA orchestration over Soft-RoCE (`rxe0`), so the whole test
+// crate is gated on the `rdma` feature: the default device-free codec build —
+// `cargo test -p hord-zerocopy` without the feature — skips it entirely.
+#![cfg(feature = "rdma")]
+
 use std::io::{Read, Write};
 use std::sync::{mpsc, Arc, Barrier};
 

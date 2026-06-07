@@ -29,6 +29,36 @@ jobs:
         # port, so serialize to avoid bind() races. The suite runs in seconds.
         run: cargo test --workspace -- --include-ignored --test-threads=1
 
+  # Milestone-1 "device-free build" guarantee. The hord-zerocopy header codec
+  # (RdmaWriteReq / RdmaWriteStatus / RdmaWriteAction) must link and test with the
+  # `rdma` feature OFF — no NIC, no rdma-core, no Soft-RoCE — which is exactly how
+  # an embedder (Carapace) unit-tests header handling on a laptop. This job runs on
+  # a stock runner and deliberately does NOT bring up Soft-RoCE; if anyone makes the
+  # default build pull an RDMA crate, the dependency-tree assertion fails the job.
+  codec:
+    name: codec (device-free, no RDMA libs)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Assert the default hord-zerocopy build pulls no RDMA crate
+        run: |
+          set -euxo pipefail
+          # Default features (rdma off): the normal-dependency tree must be empty —
+          # no hord-stream/hord-core and so none of sideway/rdma-mummy-sys/rdma-core.
+          tree=$(cargo tree -p hord-zerocopy --edges normal)
+          echo "$tree"
+          if echo "$tree" | grep -Eiq 'sideway|rdma-mummy-sys|hord-core|hord-stream'; then
+            echo "::error::hord-zerocopy default build pulled an RDMA crate; the pure codec must stay device-free (Milestone 1)"
+            exit 1
+          fi
+      - name: Build + test the pure codec (rdma feature off)
+        # Compiles the lib + runs the codec unit tests; the RDMA loopback tests are
+        # `#![cfg(feature = "rdma")]` so they compile to empty here. No device, no
+        # rdma-core, no setup-soft-roce — proving the laptop story end to end.
+        run: cargo test -p hord-zerocopy
+
   coverage:
     name: coverage (llvm-cov)
     runs-on: ubuntu-24.04

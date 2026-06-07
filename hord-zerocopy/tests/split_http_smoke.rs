@@ -16,6 +16,11 @@
 //! cargo test -p hord-zerocopy -- --ignored --nocapture split_http_round_trip
 //! ```
 
+// Exercises the RDMA orchestration over Soft-RoCE (`rxe0`), so the whole test
+// crate is gated on the `rdma` feature: the default device-free codec build —
+// `cargo test -p hord-zerocopy` without the feature — skips it entirely.
+#![cfg(feature = "rdma")]
+
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::{Duration, Instant};
 

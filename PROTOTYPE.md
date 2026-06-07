@@ -90,8 +90,10 @@ hord-stream/   HORD wire protocol: handshake, envelope, credit flow control,
                §7.7 split half: write-with-immediate, the completion dispatcher
                (demux by opcode), transfer-credit recv headroom, and the
                data-plane transfer queue.
-hord-zerocopy/ Zero-copy HTTP semantics (spec §7): the X-HORD-RDMA-Write header
-               codec and the client/server orchestration over a HordStream;
+hord-zerocopy/ Zero-copy HTTP semantics (spec §7). Default build: the pure
+               X-HORD-RDMA-Write header codec (RdmaWriteReq / RdmaWriteStatus /
+               RdmaWriteAction) — no dependencies, no RDMA libraries. The `rdma`
+               feature adds the client/server orchestration over a HordStream,
                split-mode dispatch (§7.7) and the SplitReceiver data-plane handle.
 hord-async/    Async wrapper: tokio AsyncRead/AsyncWrite over a HordStream,
                driving the CQ completion-channel fd with AsyncFd (no busy-poll);
@@ -103,12 +105,14 @@ hord-demo/     hord-server / hord-client (sync) and hord-server-async /
                into the RDMA-write path; --split (async) opts into §7.7.
 ```
 
-`hord-core`, `hord-stream` and `hord-zerocopy` have **no third-party crate
-dependencies** — only `std`, plus the system `librdmacm`/`libibverbs` linked
-through the shim (`build.rs` invokes `cc`/`ar` directly, not the `cc` crate). The
-async milestone (`hord-async`, and the demo's hyper bins) is the sole exception:
-it pulls in `tokio` + `hyper`, confined to those crates so the transport stays
-air-gapped-buildable.
+Dependency story: `hord-core` and `hord-stream` take only `sideway` (the safe
+`librdmacm`/`libibverbs` wrapper) plus its `rdma-mummy-sys` bindings; the async
+milestone (`hord-async`, and the demo's hyper bins) adds `tokio` + `hyper`,
+confined to those crates. **`hord-zerocopy` is special: its default build has no
+dependencies at all** — the pure `X-HORD-RDMA-Write` header codec links with no
+RDMA library, so an embedder can unit-test header handling on a machine with no
+NIC and no rdma-core (`cargo test -p hord-zerocopy`). Its `rdma` feature pulls in
+`hord-stream` — and so the RDMA libraries — to add the write orchestration.
 
 ## Building
 

@@ -225,13 +225,32 @@ copies that into a send buffer. The point is a working seam and a throughput num
       server writing 16 MiB to a non-reading client stays blocked mid-write (proving
       `Pending`), and the payload still arrives intact once the client drains.
 
-- [ ] **Feature-isolated build, device-free CI.** Carapace will gate HORD behind a
+- [x] **Feature-isolated build, device-free CI.** Carapace will gate HORD behind a
       cargo feature so the default build and CI need no NIC. HORD already isolates the
       RDMA libs below `hord-async`/`hord-stream`/`hord-core`; keep it that way and
       guarantee the crates Carapace links pull `sideway`/`librdmacm`/`libibverbs`
       *only* when the feature is on. The pure codec types (`hord-zerocopy`'s
       `RdmaWriteReq`/`RdmaWriteStatus`/`RdmaWriteAction`) must stay linkable without
       any RDMA library so Carapace can unit-test header handling on a laptop.
+
+      **Done.** `hord-zerocopy` is now two layers behind one switch. The **default**
+      build is the pure header codec (`RdmaWriteReq`/`RdmaWriteStatus`/`RdmaWriteAction`)
+      with **zero dependencies**: `hord-stream` is an `optional` dep that only the new
+      `rdma` feature enables (`rdma = ["dep:hord-stream"]`), so the default build pulls
+      in *none* of `hord-stream`/`hord-core`/`sideway`/`librdmacm`/`libibverbs`. The
+      write orchestration (`ZeroCopyRequest`, `serve_rdma_write{,_pooled}`, `SourcePool`,
+      `SplitReceiver`/`SplitCompletion`) and the three device loopback tests are gated
+      behind `rdma` (each item `#[cfg(feature = "rdma")]`; the test crates
+      `#![cfg(feature = "rdma")]`). `hord-demo` enables the feature, so the full
+      workspace build/suite is unchanged, while `cargo test -p hord-zerocopy` builds and
+      runs the 14 codec unit tests with no NIC and no rdma-core. A new device-free CI
+      job (`codec`) runs that on a stock runner (no Soft-RoCE) and asserts via
+      `cargo tree` that the default build pulls no RDMA crate — so the isolation can't
+      silently regress. `hord-core`/`hord-stream`/`hord-async` stay RDMA-only by
+      construction (Carapace gates the whole `hord-async` dependency behind its own
+      feature; there is no device-free subset of those to expose). **Remaining (Carapace
+      side):** add the cargo feature that turns on `hord-async` + `hord-zerocopy/rdma`,
+      and keep the default Carapace build/CI codec-only.
 
 ### Milestone 2 — one-sided zero-copy into client buffers (`X-HORD-RDMA-Write`)
 

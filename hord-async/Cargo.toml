@@ -31,4 +31,7 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros", "
 # busy-poll-vs-park measurement in tests/idle_cpu.rs.
 libc = "0.2"
 # Test-only: reuse the X-HORD-RDMA-Write codec in the zero-copy write test.
+# Default features only (no `rdma`): the tests use just the pure header codec
+# (RdmaWriteReq / RdmaWriteStatus), so this dev-dep pulls no extra RDMA linkage
+# beyond what hord-async already has via hord-stream.
 hord-zerocopy = { path = "../hord-zerocopy" }

@@ -1,36 +1,51 @@
 //! HORD zero-copy extension (spec §7.1–7.4): the `X-HORD-RDMA-Write` HTTP
-//! semantics, layered over the one-sided RDMA-write driver in `hord-stream`.
+//! semantics for delivering a response body by one-sided `RDMA_WRITE` straight
+//! into the client's (or a GPU's) registered buffer.
 //!
-//! The split of responsibility:
+//! # Two layers, one feature
 //!
-//! * **`hord-stream`** owns the *mechanism* — capability negotiation
-//!   ([`HordStream::zero_copy_negotiated`]), buffer registration, and the
-//!   one-sided write ([`HordStream::rdma_write_all`]).
-//! * **this crate** owns the *HTTP semantics* — the `X-HORD-RDMA-Write` request
-//!   and response header codec (§12.3 / §12.4) and small orchestration helpers
-//!   that drive a write and report the right status.
+//! * The **header codec** — [`RdmaWriteReq`] and [`RdmaWriteStatus`] (the §12.3 /
+//!   §12.4 request / response header) plus the server-policy decision
+//!   [`RdmaWriteAction`] — is plain `std` Rust with **no third-party or RDMA
+//!   dependency** and is **always** compiled. An embedder can parse and emit the
+//!   header, and compute the §7.3/§7.7 server policy, on a machine with no NIC and
+//!   no `rdma-core` — e.g. unit-testing header handling on a laptop, where the
+//!   default (feature-off) build pulls in nothing at all.
+//! * The **`rdma` feature** (off by default) adds the write *orchestration* —
+//!   `ZeroCopyRequest`, `serve_rdma_write` / `serve_rdma_write_pooled`,
+//!   `SourcePool`, and the split-mode data plane (`SplitReceiver` /
+//!   `SplitCompletion`) — which drives the actual one-sided write and therefore
+//!   pulls in `hord-stream` → `hord-core` → `sideway` / `libibverbs` / `librdmacm`.
 //!
-//! It is plain `std` Rust with no third-party dependencies; the HTTP framing
-//! itself stays with the caller (the demo's hand-rolled codec, or `hyper`).
-//!
-//! ## Flow
-//!
-//! **Client.** Gate on [`HordStream::zero_copy_negotiated`]; build a
-//! [`ZeroCopyRequest`] (registers a destination buffer); add
-//! [`ZeroCopyRequest::header_line`] to the GET. After reading the response head,
-//! parse the `X-HORD-RDMA-Write` response header with [`RdmaWriteStatus::parse`]:
-//! [`RdmaWriteStatus::Complete`] means the body is already in the buffer (read it
-//! with [`ZeroCopyRequest::copy_out`]); otherwise fall back to the stream body.
-//!
-//! **Server.** Gate on negotiation + the presence of the request header; parse it
-//! with [`RdmaWriteReq::parse`] and call [`serve_rdma_write`], which writes the
-//! body into the client's buffer and returns the [`RdmaWriteStatus`] to put in
-//! the response (with `Content-Length: 0`).
+//! The HTTP framing itself stays with the caller (the demo's hand-rolled codec,
+//! or `hyper`); the *mechanism* the orchestration drives — capability negotiation,
+//! buffer registration, the one-sided write — lives in `hord-stream`.
+// The detailed client/server flow references the orchestration types and
+// `HordStream`, which exist only under `rdma`; gate the prose so the codec-only
+// docs (and `cargo doc --no-default-features`) carry no broken intra-doc links.
+#![cfg_attr(
+    feature = "rdma",
+    doc = r#"
+# Flow (`rdma` feature)
 
-use std::cell::RefCell;
-use std::io;
-use std::rc::Rc;
+**Client.** Gate on [`HordStream::zero_copy_negotiated`]; build a
+[`ZeroCopyRequest`] (registers a destination buffer); add
+[`ZeroCopyRequest::header_line`] to the GET. After reading the response head,
+parse the `X-HORD-RDMA-Write` response header with [`RdmaWriteStatus::parse`]:
+[`RdmaWriteStatus::Complete`] means the body is already in the buffer (read it
+with [`ZeroCopyRequest::copy_out`]); otherwise fall back to the stream body.
 
+**Server.** Gate on negotiation + the presence of the request header; parse it
+with [`RdmaWriteReq::parse`] and call [`serve_rdma_write`], which writes the body
+into the client's buffer and returns the [`RdmaWriteStatus`] to put in the
+response (with `Content-Length: 0`).
+"#
+)]
+
+#[cfg(feature = "rdma")]
+use std::{cell::RefCell, io, rc::Rc};
+
+#[cfg(feature = "rdma")]
 use hord_stream::{HordStream, RegisteredBuffer};
 
 /// The HORD zero-copy header name, used for both request and response.
@@ -174,6 +189,15 @@ fn parse_hex_u32(s: &str) -> Option<u32> {
     u32::from_str_radix(s, 16).ok()
 }
 
+// ==============================================================================
+// Write *orchestration* (§7.3 / §7.7). Every item below marked
+// `#[cfg(feature = "rdma")]` drives the one-sided write and so depends on
+// `hord-stream` -> `hord-core` -> sideway / libibverbs / librdmacm. The one
+// unmarked exception is `RdmaWriteAction`: the pure server-policy decision,
+// shared with the async demo server, which stays in the default codec build like
+// the header types above. See the crate docs for the two-layer split.
+// ==============================================================================
+
 // ---- client orchestration ----------------------------------------------------
 
 /// A registered destination buffer for a zero-copy response, together with the
@@ -182,11 +206,13 @@ fn parse_hex_u32(s: &str) -> Option<u32> {
 /// this buffer (delivered out-of-band by the server's RDMA write — RC ordering
 /// guarantees it has landed by the time the response head arrives). Read it with
 /// [`copy_out`](Self::copy_out).
+#[cfg(feature = "rdma")]
 pub struct ZeroCopyRequest {
     buf: RegisteredBuffer,
     id: Option<u32>,
 }
 
+#[cfg(feature = "rdma")]
 impl ZeroCopyRequest {
     /// Register a `capacity`-byte destination region the server may RDMA-write
     /// into. Gate on [`HordStream::zero_copy_negotiated`] before offering it.
@@ -218,7 +244,8 @@ impl ZeroCopyRequest {
         self.id
     }
 
-    /// The request descriptor (`addr`/`rkey`/`len`[/`id`]) for this buffer.
+    /// The request descriptor (`addr`/`rkey`/`len`, plus `id` in split mode) for
+    /// this buffer.
     pub fn request(&self) -> RdmaWriteReq {
         RdmaWriteReq {
             addr: self.buf.as_mut_ptr() as u64,
@@ -248,12 +275,16 @@ impl ZeroCopyRequest {
 
 // ---- server orchestration ----------------------------------------------------
 
-/// The action [`serve_rdma_write`] takes for a given request and object size —
+/// The action `serve_rdma_write` takes for a given request and object size —
 /// the §7.3 / §7.7 *server policy*, factored out as a pure decision function so
 /// the synchronous library path here and the async demo server share one source
 /// of truth. (They can't share the *mechanism*: one drives the blocking
-/// [`HordStream::rdma_write_all`], the other an async `rdma_write` future — but
-/// the policy that used to drift between them is all here.)
+/// `HordStream::rdma_write_all`, the other an async `rdma_write` future — but the
+/// policy that used to drift between them is all here.)
+///
+/// This is **pure** — no device, no I/O — so it lives in the default codec build
+/// and unit-tests without an RDMA library; only its executors (`serve_rdma_write`
+/// and friends) need the `rdma` feature.
 ///
 /// Compute it with [`decide`](Self::decide); then either return the status (for
 /// [`Respond`](Self::Respond)) or run the write with your path's own register /
@@ -288,7 +319,7 @@ pub enum RdmaWriteAction {
 impl RdmaWriteAction {
     /// Decide the action for delivering `object_size` bytes against the client's
     /// request `req`, given whether protocol splitting was negotiated on the
-    /// connection (`split_negotiated` — pass [`HordStream::split_mode_negotiated`]).
+    /// connection (`split_negotiated` — pass `HordStream::split_mode_negotiated`).
     /// Pure: no device and no I/O, so it unit-tests on its own.
     pub fn decide(req: &RdmaWriteReq, object_size: u64, split_negotiated: bool) -> Self {
         if object_size > req.len {
@@ -351,6 +382,7 @@ impl RdmaWriteAction {
 /// The §7.3/§7.7 decision — too-large, split vs. plain, the zero-length handling —
 /// is [`RdmaWriteAction::decide`]; this function just executes the resulting plan
 /// with the blocking write calls, so the async server can share the same policy.
+#[cfg(feature = "rdma")]
 pub fn serve_rdma_write(
     stream: &mut HordStream,
     req: &RdmaWriteReq,
@@ -392,6 +424,7 @@ pub fn serve_rdma_write(
 /// registration (an oversized object — §8.4 — or a momentarily exhausted pool), so
 /// correctness never depends on the pool being large enough. The leased buffer is
 /// returned to the pool for reuse only after the write is acknowledged.
+#[cfg(feature = "rdma")]
 pub fn serve_rdma_write_pooled(
     stream: &mut HordStream,
     pool: &SourcePool,
@@ -426,6 +459,7 @@ pub fn serve_rdma_write_pooled(
 /// (split mode, §7.7) or a plain write. Blocks until the write is acknowledged.
 /// Shared by [`serve_rdma_write`] and [`serve_rdma_write_pooled`] so the only thing
 /// that differs between them is where the source comes from.
+#[cfg(feature = "rdma")]
 fn run_write_plan(
     stream: &mut HordStream,
     src: &RegisteredBuffer,
@@ -467,9 +501,11 @@ fn run_write_plan(
 /// (e.g. into a `hyper` `service_fn`). The lease owns its buffer and holds only an
 /// `Rc`, so it is safe to keep across an `.await` — no pool borrow is held. `!Send`
 /// (its buffers hold raw pointers), like everything on the zero-copy path.
+#[cfg(feature = "rdma")]
 #[derive(Clone)]
 pub struct SourcePool(Rc<RefCell<PoolInner>>);
 
+#[cfg(feature = "rdma")]
 struct PoolInner {
     buf_size: usize,           // slab size; a request larger than this falls back
     capacity: usize,           // max pooled buffers (bounds pinned memory)
@@ -478,6 +514,7 @@ struct PoolInner {
     fallbacks: u64,            // one-off registrations (oversized / pool exhausted)
 }
 
+#[cfg(feature = "rdma")]
 impl SourcePool {
     /// A pool of up to `capacity` reusable source buffers, each `buf_size` bytes.
     /// Registers nothing up front (lazy growth — see the type docs); cheap and
@@ -573,12 +610,14 @@ impl SourcePool {
 /// the pool for reuse; a one-off fallback buffer is deregistered. It owns its
 /// buffer and holds only an `Rc` to the pool, so it is safe to keep across an
 /// `.await`.
+#[cfg(feature = "rdma")]
 pub struct SourceLease {
     buf: Option<RegisteredBuffer>,
     // Some -> pooled (return to the pool on drop); None -> one-off (deregister).
     pool: Option<Rc<RefCell<PoolInner>>>,
 }
 
+#[cfg(feature = "rdma")]
 impl SourceLease {
     /// The leased registered source buffer (capacity >= the requested length).
     pub fn buffer(&self) -> &RegisteredBuffer {
@@ -588,6 +627,7 @@ impl SourceLease {
     }
 }
 
+#[cfg(feature = "rdma")]
 impl Drop for SourceLease {
     fn drop(&mut self) {
         if let (Some(buf), Some(pool)) = (self.buf.take(), self.pool.take()) {
@@ -606,6 +646,7 @@ impl Drop for SourceLease {
 /// this is returned the payload is fully in the client's registered buffer (QP
 /// ordering guarantees the write landed before the immediate's completion,
 /// §7.7.2), so the consumer can use it immediately without the HTTP response.
+#[cfg(feature = "rdma")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SplitCompletion {
     /// The transfer ID, echoed from the write-with-immediate's `imm_data`.
@@ -624,10 +665,12 @@ pub struct SplitCompletion {
 /// its requests, then the data plane drains completions. A production split would
 /// run the data plane on its own thread polling the shared CQ directly; that
 /// needs a multi-waiter scheme and is deferred.
+#[cfg(feature = "rdma")]
 pub struct SplitReceiver<'s> {
     stream: &'s mut HordStream,
 }
 
+#[cfg(feature = "rdma")]
 impl<'s> SplitReceiver<'s> {
     /// Borrow `stream` as a data-plane receiver. Errors if protocol splitting was
     /// not negotiated on this connection (gate with

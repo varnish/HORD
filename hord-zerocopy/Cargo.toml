@@ -7,9 +7,26 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-# Like hord-core/hord-stream, this crate is plain std Rust with no third-party
-# dependencies. It layers the HORD zero-copy *HTTP semantics* (§7) over the
-# RDMA-write driver in hord-stream; tokio/hyper stay confined to hord-async and
-# the demo.
+# This crate is two layers behind one feature switch:
+#
+#   * default (no features): the pure `X-HORD-RDMA-Write` header codec —
+#     RdmaWriteReq / RdmaWriteStatus / RdmaWriteAction — plain std Rust with NO
+#     dependency at all. It links (and unit-tests) on a machine with no NIC and no
+#     rdma-core, so an embedder (Carapace) can test header handling on a laptop.
+#     This is the Milestone-1 "device-free" guarantee.
+#   * `rdma`: adds the one-sided-write orchestration (ZeroCopyRequest /
+#     serve_rdma_write* / SourcePool / SplitReceiver + SplitCompletion), which
+#     drives the actual RDMA write and so depends on hord-stream — pulling in
+#     hord-core -> sideway / libibverbs / librdmacm.
+#
+# Off by default on purpose: an embedder that wants only the codec gets no RDMA
+# libraries without having to remember `default-features = false` — a forgotten
+# flag must fail closed (no libs), not open. tokio/hyper stay in hord-async/demo.
+[features]
+default = []
+rdma = ["dep:hord-stream"]
+
 [dependencies]
-hord-stream = { path = "../hord-stream" }
+# Only pulled in (and only then is hord-core -> sideway/rdma-core pulled) when the
+# `rdma` feature is on; the default codec build has zero dependencies.
+hord-stream = { path = "../hord-stream", optional = true }

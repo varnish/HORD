@@ -36,7 +36,7 @@ exercised on this host (Soft-RoCE has no GPU peer-memory path). See
 | ---------------- | ------------------------------------------------------------------------- |
 | `hord-core`      | RDMA transport: device/PD/QP lifecycle, MR registration, CQ processing. Wraps `libibverbs`/`librdmacm` via the `sideway` crate. |
 | `hord-stream`    | HORD wire protocol: handshake, envelope, credit flow control, the `HordStream` byte stream, and the zero-copy / split-mode write drivers. |
-| `hord-zerocopy`  | Zero-copy HTTP semantics (§7): the `X-HORD-RDMA-Write` codec, client/server orchestration, the source-buffer pool, and the `SplitReceiver` data plane. |
+| `hord-zerocopy`  | Zero-copy HTTP semantics (§7). **Default:** the pure `X-HORD-RDMA-Write` header codec (`RdmaWriteReq`/`RdmaWriteStatus`/`RdmaWriteAction`) — no dependencies, links with no NIC or RDMA libraries. **`rdma` feature:** adds the client/server write orchestration, the source-buffer pool, and the `SplitReceiver` data plane (depends on `hord-stream`). |
 | `hord-async`     | tokio `AsyncRead`/`AsyncWrite` over a `HordStream`, driving the CQ event fd with `AsyncFd` (no busy-poll); reactor split for multi-task duplex + data plane. |
 | `hord-demo`      | `hord-server`/`hord-client` (sync) and `hord-server-async`/`hord-client-async` (`hyper`). |
 
@@ -71,8 +71,14 @@ The `*-async` binaries behave identically over `hyper`; `--split` (async) exerci
 ```sh
 # Full suite incl. the RDMA loopback tests (need the rxe device up).
 cargo test --workspace -- --include-ignored --test-threads=1
-# Device-free logic tests only (wire format, handshake, parsers):
+
+# Logic tests only (wire format, handshake, parsers): no device to run, but still
+# builds the transport, so it needs the RDMA dev packages installed:
 cargo test --workspace
+
+# Pure header codec only: needs neither a NIC nor rdma-core (the hord-zerocopy
+# `rdma` feature is off) — how an embedder unit-tests X-HORD-RDMA-Write on a laptop.
+cargo test -p hord-zerocopy
 ```
 
 ## Documentation

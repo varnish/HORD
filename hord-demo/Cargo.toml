@@ -8,7 +8,10 @@ authors.workspace = true
 
 [dependencies]
 hord-stream = { path = "../hord-stream" }
-hord-zerocopy = { path = "../hord-zerocopy" }
+# The demo drives the actual one-sided write (ZeroCopyRequest / serve_rdma_write* /
+# SourcePool), so it needs the orchestration layer — hence `features = ["rdma"]`.
+# (Carapace's codec-only unit tests omit this and get the pure header codec.)
+hord-zerocopy = { path = "../hord-zerocopy", features = ["rdma"] }
 # Async + hyper demo (server_async / client_async). The sync bins below use
 # only hord-stream + hord-zerocopy; these third-party deps are pulled in for the
 # hyper bins.
