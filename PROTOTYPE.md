@@ -211,8 +211,13 @@ What remains:
   split. The `HordStream` state machine was unchanged; it only ever lacked a way
   to be driven from more than one async task. (`SharedAsyncStream` still keeps a
   zero-copy write on the *single* hyper task and is the right tool there.)
-- **Thread-per-connection, not thread-per-core.** A real server would use a
-  bounded worker pool with `spawn_local`, not one OS thread per connection.
+- **Thread-per-core via `HordListener`.** The async server topology now lives in a
+  reusable library type, `hord_async::HordListener` (`hord-async/src/listener.rs`):
+  an accept loop + a thread-per-core worker pool (one current-thread runtime /
+  `LocalSet` + completion domain per worker), each connection `spawn_local`d on its
+  worker, plus a `watch`-driven graceful shutdown. The host supplies only a
+  per-connection service closure `(AsyncHordStream, SocketAddr) -> impl Future` —
+  the Carapace "Blocker 0" seam (see TODO.md). The demo server runs on it.
 - **Zero-copy source registered per response.** The server registers (and frees)
   a source MR per zero-copy *or split-mode* response; a real server would
   amortize this with a pool (spec §8.3). §7.5 GPUDirect remains unbuilt

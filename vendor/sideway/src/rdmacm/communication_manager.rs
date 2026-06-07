@@ -168,8 +168,8 @@ use os_socketaddr::OsSocketAddr;
 use rdma_mummy_sys::{
     ibv_qp_attr, rdma_accept, rdma_ack_cm_event, rdma_bind_addr, rdma_cm_event, rdma_cm_event_type, rdma_cm_id,
     rdma_conn_param, rdma_connect, rdma_create_event_channel, rdma_create_id, rdma_destroy_event_channel,
-    rdma_destroy_id, rdma_disconnect, rdma_establish, rdma_event_channel, rdma_get_cm_event, rdma_init_qp_attr,
-    rdma_listen, rdma_migrate_id, rdma_port_space, rdma_resolve_addr, rdma_resolve_route,
+    rdma_destroy_id, rdma_disconnect, rdma_establish, rdma_event_channel, rdma_get_cm_event, rdma_get_peer_addr,
+    rdma_init_qp_attr, rdma_listen, rdma_migrate_id, rdma_port_space, rdma_resolve_addr, rdma_resolve_route,
 };
 
 use crate::ibverbs::device_context::DeviceContext;
@@ -743,6 +743,43 @@ impl Identifier {
         let cm_id = self.cm_id;
 
         unsafe { cm_id.as_ref().port_num }
+    }
+
+    /// The peer's resolved socket address for an established connection
+    /// (`rdma_get_peer_addr`). For RoCE this is the address the CM derived from
+    /// the peer's GID. Returns `None` before the address is known (family
+    /// `AF_UNSPEC`, e.g. on a listener id) or for an address family this wrapper
+    /// does not map.
+    ///
+    /// # HORD addition
+    ///
+    /// Not part of upstream sideway 0.4.3 — added alongside [`migrate`] so a HORD
+    /// listener can label each accepted connection with its peer's address (the
+    /// `SocketAddr` it hands to the per-connection service). See HORD-PATCH.md.
+    ///
+    /// [`migrate`]: crate::rdmacm::communication_manager::Identifier::migrate
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        // SAFETY: `cm_id` is live for the borrow of `&self`. `rdma_get_peer_addr`
+        // hands back a `&sockaddr` into the id's destination address, but that
+        // reference only carries provenance for `size_of::<sockaddr>()` (16) bytes
+        // — too narrow to read a `sockaddr_in6` (28) without an out-of-provenance
+        // read (UB under Stacked Borrows / Miri). So we use it only to read the
+        // family and locate the address, then copy the family-appropriate length
+        // through a pointer re-derived from `cm_id`'s whole-allocation provenance
+        // (the sockaddr lives inside that allocation, backed by a `sockaddr_storage`
+        // ≥ 28 bytes), which keeps the read in bounds.
+        unsafe {
+            let sa = rdma_get_peer_addr(self.cm_id.as_ref());
+            let len = match i32::from(sa.sa_family) {
+                libc::AF_INET => core::mem::size_of::<libc::sockaddr_in>(),
+                libc::AF_INET6 => core::mem::size_of::<libc::sockaddr_in6>(),
+                _ => return None,
+            };
+            let base = self.cm_id.as_ptr() as *const u8;
+            let offset = (sa as *const libc::sockaddr as *const u8 as usize) - base as usize;
+            let wide = base.add(offset) as *const libc::sockaddr;
+            OsSocketAddr::copy_from_raw(wide, len as libc::socklen_t).into_addr()
+        }
     }
 
     /// Bind the [`Identifier`] to a specific address. Note that users shouldn't bind to a loopback

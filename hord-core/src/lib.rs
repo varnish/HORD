@@ -37,7 +37,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sideway::ibverbs::completion::{
     CompletionChannel, CompletionQueue, ExtendedCompletionQueue, GenericCompletionQueue,
@@ -51,7 +51,7 @@ use sideway::ibverbs::queue_pair::{
 };
 use sideway::ibverbs::AccessFlags;
 use sideway::rdmacm::communication_manager::{
-    ConnectionParameter, EventChannel, EventType, GetEventErrorKind, Identifier, PortSpace,
+    ConnectionParameter, Event, EventChannel, EventType, GetEventErrorKind, Identifier, PortSpace,
 };
 
 /// IBV_ACCESS_LOCAL_WRITE — the only MR access flag the stream path needs.
@@ -314,42 +314,109 @@ impl Listener {
     pub fn accept(&self, send_wr: usize, recv_wr: usize, cm: CmParams) -> io::Result<Connection> {
         loop {
             let event = self.event_channel.get_cm_event().map_err(to_io)?;
-            match event.event_type() {
-                EventType::ConnectRequest => {
-                    // A fresh cm_id for this connection (distinct from the
-                    // listener id); it is migrated to its own channel below.
-                    let id = event
-                        .cm_id()
-                        .ok_or_else(|| io::Error::other("connect request carried no cm id"))?;
-                    event.ack().map_err(to_io)?;
-                    // Give this connection its own CM event channel, decoupled
-                    // from the listener's, so finishing it (and later watching it
-                    // for disconnect) never competes with the next accept() — a
-                    // looping, multi-threaded acceptor is then race-free. The
-                    // ConnectRequest must be acked (above) before migrating.
-                    let conn_channel = EventChannel::new().map_err(to_io)?;
-                    id.migrate(&conn_channel).map_err(to_io)?;
-                    let ep = Endpoint::build(&id, send_wr, recv_wr)?;
-                    let conn = Connection::new(conn_channel, id, ep, Role::Server, cm);
-                    conn.modify_qp(QueuePairState::Init)?;
-                    return Ok(conn);
-                }
-                // Device removal on the listener is terminal — surface it rather
-                // than ack-and-spin (the next get_cm_event would block forever).
-                EventType::DeviceRemoval => {
-                    let _ = event.ack();
-                    return Err(io::Error::other(
-                        "RDMA device removed while listening for connections",
-                    ));
-                }
-                // Other events can legitimately appear on the listener channel
-                // (e.g. a stray TimewaitExit); they are benign — ack and keep
-                // waiting for the next connection request.
-                _ => {
-                    let _ = event.ack();
-                }
+            if let Some(conn) = self.process_event(event, send_wr, recv_wr, cm)? {
+                return Ok(conn);
             }
         }
+    }
+
+    /// Non-blocking [`accept`](Self::accept): return the next pending connection,
+    /// or `Ok(None)` if no connection request is queued right now. Requires the
+    /// listener's CM channel to have been put in non-blocking mode first (see
+    /// [`set_nonblocking`](Self::set_nonblocking)); pair it with [`cm_fd`](Self::cm_fd)
+    /// so an event loop can park on the fd and call this only when it is readable.
+    ///
+    /// Drains benign non-`ConnectRequest` events (e.g. a stray `TimewaitExit`) in
+    /// the same call, so a readable fd that carried only those returns `Ok(None)`
+    /// rather than a spurious connection. Device removal is still surfaced as an
+    /// error, as in the blocking path.
+    pub fn try_accept(
+        &self,
+        send_wr: usize,
+        recv_wr: usize,
+        cm: CmParams,
+    ) -> io::Result<Option<Connection>> {
+        loop {
+            match self.event_channel.get_cm_event() {
+                Ok(event) => {
+                    if let Some(conn) = self.process_event(event, send_wr, recv_wr, cm)? {
+                        return Ok(Some(conn));
+                    }
+                    // Benign event drained; loop to see if another is queued.
+                }
+                // Channel is non-blocking and empty: no connection pending.
+                // `GetEventError` is `#[non_exhaustive]` (its ctor can't be
+                // matched), so reach the kind through its public `.0` field.
+                Err(e) => match &e.0 {
+                    GetEventErrorKind::NoEvent => return Ok(None),
+                    _ => return Err(to_io(e)),
+                },
+            }
+        }
+    }
+
+    /// Handle one CM event from the listener channel: build + return a
+    /// [`Connection`] for a `ConnectRequest`, surface `DeviceRemoval` as a fatal
+    /// error, or ack-and-ignore anything else (`Ok(None)`). Shared by the blocking
+    /// [`accept`](Self::accept) and non-blocking [`try_accept`](Self::try_accept) so
+    /// the connection-setup dance lives in exactly one place.
+    fn process_event(
+        &self,
+        event: Event,
+        send_wr: usize,
+        recv_wr: usize,
+        cm: CmParams,
+    ) -> io::Result<Option<Connection>> {
+        match event.event_type() {
+            EventType::ConnectRequest => {
+                // A fresh cm_id for this connection (distinct from the listener
+                // id); it is migrated to its own channel below.
+                let id = event
+                    .cm_id()
+                    .ok_or_else(|| io::Error::other("connect request carried no cm id"))?;
+                event.ack().map_err(to_io)?;
+                // Give this connection its own CM event channel, decoupled from
+                // the listener's, so finishing it (and later watching it for
+                // disconnect) never competes with the next accept() — a looping,
+                // multi-threaded acceptor is then race-free. The ConnectRequest
+                // must be acked (above) before migrating.
+                let conn_channel = EventChannel::new().map_err(to_io)?;
+                id.migrate(&conn_channel).map_err(to_io)?;
+                let ep = Endpoint::build(&id, send_wr, recv_wr)?;
+                let conn = Connection::new(conn_channel, id, ep, Role::Server, cm);
+                conn.modify_qp(QueuePairState::Init)?;
+                Ok(Some(conn))
+            }
+            // Device removal on the listener is terminal — surface it rather than
+            // ack-and-spin (the next get_cm_event would block forever).
+            EventType::DeviceRemoval => {
+                let _ = event.ack();
+                Err(io::Error::other(
+                    "RDMA device removed while listening for connections",
+                ))
+            }
+            // Other events can legitimately appear on the listener channel (e.g. a
+            // stray TimewaitExit); they are benign — ack and keep waiting.
+            _ => {
+                let _ = event.ack();
+                Ok(None)
+            }
+        }
+    }
+
+    /// Put the listener's CM event channel in (non-)blocking mode. Call with
+    /// `true` before driving [`try_accept`](Self::try_accept) from an event loop;
+    /// the default (blocking) mode is what [`accept`](Self::accept) needs.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.event_channel.set_nonblocking(nonblocking).map_err(to_io)
+    }
+
+    /// File descriptor of the listener's CM event channel, for registration with
+    /// an event loop. Readable when a CM event (e.g. a connection request) is
+    /// pending; drain it with [`try_accept`](Self::try_accept). Owned by the
+    /// listener; valid for its life.
+    pub fn cm_fd(&self) -> RawFd {
+        self.event_channel.as_raw_fd()
     }
 }
 
@@ -509,8 +576,14 @@ impl Connection {
         Ok(())
     }
 
-    /// Server side: drive RTR → RTS, accept (sending our QP number), and block
-    /// until ESTABLISHED.
+    /// Server side: drive RTR → RTS, accept (sending our QP number), and wait —
+    /// **bounded by [`ESTABLISH_TIMEOUT`]** — for ESTABLISHED.
+    ///
+    /// The timeout matters for a threaded acceptor (e.g. `hord-async::HordListener`):
+    /// this runs on the worker that will drive the connection, so a peer that issues
+    /// a connect request and then stalls (never establishing) must not block that
+    /// worker — and its other connections — forever. On timeout this returns
+    /// `TimedOut` and the caller drops the half-open connection.
     pub fn accept_finish(&self) -> io::Result<()> {
         debug_assert_eq!(self.role, Role::Server);
         let qp_number = self.with_qp(|qp| Ok(qp.qp_number()))?;
@@ -521,7 +594,7 @@ impl Connection {
         let mut param = ConnectionParameter::default();
         param.setup_qp_number(qp_number);
         self.id.accept(param).map_err(to_io)?;
-        expect_event(&self.event_channel, EventType::Established)?;
+        expect_event_timed(&self.event_channel, EventType::Established, ESTABLISH_TIMEOUT)?;
         Ok(())
     }
 
@@ -773,6 +846,16 @@ impl Connection {
         Ok(self.event_channel.as_raw_fd())
     }
 
+    /// The peer's resolved socket address, once the connection is established.
+    /// For RoCE this is the address the CM derived from the peer's GID. `None`
+    /// before establishment or for an address family the wrapper does not map.
+    /// A HORD listener uses this to label each connection with its peer for the
+    /// per-connection service. (Relies on the vendored sideway `peer_addr`
+    /// addition — see vendor/sideway/HORD-PATCH.md.)
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.id.peer_addr()
+    }
+
     /// Make the CM channel non-blocking. Call only *after* the handshake — setup
     /// relies on blocking CM waits.
     pub fn set_cm_nonblock(&self) -> io::Result<()> {
@@ -859,6 +942,12 @@ impl Drop for Connection {
     }
 }
 
+/// Upper bound on the server's wait for ESTABLISHED in
+/// [`accept_finish`](Connection::accept_finish). A peer that connects then never
+/// establishes must not pin the accepting worker forever; mirrors the spirit of
+/// the first-message handshake timeout in `hord-stream`.
+const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Block for the next CM event and require it to be `want`; ack it either way.
 fn expect_event(channel: &Arc<EventChannel>, want: EventType) -> io::Result<()> {
     let event = channel.get_cm_event().map_err(to_io)?;
@@ -871,5 +960,49 @@ fn expect_event(channel: &Arc<EventChannel>, want: EventType) -> io::Result<()> 
         Err(io::Error::other(format!(
             "expected CM event {want:?}, got {got:?} (status {status})"
         )))
+    }
+}
+
+/// Like [`expect_event`], but bounded by `timeout`. Flips the channel non-blocking
+/// and polls for the event with a deadline, so a stalled peer cannot block the
+/// caller indefinitely. Returns [`io::ErrorKind::TimedOut`] if the event does not
+/// arrive in time. The channel is left non-blocking (which is the state the stream
+/// layer wants post-handshake anyway, for half-close detection).
+fn expect_event_timed(
+    channel: &Arc<EventChannel>,
+    want: EventType,
+    timeout: Duration,
+) -> io::Result<()> {
+    channel.set_nonblocking(true).map_err(to_io)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match channel.get_cm_event() {
+            Ok(event) => {
+                let got = event.event_type();
+                let status = event.status();
+                event.ack().map_err(to_io)?;
+                return if got == want {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "expected CM event {want:?}, got {got:?} (status {status})"
+                    )))
+                };
+            }
+            // Non-blocking channel with nothing pending: spin to the deadline.
+            // `GetEventError` is `#[non_exhaustive]`; reach its kind via `.0`.
+            Err(e) => match &e.0 {
+                GetEventErrorKind::NoEvent => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("timed out waiting for CM event {want:?}"),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                _ => return Err(to_io(e)),
+            },
+        }
     }
 }

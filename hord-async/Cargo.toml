@@ -13,10 +13,17 @@ repository.workspace = true
 # host with only a C compiler and rdma-core).
 [dependencies]
 hord-stream = { path = "../hord-stream" }
-# "rt" is needed for `spawn_local` + `JoinHandle`: the multi-waiter split
-# (`AsyncHordStream::into_split`) drives the shared completion fd from one pump
-# task while the read/write/data handles run on their own tasks.
-tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }
+# "rt": `spawn_local`/`spawn_blocking`/`LocalSet` + the current-thread runtimes
+#   the multi-waiter split (`AsyncHordStream::into_split`) and `HordListener`'s
+#   thread-per-core workers run on.
+# "sync": `watch` (graceful-shutdown signal) + `mpsc` (acceptor → worker handoff)
+#   for `HordListener`.
+# "macros": `tokio::select!` in the listener's accept loop (shutdown vs. accept).
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "sync", "macros"] }
+# Lightweight logging facade for the server loop (handshake/accept/drain
+# diagnostics). Near-zero cost with no logger installed; integrates with the
+# host's `log` setup (e.g. Carapace) when there is one.
+log = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros", "sync"] }

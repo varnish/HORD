@@ -336,12 +336,33 @@ impl HordStream {
     /// now exchanged (over the QP as the first messages, no longer in CM private
     /// data), since the peer's handshake isn't available until the QP is up.
     pub fn accept_begin(listener: &Listener, config: &HordConfig) -> io::Result<Connection> {
-        // The QP must hold the control lane's extra WRs, the split-mode transfer
-        // headroom, and the handshake's send/recv, on top of the data pools.
-        listener.accept(
+        let (send_wr, recv_wr) = Self::accept_qp_sizing(config);
+        listener.accept(send_wr, recv_wr, config.cm)
+    }
+
+    /// Non-blocking [`accept_begin`](Self::accept_begin): return the next pending
+    /// connection, or `Ok(None)` if none is queued right now. Requires the
+    /// listener to be in non-blocking mode ([`Listener::set_nonblocking`]); pair
+    /// with [`Listener::cm_fd`] so an event loop can park on the fd and call this
+    /// only when it is readable. This is the accept primitive `hord-async`'s
+    /// `HordListener` builds its async accept loop on, so a graceful-shutdown
+    /// signal can interrupt accepting instead of blocking inside the CM channel.
+    pub fn try_accept_begin(
+        listener: &Listener,
+        config: &HordConfig,
+    ) -> io::Result<Option<Connection>> {
+        let (send_wr, recv_wr) = Self::accept_qp_sizing(config);
+        listener.try_accept(send_wr, recv_wr, config.cm)
+    }
+
+    /// QP send/recv-queue sizing for an accepted connection: the data pools plus
+    /// the control lane's reserved WRs, the split-mode transfer headroom, and the
+    /// handshake's one send + one recv. Shared by [`accept_begin`](Self::accept_begin)
+    /// and [`try_accept_begin`](Self::try_accept_begin) so the two can't drift.
+    fn accept_qp_sizing(config: &HordConfig) -> (usize, usize) {
+        (
             config.send_pool_size + CTRL_SEND_SLOTS + HS_SEND_SLOTS,
             recv_wr_count(config) + HS_RECV_SLOTS,
-            config.cm,
         )
     }
 

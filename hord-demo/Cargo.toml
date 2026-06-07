@@ -13,7 +13,9 @@ hord-zerocopy = { path = "../hord-zerocopy" }
 # only hord-stream + hord-zerocopy; these third-party deps are pulled in for the
 # hyper bins.
 hord-async = { path = "../hord-async" }
-tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
+# "sync" (watch shutdown channel) + "signal" (Ctrl-C → graceful drain) are for
+# the server_async demo's HordListener wiring; the rest drive hyper + the stream.
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "signal"] }
 hyper = { version = "1", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body = "1"

@@ -18,19 +18,21 @@
 //! same stream object (see hord-async). Other body responses to a zero-copy
 //! request echo `status=declined`.
 //!
-//! Concurrency model: **thread-per-core**. A fixed pool of worker threads (one per
-//! core by default, `--workers N` to override) each runs a current-thread Tokio
-//! runtime + `LocalSet`. A blocking acceptor loop on the main thread round-robins
-//! each accepted connection — the `Send` `Connection` from `accept_begin` — to a
-//! worker over a channel; the worker `spawn_local`s a task that builds and drives
-//! the `!Send` async stream. One worker thus drives *many* connections
-//! concurrently on one core via its reactor (each connection still has its own CQ
-//! completion-channel fd, registered with that runtime's epoll — the 1:1 model;
-//! the N:1 completion-channel demux in 113.md is a later fd-economy optimization,
-//! not required here). This replaces the previous one-OS-thread-per-connection
-//! model, so connection count no longer maps to thread count.
+//! Concurrency model: **thread-per-core**, owned by [`hord_async::HordListener`].
+//! The listener runs an accept loop and a fixed pool of worker threads (one per
+//! core by default, `--workers N` to override), each a current-thread Tokio
+//! runtime + `LocalSet`; it round-robins each accepted connection to a worker,
+//! which builds and `spawn_local`s the `!Send` async stream. One worker thus
+//! drives *many* connections concurrently on one core via its reactor (each with
+//! its own CQ completion-channel fd — the 1:1 model; the N:1 demux in 113.md is a
+//! later fd-economy optimization). The demo supplies only the per-connection
+//! service — a closure `(AsyncHordStream, SocketAddr) -> impl Future` — which is
+//! exactly the seam a host like Carapace plugs into. Ctrl-C fires the listener's
+//! graceful-shutdown signal, which stops accepting and drains in-flight
+//! connections before returning.
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::process::ExitCode;
 use std::task::{Context, Poll};
@@ -43,14 +45,14 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 
-use hord_async::{AsyncHordStream, SharedAsyncStream};
+use hord_async::{AsyncHordStream, HordListener, SharedAsyncStream};
 use hord_demo::{
     content_range, content_range_unsatisfied, parse_range, pattern_byte,
     pattern_fill_registered_from, RangeSpec,
 };
-use hord_stream::{HordConfig, HordStream, Listener};
+use hord_stream::HordConfig;
 use hord_zerocopy::{RdmaWriteAction, RdmaWriteReq, RdmaWriteStatus, SourcePool, HEADER};
 
 const DEFAULT_BIND: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
@@ -363,27 +365,16 @@ async fn serve_zero_copy(
     }
 }
 
-/// Drive one accepted connection to completion as a `spawn_local` task on a
-/// worker's runtime. The stream is wrapped in a [`SharedAsyncStream`] so the
-/// request handler can reach it to perform a zero-copy RDMA write while hyper owns
-/// it for HTTP. `!Send` (it builds the `!Send` async stream), so it must be
-/// `spawn_local`d — never `tokio::spawn`.
+/// The per-connection service the demo hands to [`HordListener`]: wrap the stream
+/// in a [`SharedAsyncStream`] so the request handler can reach it for a zero-copy
+/// RDMA write while hyper owns it for HTTP, give it a per-connection source pool,
+/// and serve HTTP/1.1. This is the seam a host (e.g. Carapace) plugs into — the
+/// listener owns the thread topology; this only describes one connection.
 ///
-/// Caveat: `from_accepted` completes the HORD handshake *synchronously* (a brief
-/// CQ busy-poll for one round trip), which momentarily pins this worker — and so
-/// its other connections — until it returns. Acceptable here because the handshake
-/// is a single fast exchange and the test fleet confirms one worker multiplexes
-/// many connections; a production thread-per-core server would run the handshake
-/// asynchronously (or on a dedicated handshake stage) so a slow-handshaking peer
-/// cannot stall a worker's other connections.
-async fn run_connection(conn: hord_stream::Connection, config: HordConfig) {
-    let stream = match AsyncHordStream::from_accepted(conn, &config) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[server] handshake failed: {e}");
-            return;
-        }
-    };
+/// (The HORD handshake already completed inside the listener's
+/// `AsyncHordStream::from_accepted`, on this same worker thread — see the
+/// `HordListener` "synchronous handshake" caveat.)
+async fn serve_connection(stream: AsyncHordStream, peer: SocketAddr) {
     let shared = SharedAsyncStream::new(stream);
     let handle = shared.clone();
     // One lazy source pool per connection (MRs are PD-scoped); cloned into the
@@ -397,31 +388,8 @@ async fn run_connection(conn: hord_stream::Connection, config: HordConfig) {
         )
         .await
     {
-        eprintln!("[server] connection error: {e}");
+        eprintln!("[server] connection error ({peer}): {e}");
     }
-}
-
-/// One worker thread of the thread-per-core pool: a current-thread runtime +
-/// `LocalSet` that receives accepted connections from the acceptor and
-/// `spawn_local`s a [`run_connection`] task for each. The `LocalSet` drives all of
-/// them concurrently on this one core while the loop keeps accepting more, so a
-/// single worker fans out over many connections (each parked on its own CQ fd via
-/// the runtime's reactor) — not one thread per connection. Returns when the
-/// acceptor drops its sender (server shutdown).
-fn worker_loop(worker_id: usize, mut rx: mpsc::UnboundedReceiver<hord_stream::Connection>, config: HordConfig) {
-    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("[server] worker {worker_id} runtime build failed: {e}");
-            return;
-        }
-    };
-    let local = tokio::task::LocalSet::new();
-    rt.block_on(local.run_until(async move {
-        while let Some(conn) = rx.recv().await {
-            tokio::task::spawn_local(run_connection(conn, config.clone()));
-        }
-    }));
 }
 
 fn main() -> ExitCode {
@@ -447,59 +415,46 @@ fn main() -> ExitCode {
     }
 
     let config = HordConfig::default();
-    let listener = match Listener::bind(&bind, port) {
+    // HordListener owns the whole thread-per-core topology (accept loop + worker
+    // pool, each worker its own current-thread runtime/LocalSet + completion
+    // domain) and the graceful-shutdown drain — see hord-async. The demo only
+    // supplies the per-connection service (`serve_connection`).
+    let mut listener = match HordListener::bind(&bind, port, config.clone()) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[server] bind {bind}:{port} failed: {e}");
             return ExitCode::FAILURE;
         }
     };
-    // Default to one worker per core (thread-per-core). `--workers` overrides.
-    let workers = workers
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
-        .max(1);
+    if let Some(n) = workers {
+        listener = listener.workers(n);
+    }
     eprintln!(
-        "[server] listening on {bind}:{port} (async/hyper, {workers} worker thread(s), spawn_local per connection, zero_copy={})",
-        config.zero_copy
+        "[server] listening on {bind}:{port} (async/hyper via HordListener, workers={}, zero_copy={})",
+        workers.map_or_else(|| "auto".to_string(), |n| n.to_string()),
+        config.zero_copy,
     );
 
-    // Spawn the worker pool: one current-thread runtime per worker, each driving
-    // many connections concurrently via spawn_local. The acceptor (this thread)
-    // round-robins accepted connections to them. accept_begin migrates each
-    // connection to its own CM event channel (Identifier::migrate /
-    // rdma_migrate_id), so the acceptor, the workers, and the connections never
-    // compete on a shared channel. (migrate is a local sideway patch — see
-    // vendor/sideway/HORD-PATCH.md.)
-    let mut senders = Vec::with_capacity(workers);
-    let mut handles = Vec::with_capacity(workers);
-    for id in 0..workers {
-        let (tx, rx) = mpsc::unbounded_channel::<hord_stream::Connection>();
-        senders.push(tx);
-        let cfg = config.clone();
-        handles.push(std::thread::spawn(move || worker_loop(id, rx, cfg)));
-    }
-
-    let mut next = 0usize;
-    loop {
-        match HordStream::accept_begin(&listener, &config) {
-            Ok(conn) => {
-                // Hand to the next worker; skip any whose thread has exited
-                // (closed receiver). If every worker is gone there is nothing left
-                // to serve the connection, so drop it with a warning.
-                let mut conn = Some(conn);
-                for _ in 0..workers {
-                    let w = next;
-                    next = (next + 1) % workers;
-                    match senders[w].send(conn.take().expect("connection in hand")) {
-                        Ok(()) => break,
-                        Err(e) => conn = Some(e.0), // worker gone — try the next
-                    }
-                }
-                if conn.is_some() {
-                    eprintln!("[server] all workers unavailable; dropping connection");
-                }
-            }
-            Err(e) => eprintln!("[server] accept failed: {e}"),
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("[server] runtime build failed: {e}");
+            return ExitCode::FAILURE;
         }
-    }
+    };
+    rt.block_on(async move {
+        // Ctrl-C fires the listener's graceful-shutdown signal: it stops accepting
+        // and drains in-flight connections before `serve` returns. This is the same
+        // watch::Receiver<bool> a host (Carapace's ShutdownWatch) would hand in.
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!("[server] Ctrl-C received — draining in-flight connections…");
+                let _ = shutdown_tx.send(true);
+            }
+        });
+        listener.serve(shutdown_rx, serve_connection).await;
+    });
+    eprintln!("[server] shut down");
+    ExitCode::SUCCESS
 }

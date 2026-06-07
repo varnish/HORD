@@ -77,6 +77,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use hord_stream::{Connection, HordConfig, HordStream, RegisteredBuffer};
 
+mod listener;
+pub use listener::HordListener;
+
 /// A raw fd owned elsewhere (by the connection), wrapped only so `AsyncFd` can
 /// register it with the reactor. Dropping it does **not** close the fd — it just
 /// deregisters; the connection closes the fd at shutdown.
@@ -410,6 +413,15 @@ fn next_transfer(stream: &mut HordStream) -> Option<Option<u32>> {
 }
 
 impl AsyncRead for AsyncHordStream {
+    /// Reads buffered stream data, parking on the completion fd when none is
+    /// ready. **Keep-alive EOF:** this resolves to `Ok(())` with zero bytes filled
+    /// (EOF) *only* when the peer has actually half-closed (a graceful CM
+    /// disconnect or a transport teardown — `try_read` returns `Some(0)` once
+    /// `peer_closed`). It never reports EOF merely because no bytes are buffered
+    /// between two requests, so `hyper`'s keep-alive loop serves many requests over
+    /// one QP and a host's promote-on-clean-EOF logic only triggers on a real
+    /// close — the same contract a `TcpStream` gives. (Verified by
+    /// `tests/listener.rs`.)
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -426,6 +438,14 @@ impl AsyncRead for AsyncHordStream {
 }
 
 impl AsyncWrite for AsyncHordStream {
+    /// Accepts as many bytes as a send slot + credit allow right now.
+    /// **Backpressure:** when the credit window is exhausted (`try_write` accepts
+    /// nothing), this does *not* buffer unbounded and return `Ready` — it parks on
+    /// the completion fd and returns `Poll::Pending` until a send completion frees
+    /// a credit. A slow RDMA reader therefore back-pressures the writer, so a host
+    /// that streams a body through a bounded channel (throttled by `poll_write`
+    /// going `Pending`) cannot be driven to pull an arbitrarily large object fully
+    /// into RAM. (Verified by `tests/listener.rs`.)
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
