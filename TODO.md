@@ -186,12 +186,22 @@ supported single-host path.
       proving the signal, not the timeout, drove the drain). The deeper
       handshake-stage item below stays open; this is the per-connection drain only.
 
-- [ ] **`peer_addr` unknown-peer is a lossy sentinel.** The acceptor folds a
+- [x] **`peer_addr` unknown-peer is a lossy sentinel.** The acceptor folds a
       missing/unmappable peer address into `UNKNOWN_PEER` (`0.0.0.0:0`), so a host
       can't distinguish "unknown" from a peer that is literally `0.0.0.0:0`, and
       anonymous peers all alias to one identity — the seam the cross-cutting
       multi-tenant trust model (below) rides on. **Fix when that lands:** surface
       `Option<SocketAddr>` (ideally plus the GID) to the service rather than a default.
+
+      **Done** (landed with the cross-cutting peer-identity work below). `UNKNOWN_PEER`
+      is gone: the acceptor passes `conn.peer_addr()` through verbatim, the `Accepted`
+      tuple and the `serve_fn` second argument are now `Option<SocketAddr>`, and a host
+      sees `None` (distinct from any real address) when the CM can't resolve one. Log
+      lines route through a `peer_label` helper that renders `<unknown>` for `None`. The
+      GID half is satisfied by RoCEv2 equivalence rather than raw-GID plumbing — see the
+      cross-cutting item's note. Regressed by `conn_meta_surfaces_peer_addr_and_caps`
+      (`hord-async/tests/listener.rs`): a loopback peer surfaces as `Some(addr)`, never
+      the `0.0.0.0` sentinel.
 
 - [x] **Unbounded acceptor→worker channel + blind round-robin.** `dispatch` round-robins
       over an unbounded `mpsc`, skipping only *closed* channels, not a merely-wedged
@@ -626,7 +636,7 @@ or is a pure optimization, and none is a live bug on the supported path:
 
 ### Cross-cutting
 
-- [ ] **Peer identity + trust model for multi-tenancy.** Carapace is multi-tenant by
+- [x] **Peer identity + trust model for multi-tenancy.** Carapace is multi-tenant by
       design; RDMA QPs carry no TLS and HORD currently has no authentication. HORD must
       expose the peer's GID / connection identity per connection so Carapace can attach
       a `tenant` dimension (cache key namespace, VSL/Prometheus `tenant` label, PURGE
@@ -634,9 +644,40 @@ or is a pure optimization, and none is a live bug on the supported path:
       (last-hop trusted-fabric assumption) so the multi-tenant security posture is a
       stated decision rather than a silent gap.
 
-- [ ] **Connection metadata for VSL parity.** The direct path already logs two
+      **Done.** Peer identity is surfaced honestly as `Option<SocketAddr>` — the
+      `serve_fn` second argument (no longer the lossy `0.0.0.0:0`; see the resolved
+      sentinel item above) and `HordStream::peer_addr` / `AsyncHordStream::peer_addr`
+      (forwarded on `SharedAsyncStream` / `DataPlane` too). For **RoCEv2** — HORD's
+      target transport — this IP *is* the peer's GID in address form (a RoCEv2 GID is
+      the IPv6-mapped peer address), so it is the peer's GID identity; raw 16-byte-GID
+      plumbing (`ibv_query_qp` AV / cm_id route) was deliberately *not* added (it adds
+      vendored-sideway surface for no gain on the RoCEv2 target — a follow-up only if an
+      IB deployment, where there is no IP, ever needs it). The trust model is documented
+      plainly in three places: the `hord-async` listener module docs (`## Trust model`),
+      the `ConnMeta::peer_addr` doc, and **SPEC §11.4 Peer Identity and Trust Model** —
+      the last-hop-trusted-fabric assumption, that the address is only as trustworthy as
+      the fabric (no cryptographic binding; a fabric peer can spoof a source GID), and
+      that stronger isolation must be enforced below HORD (separate fabrics / VLANs /
+      partitions per tenant). HORD does not authenticate peers — now a stated decision.
+
+- [x] **Connection metadata for VSL parity.** The direct path already logs two
       documented divergences from the proxy path (no `Connected` timestamp;
       `ttl/grace/age` logged as zero). HORD should expose handshake-completion timing
       and negotiated capabilities (`zero_copy_negotiated` / `split_mode_negotiated` are
       already there) so the HORD listener can record a transport-accurate transaction
       tree rather than inheriting the TCP path's gaps.
+
+      **Done.** A `ConnMeta` snapshot (re-exported from `hord-stream` through
+      `hord-async`) bundles the per-connection metadata: `peer_addr`, `established_at`
+      (the missing piece — a wall-clock `SystemTime` stamped in `apply_peer`, i.e. at
+      handshake completion / "ready to serve", the RDMA analogue of TCP `Connected`),
+      `zero_copy_negotiated`, and `split_mode_negotiated`. Reachable via
+      `HordStream::conn_meta` and forwarded on `AsyncHordStream` / `SharedAsyncStream` /
+      `DataPlane` (with `established_at()` accessors alongside the existing cap
+      accessors). The `ttl/grace/age`-as-zero divergence is *not* HORD's to fix — those
+      are object/cache-tier properties the direct path bypasses, not connection
+      properties. Regressed by `conn_meta_surfaces_peer_addr_and_caps`
+      (`hord-async/tests/listener.rs`): asserts a stamped `established_at` and the
+      negotiated caps on a live loopback connection. **Remaining (Carapace side):**
+      record the `ConnMeta` into the listener's transaction tree (a `Connected`
+      timestamp + the negotiated-capability dimensions).

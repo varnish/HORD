@@ -13,15 +13,19 @@
 //! * `poll_write_backpressures_slow_reader` — a server writing far more than the
 //!   credit window blocks (`poll_write` → `Pending`) until the client reads, rather
 //!   than buffering the whole object; the payload still arrives intact.
+//! * `conn_meta_surfaces_peer_addr_and_caps` — the per-connection metadata seam:
+//!   the service receives a real `Some(peer)` (the lossy `0.0.0.0:0` sentinel is
+//!   gone) and `conn_meta()` reports a matching peer, a stamped `established_at`,
+//!   and the negotiated capabilities.
 
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{mpsc, Arc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, watch};
 
-use hord_async::{AsyncHordStream, HordListener, SharedAsyncStream};
+use hord_async::{AsyncHordStream, ConnMeta, HordListener, SharedAsyncStream};
 use hord_stream::HordConfig;
 use hord_zerocopy::RdmaWriteReq;
 
@@ -90,7 +94,7 @@ fn spawn_listener<F, Fut>(
     serve_fn: F,
 ) -> (watch::Sender<bool>, std::thread::JoinHandle<()>)
 where
-    F: FnMut(AsyncHordStream, std::net::SocketAddr, watch::Receiver<bool>) -> Fut
+    F: FnMut(AsyncHordStream, Option<std::net::SocketAddr>, watch::Receiver<bool>) -> Fut
         + Clone
         + Send
         + 'static,
@@ -167,6 +171,85 @@ fn keep_alive_many_requests_one_qp() {
         served.expect("server never reported (no clean EOF?)"),
         REQUESTS,
         "server did not serve every keep-alive request",
+    );
+}
+
+#[test]
+#[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+fn conn_meta_surfaces_peer_addr_and_caps() {
+    const PORT: u16 = 18634;
+    const N: usize = 4096;
+
+    // The server reports, for its one accepted connection, the peer address it was
+    // handed *and* the stream's own ConnMeta snapshot — so the test can assert the
+    // lossy-sentinel fix (a real `Some(addr)`, not `0.0.0.0:0`) and that the
+    // handshake metadata (established_at + negotiated caps) is populated.
+    let started = SystemTime::now();
+    let (meta_tx, meta_rx) = mpsc::channel::<(Option<std::net::SocketAddr>, ConnMeta)>();
+    let (shutdown, listener_thread) = spawn_listener(PORT, move |mut stream, peer, _shutdown| {
+        let meta_tx = meta_tx.clone();
+        async move {
+            // Snapshot the metadata first — it is fixed at handshake completion.
+            let _ = meta_tx.send((peer, stream.conn_meta()));
+            if let Some(n) = read_req(&mut stream).await.expect("read_req") {
+                stream.write_all(&pattern_vec(n)).await.expect("write body");
+                stream.flush().await.expect("flush body");
+            }
+        }
+    });
+
+    let client: Result<(), String> = current_thread_rt().block_on(async {
+        let mut s = AsyncHordStream::connect(IP, PORT, &HordConfig::default())
+            .map_err(|e| format!("connect: {e}"))?;
+        let body = tokio::time::timeout(Duration::from_secs(10), request(&mut s, N))
+            .await
+            .map_err(|_| "request timed out".to_string())?
+            .map_err(|e| format!("request: {e}"))?;
+        if body.len() != N {
+            return Err(format!("payload len {}", body.len()));
+        }
+        // The client end exposes the same metadata; the negotiated cap must agree.
+        if !s.conn_meta().zero_copy_negotiated {
+            return Err("client: zero-copy did not negotiate".to_string());
+        }
+        s.shutdown().await.map_err(|e| format!("shutdown: {e}"))?;
+        Ok(())
+    });
+
+    let reported = meta_rx.recv_timeout(Duration::from_secs(10));
+    shutdown.send(true).expect("send shutdown");
+    listener_thread.join().expect("listener thread panicked");
+
+    client.expect("client work failed");
+    let (peer, meta) = reported.expect("server never reported metadata");
+
+    // Lossy-sentinel fix: a loopback peer resolves to a real address, surfaced as
+    // `Some` — never folded into the old `0.0.0.0:0` placeholder.
+    let peer = peer.expect("peer should resolve on a loopback RoCEv2 connection");
+    assert!(!peer.ip().is_unspecified(), "peer must not be the 0.0.0.0 sentinel");
+    assert_eq!(meta.peer_addr, Some(peer), "conn_meta.peer_addr must match the dispatched peer");
+
+    // Negotiated caps: the default config advertises both on both ends.
+    assert!(meta.zero_copy_negotiated, "zero-copy should negotiate (default config)");
+    assert!(meta.split_mode_negotiated, "split mode should negotiate (default config)");
+
+    // `established_at` is stamped at handshake completion. `SystemTime` is NOT
+    // monotonic (an NTP step can move it backward mid-run), so assert a generous
+    // window around the test rather than strict ordering — the regression we care
+    // about is that `apply_peer` stamped a real, recent time and did not leave the
+    // `UNIX_EPOCH` placeholder, not sub-second wall-clock ordering.
+    const SKEW: Duration = Duration::from_secs(300);
+    assert!(
+        meta.established_at > SystemTime::UNIX_EPOCH,
+        "established_at was not stamped (still the placeholder)",
+    );
+    assert!(
+        meta.established_at + SKEW >= started,
+        "established_at is implausibly far before the test start",
+    );
+    assert!(
+        meta.established_at <= SystemTime::now() + SKEW,
+        "established_at is implausibly far in the future",
     );
 }
 

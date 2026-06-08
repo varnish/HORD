@@ -45,9 +45,10 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::marker::PhantomData;
+use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use hord_core::{
     CmParams, Completion, Connection, Listener, Mr, Opcode, RegisteredBuffer, Sge,
@@ -312,6 +313,36 @@ struct ReadyMsg {
     end: usize,   // absolute offset into recv_buf one past the payload
 }
 
+/// Per-connection metadata for host logging and multi-tenancy: a snapshot taken
+/// once the handshake completes.
+///
+/// An embedder (e.g. Carapace's direct listener) uses this to record a
+/// transport-accurate connection in its transaction log — the RDMA analogue of a
+/// TCP `Connected` event plus the capabilities that were negotiated — and to
+/// attach a tenant dimension keyed on the peer. Obtained via
+/// [`HordStream::conn_meta`] (and the async forwards). See the trust-model note in
+/// the `hord-async` listener docs before keying tenancy or trust on `peer_addr`.
+#[derive(Debug, Clone)]
+pub struct ConnMeta {
+    /// The peer's address as resolved by the RDMA connection manager, or `None`
+    /// if the CM could not report one (e.g. an address family the wrapper does
+    /// not map). For **RoCEv2** — HORD's target transport — the IP *is* the peer's
+    /// GID in address form (a RoCEv2 GID is the IPv6-mapped peer address), so this
+    /// is the peer's GID identity. It is the only peer identity HORD can attest,
+    /// and only as trustworthy as the fabric: RDMA QPs carry no TLS or
+    /// authentication, so keying tenancy on it is a last-hop-trusted-fabric
+    /// assumption (see the listener trust-model note).
+    pub peer_addr: Option<SocketAddr>,
+    /// Wall-clock time the HORD handshake completed and the connection became
+    /// ready to serve — the analogue of a TCP `Connected` timestamp, for a
+    /// transaction log (e.g. Varnish VSL) that records connection establishment.
+    pub established_at: SystemTime,
+    /// Whether the zero-copy extension (spec §7) negotiated on this connection.
+    pub zero_copy_negotiated: bool,
+    /// Whether protocol splitting (spec §7.7) negotiated on this connection.
+    pub split_mode_negotiated: bool,
+}
+
 /// A HORD byte stream over a single RC connection.
 pub struct HordStream {
     conn: Arc<Connection>,
@@ -348,6 +379,17 @@ pub struct HordStream {
     // `false` if the flip failed at setup — half-close detection is then simply
     // off (the data path is unaffected), matching the async wrapper's stance.
     cm_watch: bool,
+    // Connection metadata captured once, in `apply_peer` (the last setup step on
+    // both the accept and connect paths), so `conn_meta` is a true post-handshake
+    // snapshot rather than a live re-query. `peer_addr` is resolved from the CM id
+    // *after* establishment (the address is fixed by then and never changes for the
+    // connection's life), so we read it once instead of an FFI `rdma_get_peer_addr`
+    // on every accessor call. `established_at` is the wall-clock "Connected" instant
+    // (VSL-style logging). Both stay at their `new_common` sentinels (`None` /
+    // `UNIX_EPOCH`) only on a stream that errored out before `apply_peer` — never one
+    // handed to a caller.
+    peer_addr: Option<SocketAddr>,
+    established_at: SystemTime,
 
     // ---- zero-copy extension (spec §7) ----
     // Our config's `zero_copy` at construction, AND-ed with the peer's handshake
@@ -542,6 +584,11 @@ impl HordStream {
             rx_ready: VecDeque::new(),
             peer_closed: false,
             cm_watch: false,
+            // Sentinels until `apply_peer` captures the real values post-handshake.
+            // `UNIX_EPOCH` is a const (no clock syscall on a value that is always
+            // overwritten before any accessor can observe it).
+            peer_addr: None,
+            established_at: SystemTime::UNIX_EPOCH,
             zero_copy: config.zero_copy,
             writes_outstanding: 0,
             split_mode: config.split_mode,
@@ -687,12 +734,52 @@ impl HordStream {
         // unaffected), exactly as the async wrapper does. Safe here — all of setup's
         // *blocking* CM waits (resolve / establish) have completed by now.
         self.cm_watch = self.conn.set_cm_nonblock().is_ok();
+        // Capture the connection metadata now. The handshake is complete and the
+        // connection is ready to serve — the RDMA analogue of TCP "Connected" — so
+        // this times readiness, not bare QP establishment. Resolving `peer_addr`
+        // here (post-establishment) also pins the authoritative address: the CM has
+        // resolved the peer's address by now and it is fixed for the connection's
+        // life, so one read here replaces a per-call FFI and makes `conn_meta` a true
+        // snapshot. (`apply_peer` is the last setup step on both the accept and
+        // connect paths.)
+        self.peer_addr = self.conn.peer_addr();
+        self.established_at = SystemTime::now();
         Ok(())
     }
 
     /// Effective max payload bytes per RDMA message after negotiation.
     pub fn payload_capacity(&self) -> usize {
         self.payload_cap
+    }
+
+    /// The peer's address as resolved by the connection manager at handshake
+    /// completion, or `None` if the CM could not report one. Captured once (the
+    /// address is fixed for the connection's life), so this is a cheap field read,
+    /// not a per-call CM query. For RoCEv2 this IP is the peer's GID in address
+    /// form — see [`ConnMeta::peer_addr`] and the listener trust-model note before
+    /// keying tenancy or trust on it.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr
+    }
+
+    /// Wall-clock time the handshake completed and the connection became ready to
+    /// serve (the analogue of a TCP `Connected` timestamp). See
+    /// [`ConnMeta::established_at`].
+    pub fn established_at(&self) -> SystemTime {
+        self.established_at
+    }
+
+    /// Snapshot of this connection's [`ConnMeta`] — peer identity, establishment
+    /// time, and negotiated capabilities — for host logging / multi-tenancy. All
+    /// fields were captured at handshake completion, so this is a consistent
+    /// snapshot built from cheap field reads.
+    pub fn conn_meta(&self) -> ConnMeta {
+        ConnMeta {
+            peer_addr: self.peer_addr,
+            established_at: self.established_at,
+            zero_copy_negotiated: self.zero_copy_negotiated(),
+            split_mode_negotiated: self.split_mode_negotiated(),
+        }
     }
 
     /// Begin graceful disconnect.

@@ -511,6 +511,10 @@ Implementations SHOULD enforce:
 - Idle connection timeouts.
 - Limits on total registered memory.
 
+### 11.4 Peer Identity and Trust Model
+
+RDMA queue pairs carry no transport authentication: there is no TLS handshake, and a connection's only attestable identity is the peer's source address as resolved by the connection manager — for RoCEv2, the peer's GID in IP-address form. An implementation MAY surface this per connection so a multi-tenant host can attach a tenant dimension (cache-key namespace, log/metric labels, PURGE authority) keyed on the peer, but doing so rests on a **last-hop trusted-fabric** assumption: the address is only as trustworthy as the fabric, since a peer able to place packets on the fabric can spoof a source GID. Hosts requiring isolation stronger than the fabric provides MUST enforce it below HORD — dedicated fabrics, RoCEv2 VLANs, or InfiniBand partitions per tenant (see [Transport Security](#111-transport-security)). HORD does not authenticate peers.
+
 ---
 
 ## 12. Wire Format Reference

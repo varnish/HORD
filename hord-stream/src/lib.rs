@@ -11,7 +11,7 @@ pub mod envelope;
 pub mod handshake;
 mod stream;
 
-pub use stream::{ConnTeardown, HordConfig, HordStream, WriteSegment};
+pub use stream::{ConnMeta, ConnTeardown, HordConfig, HordStream, WriteSegment};
 
 // Re-export the transport handle types so callers only need this crate.
 pub use hord_core::{

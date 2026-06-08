@@ -26,8 +26,8 @@
 //! drives *many* connections concurrently on one core via its reactor (each with
 //! its own CQ completion-channel fd — the 1:1 model; the N:1 demux in 113.md is a
 //! later fd-economy optimization). The demo supplies only the per-connection
-//! service — a closure `(AsyncHordStream, SocketAddr, watch::Receiver<bool>) ->
-//! impl Future` — which is exactly the seam a host like Carapace plugs into. Ctrl-C
+//! service — a closure `(AsyncHordStream, Option<SocketAddr>, watch::Receiver<bool>)
+//! -> impl Future` — which is exactly the seam a host like Carapace plugs into. Ctrl-C
 //! fires the listener's graceful-shutdown signal, which stops accepting and drains
 //! in-flight connections before returning; each connection also receives a clone of
 //! that signal (the closure's third argument) and drives hyper's per-connection
@@ -352,7 +352,17 @@ async fn serve_zero_copy(
 /// (The HORD handshake already completed inside the listener's
 /// `AsyncHordStream::from_accepted`, on this same worker thread — see the
 /// `HordListener` "synchronous handshake" caveat.)
-async fn serve_connection(stream: AsyncHordStream, peer: SocketAddr, mut shutdown: watch::Receiver<bool>) {
+async fn serve_connection(
+    stream: AsyncHordStream,
+    peer: Option<SocketAddr>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    // Lazy peer label for the error log: only the (rare) error branches below
+    // allocate, not every accepted connection. `<unknown>` covers the rare case the
+    // CM cannot report an address (a family the wrapper does not map). For
+    // tenancy/trust semantics see the listener's trust-model note;
+    // `AsyncHordStream::peer_addr`/`conn_meta` expose the same post-handshake value.
+    let peer_label = move || peer.map_or_else(|| "<unknown>".to_string(), |p| p.to_string());
     let shared = SharedAsyncStream::new(stream);
     let handle = shared.clone();
     // One lazy source pool per connection (MRs are PD-scoped); cloned into the
@@ -374,7 +384,7 @@ async fn serve_connection(stream: AsyncHordStream, peer: SocketAddr, mut shutdow
         tokio::select! {
             res = conn.as_mut() => {
                 if let Err(e) = res {
-                    eprintln!("[server] connection error ({peer}): {e}");
+                    eprintln!("[server] connection error ({}): {e}", peer_label());
                 }
                 return;
             }
@@ -389,7 +399,7 @@ async fn serve_connection(stream: AsyncHordStream, peer: SocketAddr, mut shutdow
     // keep-alive loop, then drive the connection to completion.
     conn.as_mut().graceful_shutdown();
     if let Err(e) = conn.as_mut().await {
-        eprintln!("[server] connection error ({peer}): {e}");
+        eprintln!("[server] connection error ({}): {e}", peer_label());
     }
 }
 

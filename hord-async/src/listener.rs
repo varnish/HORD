@@ -27,8 +27,10 @@
 //!   completion-channel demux is a later fd-economy optimization, not needed here).
 //!
 //! The host supplies a per-connection service as a closure
-//! `FnMut(`[`AsyncHordStream`]`, SocketAddr) -> impl Future` — a `!Send`-friendly
-//! `serve_conn`. The closure (and the futures it returns) never leave the worker
+//! `FnMut(`[`AsyncHordStream`]`, Option<SocketAddr>, watch::Receiver<bool>) -> impl
+//! Future` — a `!Send`-friendly `serve_conn`. The second argument is the peer's
+//! address as resolved by the CM (`None` if it could not resolve one — see the
+//! trust-model note below). The closure (and the futures it returns) never leave the worker
 //! thread, so nothing it touches need be `Send`. The closure *itself* must be
 //! `Send + Clone` only so a copy can be handed to each worker thread.
 //!
@@ -106,11 +108,31 @@
 //! handshake stage, or an async handshake) so a slow-handshaking peer cannot
 //! stall a worker's other connections. The seam to do so is local to the worker
 //! loop.
+//!
+//! ## Trust model
+//!
+//! RDMA queue pairs carry no transport authentication or encryption — there is no
+//! TLS handshake and no per-message integrity beyond what the fabric provides.
+//! HORD therefore assumes a **last-hop trusted fabric**: the RoCEv2 / InfiniBand
+//! network between peers is trusted — typically a dedicated, isolated fabric, or
+//! one secured at L2/L3 (e.g. the deployment firewalls RoCEv2's UDP/4791 off any
+//! untrusted ingress, since RoCEv2 authenticates nothing on its own).
+//!
+//! The only peer identity HORD can attest is the peer's source address — the
+//! `Option<SocketAddr>` handed to the service closure (and
+//! [`AsyncHordStream::peer_addr`] / `ConnMeta`) — which for
+//! RoCEv2 is the peer's GID in address form. A host MAY use it as a tenant key
+//! (cache-key namespace, a VSL / Prometheus `tenant` label, PURGE authority), but
+//! it is only as trustworthy as the fabric: there is no cryptographic binding, so
+//! a peer able to place packets on the fabric could spoof a source GID. A
+//! multi-tenant host that needs isolation stronger than the fabric provides MUST
+//! enforce it below HORD (separate fabrics / RoCEv2 VLANs / InfiniBand partitions
+//! per tenant); HORD does not authenticate peers. See SPEC §11.4.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::io::unix::AsyncFd;
@@ -131,10 +153,6 @@ use crate::{AsyncHordStream, ReactorFd};
 /// direct service already allows its `GracefulShutdown`, so the two layers' bounds
 /// line up rather than one cutting the other short.
 const DEFAULT_GRACE: Duration = Duration::from_secs(30);
-
-/// Placeholder peer address when the CM cannot report one (e.g. an address family
-/// the wrapper does not map). The service still runs; the peer is just `0.0.0.0:0`.
-const UNKNOWN_PEER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
 /// Acceptor back-off after a failed accept, so a *persistent* error (e.g. a removed
 /// device that keeps the CM fd erroring) cannot hot-spin the accept loop.
@@ -159,9 +177,9 @@ const MAX_DRAIN_PER_WAKEUP: u32 = 64;
 /// wedged / overloaded case, not the steady state.
 const WORKER_CHANNEL_CAP: usize = 32;
 
-/// One accepted connection plus the peer address to label it with, handed from the
-/// acceptor to a worker.
-type Accepted = (Connection, SocketAddr);
+/// One accepted connection plus the peer address to label it with (or `None` if the
+/// CM could not resolve one), handed from the acceptor to a worker.
+type Accepted = (Connection, Option<SocketAddr>);
 
 /// Fires an internal stop signal when dropped. [`HordListener::serve`] holds one
 /// across its join `.await`, so if the `serve()` future is *cancelled* (dropped
@@ -221,8 +239,9 @@ impl HordListener {
     ///
     /// `serve_fn` is the per-connection service: called once per accepted
     /// connection, on the worker thread that will drive it, with the freshly
-    /// handshaked [`AsyncHordStream`], the peer's address, and a clone of the
-    /// shutdown [`watch::Receiver<bool>`](watch::Receiver) so the connection can
+    /// handshaked [`AsyncHordStream`], the peer's address as resolved by the CM
+    /// (`None` if it could not resolve one — see the [trust-model note](self#trust-model)),
+    /// and a clone of the shutdown [`watch::Receiver<bool>`](watch::Receiver) so the connection can
     /// wind itself down promptly on shutdown (see the [module docs](self) on the
     /// per-connection drain — without it an idle keep-alive connection pays the full
     /// `grace_timeout`). The future it returns is `spawn_local`d on that worker.
@@ -237,7 +256,7 @@ impl HordListener {
     /// threads' completion to async via `spawn_blocking`).
     pub async fn serve<F, Fut>(self, shutdown: watch::Receiver<bool>, serve_fn: F)
     where
-        F: FnMut(AsyncHordStream, SocketAddr, watch::Receiver<bool>) -> Fut + Clone + Send + 'static,
+        F: FnMut(AsyncHordStream, Option<SocketAddr>, watch::Receiver<bool>) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = ()> + 'static,
     {
         let HordListener {
@@ -378,7 +397,10 @@ async fn acceptor_loop(
                             // below — or a removed device would reset the counter
                             // and the cap could never trip.)
                             consecutive_errors = 0;
-                            let peer = conn.peer_addr().unwrap_or(UNKNOWN_PEER);
+                            // Surface the CM's answer faithfully: `None` means
+                            // "unresolved", distinct from any real address (the
+                            // service decides how to treat an anonymous peer).
+                            let peer = conn.peer_addr();
                             dispatch(&senders, &mut next, conn, peer);
                             handled += 1;
                             if handled >= MAX_DRAIN_PER_WAKEUP {
@@ -460,6 +482,21 @@ async fn acceptor_loop(
     Ok(())
 }
 
+/// Render an optional peer address for a log line: the resolved address, or
+/// `<unknown>` when the CM could not report one. Allocation-free in the common case.
+fn peer_label(peer: Option<SocketAddr>) -> impl std::fmt::Display {
+    struct L(Option<SocketAddr>);
+    impl std::fmt::Display for L {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self.0 {
+                Some(a) => write!(f, "{a}"),
+                None => f.write_str("<unknown>"),
+            }
+        }
+    }
+    L(peer)
+}
+
 /// Round-robin one connection to a live, non-full worker. A worker whose bounded
 /// queue is *full* (wedged or backlogged) is skipped just like one whose thread has
 /// *exited* (closed receiver), so connections fail over to the next available worker
@@ -469,7 +506,7 @@ fn dispatch(
     senders: &[mpsc::Sender<Accepted>],
     next: &mut usize,
     conn: Connection,
-    peer: SocketAddr,
+    peer: Option<SocketAddr>,
 ) {
     let n = senders.len();
     let mut payload = (conn, peer);
@@ -491,7 +528,7 @@ fn dispatch(
     // finite; dropping here is the overflow valve.
     log::warn!(
         "hord: all workers full or unavailable; dropping connection from {}",
-        payload.1
+        peer_label(payload.1)
     );
 }
 
@@ -506,7 +543,7 @@ fn run_worker<F, Fut>(
     grace: Duration,
     shutdown: watch::Receiver<bool>,
 ) where
-    F: FnMut(AsyncHordStream, SocketAddr, watch::Receiver<bool>) -> Fut,
+    F: FnMut(AsyncHordStream, Option<SocketAddr>, watch::Receiver<bool>) -> Fut,
     Fut: Future<Output = ()> + 'static,
 {
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -549,7 +586,7 @@ async fn worker_loop<F, Fut>(
     grace: Duration,
     shutdown: watch::Receiver<bool>,
 ) where
-    F: FnMut(AsyncHordStream, SocketAddr, watch::Receiver<bool>) -> Fut,
+    F: FnMut(AsyncHordStream, Option<SocketAddr>, watch::Receiver<bool>) -> Fut,
     Fut: Future<Output = ()> + 'static,
 {
     // A JoinSet reaps finished connection tasks in O(1) per task (no per-accept
@@ -573,10 +610,18 @@ async fn worker_loop<F, Fut>(
                 // connection gets its own clone of the shutdown signal so it can
                 // drive a per-connection graceful drain (see the module docs).
                 let teardown = stream.teardown_handle();
+                // Hand the service the *post-handshake* peer address, not the
+                // accept-time `peer` read off the not-yet-established `conn`. The CM
+                // may only resolve the destination address at establishment, so the
+                // stream's value is the authoritative one and matches
+                // `conn_meta().peer_addr` exactly; on RoCEv2 the two are identical.
+                // (`peer` is still used below for the failure log, where no stream
+                // exists to query.)
+                let peer = stream.peer_addr();
                 let handle = tasks.spawn_local(serve_fn(stream, peer, shutdown.clone()));
                 teardowns.insert(handle.id(), teardown);
             }
-            Err(e) => log::warn!("hord: handshake failed for {peer}: {e}"),
+            Err(e) => log::warn!("hord: handshake failed for {}: {e}", peer_label(peer)),
         }
     }
 

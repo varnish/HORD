@@ -78,10 +78,12 @@
 
 use std::cell::RefCell;
 use std::io;
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
+use std::time::SystemTime;
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -91,6 +93,9 @@ use hord_zerocopy::{RdmaWriteAction, RdmaWriteReq, RdmaWriteStatus, SourcePool};
 
 mod listener;
 pub use listener::HordListener;
+
+/// Re-export so embedders get the connection-metadata type from this crate.
+pub use hord_stream::ConnMeta;
 
 /// A raw fd owned elsewhere (by the connection), wrapped only so `AsyncFd` can
 /// register it with the reactor. Dropping it does **not** close the fd — it just
@@ -168,6 +173,26 @@ impl AsyncHordStream {
     /// would otherwise open.
     pub fn teardown_handle(&self) -> hord_stream::ConnTeardown {
         self.stream.teardown_handle()
+    }
+
+    // ---- connection metadata (logging / multi-tenancy) ---------------------
+
+    /// The peer's address, or `None` if the CM could not resolve one. See
+    /// [`HordStream::peer_addr`] (and the trust-model note on [`HordListener`])
+    /// before keying tenancy or trust on it.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.stream.peer_addr()
+    }
+
+    /// Wall-clock time the handshake completed (TCP-`Connected` analogue). See
+    /// [`HordStream::established_at`].
+    pub fn established_at(&self) -> SystemTime {
+        self.stream.established_at()
+    }
+
+    /// Snapshot of this connection's [`ConnMeta`]. See [`HordStream::conn_meta`].
+    pub fn conn_meta(&self) -> ConnMeta {
+        self.stream.conn_meta()
     }
 
     // ---- zero-copy extension (spec §7) -------------------------------------
@@ -631,6 +656,24 @@ impl SharedAsyncStream {
     /// Wrap an [`AsyncHordStream`] in a shared, clonable handle.
     pub fn new(inner: AsyncHordStream) -> Self {
         SharedAsyncStream(Rc::new(RefCell::new(inner)))
+    }
+
+    /// The peer's address, or `None` if unresolved. See
+    /// [`AsyncHordStream::peer_addr`].
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.0.borrow().peer_addr()
+    }
+
+    /// Wall-clock time the handshake completed. See
+    /// [`AsyncHordStream::established_at`].
+    pub fn established_at(&self) -> SystemTime {
+        self.0.borrow().established_at()
+    }
+
+    /// Snapshot of this connection's [`ConnMeta`]. See
+    /// [`AsyncHordStream::conn_meta`].
+    pub fn conn_meta(&self) -> ConnMeta {
+        self.0.borrow().conn_meta()
     }
 
     /// Whether the zero-copy extension was negotiated. See
@@ -1220,6 +1263,24 @@ impl AsyncWrite for WriteHalf {
 }
 
 impl DataPlane {
+    /// The peer's address, or `None` if unresolved. See
+    /// [`AsyncHordStream::peer_addr`].
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.shared.stream.borrow().peer_addr()
+    }
+
+    /// Wall-clock time the handshake completed. See
+    /// [`AsyncHordStream::established_at`].
+    pub fn established_at(&self) -> SystemTime {
+        self.shared.stream.borrow().established_at()
+    }
+
+    /// Snapshot of this connection's [`ConnMeta`]. See
+    /// [`AsyncHordStream::conn_meta`].
+    pub fn conn_meta(&self) -> ConnMeta {
+        self.shared.stream.borrow().conn_meta()
+    }
+
     /// Whether the zero-copy extension was negotiated. See
     /// [`AsyncHordStream::zero_copy_negotiated`].
     pub fn zero_copy_negotiated(&self) -> bool {
