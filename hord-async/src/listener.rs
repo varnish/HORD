@@ -41,11 +41,13 @@
 //! let listener = HordListener::bind("0.0.0.0", 4791, HordConfig::default())
 //!     .expect("bind");
 //! listener
-//!     .serve(shutdown, |stream, peer| async move {
+//!     .serve(shutdown, |stream, peer, _shutdown| async move {
 //!         // Drive `stream` (an `AsyncHordStream`: AsyncRead + AsyncWrite) here —
 //!         // e.g. `hyper::server::conn::http1::Builder::new().serve_connection(...)`.
 //!         // Wrap it in a `SharedAsyncStream` first if the handler needs to reach
-//!         // the connection for a zero-copy RDMA write.
+//!         // the connection for a zero-copy RDMA write. `_shutdown` is a clone of the
+//!         // listener's shutdown signal — watch it to wind this connection down
+//!         // promptly on shutdown (drive your HTTP layer's graceful shutdown).
 //!         let _ = (stream, peer);
 //!     })
 //!     .await;
@@ -67,11 +69,15 @@
 //! own **per-connection** graceful drain: a keep-alive connection sitting idle
 //! between requests is blocked inside the service future (waiting for the next
 //! request) and will not return until the client closes or the grace timeout
-//! elapses. To wind such connections down promptly, capture your own clone of the
-//! shutdown receiver in the service closure and drive your HTTP layer's graceful
-//! shutdown with it (e.g. `hyper_util`'s `GracefulShutdown`) — exactly as the
-//! host would on a `TcpStream`. HORD's grace timeout is the backstop, not the
-//! mechanism.
+//! elapses. To wind such connections down promptly the service closure is handed,
+//! as its **third argument**, a clone of the same shutdown
+//! [`watch::Receiver<bool>`](tokio::sync::watch::Receiver): watch it and drive your
+//! HTTP layer's graceful shutdown when it fires (e.g. call
+//! `hyper::server::conn::http1::Connection::graceful_shutdown`, or use
+//! `hyper_util`'s `GracefulShutdown`) — exactly as the host would on a `TcpStream`.
+//! HORD's grace timeout is the backstop, not the mechanism: a closure that ignores
+//! the signal still works, but its idle keep-alive connections pay the full grace
+//! timeout at shutdown (the demo server wires this — see `server_async.rs`).
 //!
 //! ## Properties the byte-stream parity relies on (Milestone 1)
 //!
@@ -215,10 +221,14 @@ impl HordListener {
     ///
     /// `serve_fn` is the per-connection service: called once per accepted
     /// connection, on the worker thread that will drive it, with the freshly
-    /// handshaked [`AsyncHordStream`] and the peer's address. The future it returns
-    /// is `spawn_local`d on that worker. Because everything runs on one worker
-    /// thread, neither the future nor anything it captures need be `Send`; the
-    /// closure itself is `Send + Clone` only so each worker gets its own copy.
+    /// handshaked [`AsyncHordStream`], the peer's address, and a clone of the
+    /// shutdown [`watch::Receiver<bool>`](watch::Receiver) so the connection can
+    /// wind itself down promptly on shutdown (see the [module docs](self) on the
+    /// per-connection drain — without it an idle keep-alive connection pays the full
+    /// `grace_timeout`). The future it returns is `spawn_local`d on that worker.
+    /// Because everything runs on one worker thread, neither the future nor anything
+    /// it captures need be `Send`; the closure itself is `Send + Clone` only so each
+    /// worker gets its own copy.
     ///
     /// Connections whose handshake fails are logged and dropped — `serve_fn` is
     /// only called for a successfully established stream.
@@ -227,7 +237,7 @@ impl HordListener {
     /// threads' completion to async via `spawn_blocking`).
     pub async fn serve<F, Fut>(self, shutdown: watch::Receiver<bool>, serve_fn: F)
     where
-        F: FnMut(AsyncHordStream, SocketAddr) -> Fut + Clone + Send + 'static,
+        F: FnMut(AsyncHordStream, SocketAddr, watch::Receiver<bool>) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = ()> + 'static,
     {
         let HordListener {
@@ -246,8 +256,11 @@ impl HordListener {
             senders.push(tx);
             let serve_fn = serve_fn.clone();
             let config = config.clone();
+            // Each worker gets its own clone of the shutdown signal to hand to every
+            // connection it serves, so a connection can drive its own graceful drain.
+            let shutdown = shutdown.clone();
             worker_handles.push(std::thread::spawn(move || {
-                run_worker(id, rx, serve_fn, config, grace);
+                run_worker(id, rx, serve_fn, config, grace, shutdown);
             }));
         }
 
@@ -491,8 +504,9 @@ fn run_worker<F, Fut>(
     serve_fn: F,
     config: HordConfig,
     grace: Duration,
+    shutdown: watch::Receiver<bool>,
 ) where
-    F: FnMut(AsyncHordStream, SocketAddr) -> Fut,
+    F: FnMut(AsyncHordStream, SocketAddr, watch::Receiver<bool>) -> Fut,
     Fut: Future<Output = ()> + 'static,
 {
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -506,7 +520,7 @@ fn run_worker<F, Fut>(
         }
     };
     let local = tokio::task::LocalSet::new();
-    rt.block_on(local.run_until(worker_loop(rx, serve_fn, config, grace)));
+    rt.block_on(local.run_until(worker_loop(rx, serve_fn, config, grace, shutdown)));
 }
 
 /// The worker's async body. Spawns one local task per connection; on channel close
@@ -533,8 +547,9 @@ async fn worker_loop<F, Fut>(
     mut serve_fn: F,
     config: HordConfig,
     grace: Duration,
+    shutdown: watch::Receiver<bool>,
 ) where
-    F: FnMut(AsyncHordStream, SocketAddr) -> Fut,
+    F: FnMut(AsyncHordStream, SocketAddr, watch::Receiver<bool>) -> Fut,
     Fut: Future<Output = ()> + 'static,
 {
     // A JoinSet reaps finished connection tasks in O(1) per task (no per-accept
@@ -554,9 +569,11 @@ async fn worker_loop<F, Fut>(
         match AsyncHordStream::from_accepted(conn, &config) {
             Ok(stream) => {
                 // Grab the teardown handle *before* moving the stream into the
-                // service future, and key it by the spawned task's id.
+                // service future, and key it by the spawned task's id. Each
+                // connection gets its own clone of the shutdown signal so it can
+                // drive a per-connection graceful drain (see the module docs).
                 let teardown = stream.teardown_handle();
-                let handle = tasks.spawn_local(serve_fn(stream, peer));
+                let handle = tasks.spawn_local(serve_fn(stream, peer, shutdown.clone()));
                 teardowns.insert(handle.id(), teardown);
             }
             Err(e) => log::warn!("hord: handshake failed for {peer}: {e}"),

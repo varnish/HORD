@@ -90,7 +90,10 @@ fn spawn_listener<F, Fut>(
     serve_fn: F,
 ) -> (watch::Sender<bool>, std::thread::JoinHandle<()>)
 where
-    F: FnMut(AsyncHordStream, std::net::SocketAddr) -> Fut + Clone + Send + 'static,
+    F: FnMut(AsyncHordStream, std::net::SocketAddr, watch::Receiver<bool>) -> Fut
+        + Clone
+        + Send
+        + 'static,
     Fut: std::future::Future<Output = ()> + 'static,
 {
     let (tx, rx) = watch::channel(false);
@@ -116,7 +119,7 @@ fn keep_alive_many_requests_one_qp() {
     // served once it observes a clean EOF — proving keep-alive (it never broke the
     // loop on a spurious between-request EOF) and a clean half-close.
     let (served_tx, served_rx) = mpsc::channel::<usize>();
-    let (shutdown, listener_thread) = spawn_listener(PORT, move |mut stream, _peer| {
+    let (shutdown, listener_thread) = spawn_listener(PORT, move |mut stream, _peer, _shutdown| {
         let served_tx = served_tx.clone();
         async move {
             let mut served = 0usize;
@@ -178,7 +181,7 @@ fn poll_write_backpressures_slow_reader() {
     // block on credit exhaustion long before completing.
     let write_done = Arc::new(AtomicBool::new(false));
     let wd = write_done.clone();
-    let (shutdown, listener_thread) = spawn_listener(PORT, move |mut stream, _peer| {
+    let (shutdown, listener_thread) = spawn_listener(PORT, move |mut stream, _peer, _shutdown| {
         let wd = wd.clone();
         async move {
             let Some(n) = read_req(&mut stream).await.expect("read_req") else {
@@ -253,7 +256,7 @@ fn serve_cancellation_winds_down_threads() {
         // fires: the ONLY thing that may wind the threads down is cancelling the
         // serve() future itself (the StopOnCancel drop guard — finding #1).
         let (_never_fires, never_rx) = watch::channel(false);
-        let serve = tokio::spawn(listener.serve(never_rx, move |_s, _p| {
+        let serve = tokio::spawn(listener.serve(never_rx, move |_s, _p, _shutdown| {
             // Capture `m` by value (so cloning the closure clones the Arc); a real
             // service would use the stream here.
             let per_conn = m.clone();
@@ -310,7 +313,7 @@ fn shutdown_already_set_returns_promptly() {
         .grace_timeout(Duration::from_secs(5));
 
     let done = std::thread::spawn(move || {
-        current_thread_rt().block_on(listener.serve(rx, |_s, _p| async {}));
+        current_thread_rt().block_on(listener.serve(rx, |_s, _p, _shutdown| async {}));
     });
 
     // serve() must return well within the grace window; if the pre-set signal were
@@ -382,7 +385,7 @@ fn shutdown_mid_backpressured_rdma_write_is_safe() {
             .grace_timeout(GRACE);
         let writing_tx = writing_tx.clone();
         let handle = std::thread::spawn(move || {
-            current_thread_rt().block_on(listener.serve(rx, move |stream, _peer| {
+            current_thread_rt().block_on(listener.serve(rx, move |stream, _peer, _shutdown| {
                 let writing_tx = writing_tx.clone();
                 async move {
                     let mut shared = SharedAsyncStream::new(stream);
@@ -474,5 +477,90 @@ fn shutdown_mid_backpressured_rdma_write_is_safe() {
     assert!(
         elapsed < GRACE + SLACK,
         "serve() took {elapsed:?} (> {GRACE:?} + {SLACK:?}) — the mid-write teardown hung",
+    );
+}
+
+/// Regression for the "idle keep-alive connections pay the full `grace_timeout` at
+/// shutdown" footgun (TODO.md, Blocker-0 deferred). `HordListener` now hands every
+/// connection a clone of the shutdown signal as the serve closure's *third*
+/// argument; a connection that watches it can wind itself down promptly instead of
+/// parking — idle, mid-keep-alive — until the grace timeout elapses.
+///
+/// Setup: the client makes one request, then holds the connection open and silent
+/// (the idle keep-alive state). The server's serve closure serves requests in a
+/// loop but `select!`s that loop against the handed-in shutdown receiver, so when
+/// shutdown fires it breaks the loop at once rather than blocking in the next-read.
+/// We fire shutdown while the server is parked idle and assert `serve()` returns far
+/// inside the (deliberately large, 10 s via `spawn_listener`) grace window — proving
+/// the per-connection signal drove the drain. Without it the server would sit in the
+/// next-request read and `serve()` would only return when the grace timeout fired.
+#[test]
+#[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+fn idle_keep_alive_drains_promptly_on_shutdown() {
+    const PORT: u16 = 18635;
+    const N: usize = 4096;
+    // `spawn_listener` uses a 10 s grace; a prompt drain returns in milliseconds, so
+    // this bound cleanly separates "wound down via the signal" from "waited out grace".
+    const PROMPT: Duration = Duration::from_secs(4);
+
+    // Server: keep-alive serve loop, but `select!`ed against the shutdown signal the
+    // listener hands in as the third arg — so an idle connection winds down promptly.
+    let (shutdown, listener_thread) = spawn_listener(PORT, move |mut stream, _peer, mut sd: watch::Receiver<bool>| async move {
+        loop {
+            tokio::select! {
+                req = read_req(&mut stream) => match req {
+                    Ok(Some(n)) => {
+                        if stream.write_all(&pattern_vec(n)).await.is_err() { break; }
+                        if stream.flush().await.is_err() { break; }
+                    }
+                    _ => break, // clean EOF or error
+                },
+                // Flip to `true` (or dropped sender, `Err`) → wind this connection
+                // down at once instead of looping back into the next-request read.
+                res = sd.changed() => {
+                    if res.is_err() || *sd.borrow() { break; }
+                }
+            }
+        }
+    });
+
+    // Client: one request, then sit idle (open, silent) until released — the
+    // keep-alive idle state the server parks in. `release_rx` keeps the !Send stream
+    // alive until the test has torn the server down.
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let client_thread = std::thread::spawn(move || {
+        current_thread_rt().block_on(async move {
+            let mut s = AsyncHordStream::connect(IP, PORT, &HordConfig::default()).expect("connect");
+            let body = request(&mut s, N).await.expect("request");
+            assert_eq!(body.len(), N, "wrong payload length");
+            let _ = ready_tx.send(()); // one request done; now idle on keep-alive
+            let _ = release_rx.await; // hold the connection open and silent
+            drop(s);
+        });
+    });
+
+    // Wait until the one request has completed and the connection is idle, then give
+    // the server a beat to loop back and park awaiting the (never-coming) next request.
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("client never completed its first request");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Fire shutdown with the connection parked idle, and time serve()'s return.
+    let t0 = Instant::now();
+    shutdown.send(true).expect("send shutdown");
+    listener_thread.join().expect("listener thread panicked");
+    let elapsed = t0.elapsed();
+
+    // Release and join the client (it must not have crashed).
+    let _ = release_tx.send(());
+    client_thread.join().expect("client thread panicked");
+
+    assert!(
+        elapsed < PROMPT,
+        "serve() took {elapsed:?} to drain an IDLE keep-alive connection — the \
+         per-connection shutdown signal was ignored, so it waited out the grace \
+         timeout (the footgun this fix closes)",
     );
 }

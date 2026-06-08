@@ -26,10 +26,13 @@
 //! drives *many* connections concurrently on one core via its reactor (each with
 //! its own CQ completion-channel fd — the 1:1 model; the N:1 demux in 113.md is a
 //! later fd-economy optimization). The demo supplies only the per-connection
-//! service — a closure `(AsyncHordStream, SocketAddr) -> impl Future` — which is
-//! exactly the seam a host like Carapace plugs into. Ctrl-C fires the listener's
-//! graceful-shutdown signal, which stops accepting and drains in-flight
-//! connections before returning.
+//! service — a closure `(AsyncHordStream, SocketAddr, watch::Receiver<bool>) ->
+//! impl Future` — which is exactly the seam a host like Carapace plugs into. Ctrl-C
+//! fires the listener's graceful-shutdown signal, which stops accepting and drains
+//! in-flight connections before returning; each connection also receives a clone of
+//! that signal (the closure's third argument) and drives hyper's per-connection
+//! graceful shutdown off it, so an idle keep-alive connection winds down promptly
+//! instead of waiting out the listener's grace timeout.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -371,23 +374,54 @@ async fn serve_zero_copy(
 /// and serve HTTP/1.1. This is the seam a host (e.g. Carapace) plugs into — the
 /// listener owns the thread topology; this only describes one connection.
 ///
+/// `shutdown` is the third argument [`HordListener`] hands every connection: a
+/// clone of the listener's shutdown signal. We drive hyper's per-connection
+/// graceful shutdown off it — without this an idle keep-alive connection (parked in
+/// hyper waiting for the next request) would not wind down until the client closed
+/// or the listener's `grace_timeout` (30 s) elapsed, so Ctrl-C with an idle client
+/// would appear to hang. With it, the in-flight response (if any) finishes and the
+/// keep-alive loop ends promptly. HORD's grace timeout stays the backstop.
+///
 /// (The HORD handshake already completed inside the listener's
 /// `AsyncHordStream::from_accepted`, on this same worker thread — see the
 /// `HordListener` "synchronous handshake" caveat.)
-async fn serve_connection(stream: AsyncHordStream, peer: SocketAddr) {
+async fn serve_connection(stream: AsyncHordStream, peer: SocketAddr, mut shutdown: watch::Receiver<bool>) {
     let shared = SharedAsyncStream::new(stream);
     let handle = shared.clone();
     // One lazy source pool per connection (MRs are PD-scoped); cloned into the
     // request handler (an Rc bump). Reused across this connection's zero-copy
     // responses — the win shows on split / keep-alive (many per connection).
     let pool = SourcePool::new(SOURCE_POOL_CAP, SOURCE_POOL_BUF_SIZE);
-    if let Err(e) = http1::Builder::new()
-        .serve_connection(
-            TokioIo::new(shared),
-            service_fn(move |req| serve(req, handle.clone(), pool.clone())),
-        )
-        .await
-    {
+    let conn = http1::Builder::new().serve_connection(
+        TokioIo::new(shared),
+        service_fn(move |req| serve(req, handle.clone(), pool.clone())),
+    );
+    tokio::pin!(conn);
+
+    // Drive the connection, but break out the moment the listener signals shutdown
+    // so we can ask hyper to wind this connection down gracefully instead of parking
+    // for the next keep-alive request. Honour an already-set signal (a connection
+    // accepted just as shutdown fired) without waiting for a `changed()` edge.
+    let mut winding_down = *shutdown.borrow();
+    while !winding_down {
+        tokio::select! {
+            res = conn.as_mut() => {
+                if let Err(e) = res {
+                    eprintln!("[server] connection error ({peer}): {e}");
+                }
+                return;
+            }
+            res = shutdown.changed() => {
+                // A flip to `true` (or a dropped sender, `Err`) means wind down; a
+                // spurious toggle-back to `false` is ignored (keep serving).
+                winding_down = res.is_err() || *shutdown.borrow();
+            }
+        }
+    }
+    // Shutdown signalled: let hyper finish any in-flight response and stop the
+    // keep-alive loop, then drive the connection to completion.
+    conn.as_mut().graceful_shutdown();
+    if let Err(e) = conn.as_mut().await {
         eprintln!("[server] connection error ({peer}): {e}");
     }
 }

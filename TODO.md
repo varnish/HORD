@@ -157,15 +157,34 @@ swallowing them).
 The following remain consciously deferred — none is a correctness bug on the
 supported single-host path.
 
-- [ ] **Idle keep-alive connections pay the full `grace_timeout` at shutdown.**
-      `HordListener` stops accepting and bounds the drain, but does not signal the
+- [x] **Idle keep-alive connections pay the full `grace_timeout` at shutdown.**
+      `HordListener` stops accepting and bounds the drain, but did not signal the
       per-connection service to wind down; an idle keep-alive connection parked in
-      `hyper` awaiting the next request only ends when the client closes or `grace`
-      (30 s) elapses. The contract puts per-connection drain on the host (capture your
+      `hyper` awaiting the next request only ended when the client closed or `grace`
+      (30 s) elapsed. The contract puts per-connection drain on the host (capture your
       own shutdown handle in the serve closure and drive hyper's `GracefulShutdown`),
-      but the demo doesn't wire it, so Ctrl-C with an idle client appears to hang for
+      but the demo didn't wire it, so Ctrl-C with an idle client appeared to hang for
       `grace`. **Fix:** wire the demo's per-connection graceful shutdown; consider
       passing the serve closure a cancel token so the common case isn't a footgun.
+
+      **Done (both halves).** The serve closure now *receives* the cancel signal so
+      embedders don't reinvent (and forget) the clone-and-capture: `serve_fn`'s
+      signature gained a third argument — a clone of the same shutdown
+      `watch::Receiver<bool>` — handed to every connection (`worker_loop` clones it
+      per `spawn_local`). A closure that ignores it still works; HORD's `grace` stays
+      the backstop. The demo's `serve_connection` now drives hyper's per-connection
+      graceful shutdown off it: it `select!`s the pinned `http1` connection against
+      the receiver and, on a flip to `true` (or a dropped sender), calls
+      `Connection::graceful_shutdown()` then drives the connection to completion — so
+      the in-flight response finishes and the keep-alive loop ends at once instead of
+      parking for `grace`. An already-set signal is honoured without waiting for a
+      `changed()` edge. Module + `serve` docs updated (the old "capture your own
+      clone" advice replaced by the third-arg contract). Regressed by
+      `idle_keep_alive_drains_promptly_on_shutdown` in `hord-async/tests/listener.rs`
+      (client makes one request then sits idle on the keep-alive; shutdown fires while
+      the server is parked; asserts `serve()` returns far inside the 10 s grace —
+      proving the signal, not the timeout, drove the drain). The deeper
+      handshake-stage item below stays open; this is the per-connection drain only.
 
 - [ ] **`peer_addr` unknown-peer is a lossy sentinel.** The acceptor folds a
       missing/unmappable peer address into `UNKNOWN_PEER` (`0.0.0.0:0`), so a host

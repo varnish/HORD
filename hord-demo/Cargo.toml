@@ -17,8 +17,10 @@ hord-zerocopy = { path = "../hord-zerocopy", features = ["rdma"] }
 # hyper bins.
 hord-async = { path = "../hord-async" }
 # "sync" (watch shutdown channel) + "signal" (Ctrl-C → graceful drain) are for
-# the server_async demo's HordListener wiring; the rest drive hyper + the stream.
-tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "signal"] }
+# the server_async demo's HordListener wiring; "macros" drives the per-connection
+# `tokio::select!` (hyper graceful shutdown vs. the connection finishing); the rest
+# drive hyper + the stream.
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "signal", "macros"] }
 hyper = { version = "1", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body = "1"
