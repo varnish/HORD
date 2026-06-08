@@ -1,7 +1,7 @@
-# Vendored sideway 0.4.3 + `migrate_id` / `peer_addr` patch
+# Vendored sideway 0.4.3 + `migrate_id` / `peer_addr` / `reject` patch
 
 This is an unmodified vendored copy of [`sideway`](https://crates.io/crates/sideway)
-**0.4.3** with two local additions, applied to the workspace via
+**0.4.3** with three local additions, applied to the workspace via
 `[patch.crates-io]` in the repo-root `Cargo.toml`.
 
 ## The patch
@@ -18,13 +18,21 @@ each accepted connection with its peer's address — the `SocketAddr` it hands t
 the per-connection service closure. Read-only (no syscall; reads the id's resolved
 destination sockaddr) and additive, so it needs no error type.
 
+**3. `Identifier::reject(&self) -> Result<(), RejectError>`** wrapping
+`rdma_reject` (no private data), so a server that has accepted a `ConnectRequest`
+id but then fails to set the connection up can refuse it explicitly. Without it,
+`hord-core` dropped the id on a per-connection setup failure, leaving the peer to
+wait out a connect timeout (and a half-open id to linger until timewait). Used by
+`Listener::process_event`'s `ConnectRequest` arm on any post-ack setup failure.
+
 Changed files: `src/rdmacm/communication_manager.rs` only —
-- import `rdma_migrate_id` and `rdma_get_peer_addr`;
+- import `rdma_migrate_id`, `rdma_get_peer_addr`, and `rdma_reject`;
 - `Identifier._event_channel: Arc<EventChannel>` → `Mutex<Arc<EventChannel>>`
   (so `migrate` can swap it through `&self`, since `Identifier` is shared as `Arc`);
-- new `MigrateError` / `MigrateErrorKind`;
+- new `MigrateError` / `MigrateErrorKind` and `RejectError` / `RejectErrorKind`;
 - the `migrate` method;
-- the `peer_addr` method.
+- the `peer_addr` method;
+- the `reject` method.
 
 `examples/`, `tests/`, and their `[dev-dependencies]` were removed from the
 vendored copy (we build only the library); everything else is verbatim 0.4.3.
@@ -38,8 +46,9 @@ When the upstream `migrate_id` issue lands in a released sideway:
 3. Bump `sideway` in `hord-core/Cargo.toml` to the release that has it.
 
 The `hord-core` call sites (`Listener::accept` → `migrate`, `Connection::peer_addr`
-→ `peer_addr`) are unchanged by removal as long as the upstream methods keep the
-`migrate(&self, &Arc<EventChannel>)` and `peer_addr(&self) -> Option<SocketAddr>`
-shapes. `peer_addr` is a plain `rdma_get_peer_addr` wrapper and may not land
-upstream on the same timeline as `migrate`; if not, keep just that method (and the
-two-line import) as the residual patch rather than dropping the vendor tree.
+→ `peer_addr`, `Listener::process_event` → `reject`) are unchanged by removal as
+long as the upstream methods keep the `migrate(&self, &Arc<EventChannel>)`,
+`peer_addr(&self) -> Option<SocketAddr>`, and `reject(&self) -> Result<…>` shapes.
+`peer_addr` and `reject` are plain `rdma_get_peer_addr` / `rdma_reject` wrappers and
+may not land upstream on the same timeline as `migrate`; if not, keep just those
+methods (and the import) as the residual patch rather than dropping the vendor tree.

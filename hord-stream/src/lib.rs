@@ -14,4 +14,7 @@ mod stream;
 pub use stream::{ConnTeardown, HordConfig, HordStream};
 
 // Re-export the transport handle types so callers only need this crate.
-pub use hord_core::{is_device_removed, Connection, DeviceRemoved, Listener, RegisteredBuffer};
+pub use hord_core::{
+    is_connection_setup_failure, is_device_removed, Connection, ConnectionSetupFailed,
+    DeviceRemoved, Listener, RegisteredBuffer,
+};

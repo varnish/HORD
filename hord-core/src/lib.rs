@@ -105,6 +105,40 @@ pub fn is_device_removed(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<DeviceRemoved>())
 }
 
+/// Marker carried by the [`io::Error`] that [`Listener::accept`] /
+/// [`Listener::try_accept`] return when *one* incoming connection could not be set
+/// up — its per-connection CM channel, the migrate, the QP, or the INIT transition
+/// failed — as opposed to a listener-level fault. The offending peer has already
+/// been rejected (`rdma_reject`), so it fails fast instead of waiting out a connect
+/// timeout. A threaded acceptor should recognise this (with
+/// [`is_connection_setup_failure`]), skip the one connection, and keep accepting,
+/// rather than counting a single bad peer against its fatal-error budget. The
+/// `Display` text carries the underlying cause.
+#[derive(Debug)]
+pub struct ConnectionSetupFailed(String);
+
+impl ConnectionSetupFailed {
+    fn new(cause: &io::Error) -> Self {
+        ConnectionSetupFailed(cause.to_string())
+    }
+}
+
+impl std::fmt::Display for ConnectionSetupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "incoming connection setup failed (peer rejected): {}", self.0)
+    }
+}
+
+impl std::error::Error for ConnectionSetupFailed {}
+
+/// True if `e` marks a per-connection setup failure (its inner error is a
+/// [`ConnectionSetupFailed`]). A threaded acceptor uses this to skip one bad peer
+/// (already rejected) and keep accepting, instead of treating it as a
+/// listener-level error and backing off / climbing toward a fatal-error cap.
+pub fn is_connection_setup_failure(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<ConnectionSetupFailed>())
+}
+
 fn parse_addr(ip: &str, port: u16) -> io::Result<SocketAddr> {
     let addr: IpAddr = ip.parse().map_err(|_| invalid_ip(ip))?;
     Ok(SocketAddr::new(addr, port))
@@ -400,17 +434,37 @@ impl Listener {
                     .cm_id()
                     .ok_or_else(|| io::Error::other("connect request carried no cm id"))?;
                 event.ack().map_err(to_io)?;
-                // Give this connection its own CM event channel, decoupled from
-                // the listener's, so finishing it (and later watching it for
-                // disconnect) never competes with the next accept() — a looping,
-                // multi-threaded acceptor is then race-free. The ConnectRequest
-                // must be acked (above) before migrating.
-                let conn_channel = EventChannel::new().map_err(to_io)?;
-                id.migrate(&conn_channel).map_err(to_io)?;
-                let ep = Endpoint::build(&id, send_wr, recv_wr)?;
-                let conn = Connection::new(conn_channel, id, ep, Role::Server, cm);
-                conn.modify_qp(QueuePairState::Init)?;
-                Ok(Some(conn))
+
+                // Everything past the ack is THIS connection's setup: its own CM
+                // event channel (decoupled from the listener's, so finishing it —
+                // and later watching it for disconnect — never competes with the
+                // next accept(), making a looping/threaded acceptor race-free), the
+                // migrate, the QP, and the INIT transition. If any step fails it is
+                // a *per-connection* fault, not a listener fault, so on failure we:
+                //   * `reject` the peer — it then fails fast instead of waiting out
+                //     a connect timeout, with no half-open id lingering to timewait;
+                //   * tag the error `ConnectionSetupFailed`, so a looping/threaded
+                //     acceptor skips this one peer and keeps draining the queue,
+                //     rather than counting a single bad peer against its
+                //     fatal-error budget (see `is_connection_setup_failure`).
+                let setup = (|| -> io::Result<Connection> {
+                    let conn_channel = EventChannel::new().map_err(to_io)?;
+                    id.migrate(&conn_channel).map_err(to_io)?;
+                    let ep = Endpoint::build(&id, send_wr, recv_wr)?;
+                    let conn = Connection::new(conn_channel, Arc::clone(&id), ep, Role::Server, cm);
+                    conn.modify_qp(QueuePairState::Init)?;
+                    Ok(conn)
+                })();
+                match setup {
+                    Ok(conn) => Ok(Some(conn)),
+                    Err(e) => {
+                        // Best-effort: a reject that itself fails (e.g. the id is
+                        // already torn down) leaves us no worse than the old
+                        // drop-without-reject path.
+                        let _ = id.reject();
+                        Err(io::Error::other(ConnectionSetupFailed::new(&e)))
+                    }
+                }
             }
             // Device removal on the listener is terminal — surface it rather than
             // ack-and-spin (the next get_cm_event would block forever). Carry a
@@ -1030,5 +1084,37 @@ fn expect_event_timed(
                 _ => return Err(to_io(e)),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The two listener error markers must be distinguishable and must not
+    // cross-trigger: the acceptor stops on device removal but only *skips* a
+    // per-connection setup failure, so confusing them is a correctness bug.
+    #[test]
+    fn connection_setup_failure_is_classified_and_distinct() {
+        let cause = io::Error::new(io::ErrorKind::Other, "QP creation failed");
+        let tagged = io::Error::other(ConnectionSetupFailed::new(&cause));
+        assert!(is_connection_setup_failure(&tagged));
+        assert!(!is_device_removed(&tagged));
+
+        let removed = io::Error::other(DeviceRemoved);
+        assert!(is_device_removed(&removed));
+        assert!(!is_connection_setup_failure(&removed));
+
+        // A plain error is neither marker.
+        let plain = io::Error::new(io::ErrorKind::TimedOut, "nope");
+        assert!(!is_connection_setup_failure(&plain));
+        assert!(!is_device_removed(&plain));
+    }
+
+    #[test]
+    fn connection_setup_failure_display_carries_the_cause() {
+        let cause = io::Error::new(io::ErrorKind::Other, "max_qp_wr exceeded");
+        let tagged = io::Error::other(ConnectionSetupFailed::new(&cause));
+        assert!(tagged.to_string().contains("max_qp_wr exceeded"));
     }
 }

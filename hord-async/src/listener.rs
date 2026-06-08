@@ -111,7 +111,10 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{Id, JoinError, JoinSet};
 
-use hord_stream::{is_device_removed, ConnTeardown, Connection, HordConfig, HordStream, Listener};
+use hord_stream::{
+    is_connection_setup_failure, is_device_removed, ConnTeardown, Connection, HordConfig,
+    HordStream, Listener,
+};
 
 // `ReactorFd` (crate root) is the shared "raw fd owned elsewhere; drop deregisters
 // but does not close" AsyncFd wrapper — reused here for the listener's CM fd.
@@ -336,7 +339,10 @@ async fn acceptor_loop(
                 // *error* would discard readiness we never observed as consumed —
                 // the AsyncFd footgun that hot-spins on a persistent error.
                 let mut drained = false;
-                let mut accepted = 0u32;
+                // Events handled this wakeup — accepts *and* rejected-bad-peer
+                // skips both count, so a flood of either kind yields to the
+                // `select!` (and the biased shutdown branch) at the per-wakeup cap.
+                let mut handled = 0u32;
                 // Set by a terminal listener error (device removal) so the post-loop
                 // logic stops the acceptor immediately rather than backing off.
                 let mut fatal = false;
@@ -351,8 +357,8 @@ async fn acceptor_loop(
                             consecutive_errors = 0;
                             let peer = conn.peer_addr().unwrap_or(UNKNOWN_PEER);
                             dispatch(&senders, &mut next, conn, peer);
-                            accepted += 1;
-                            if accepted >= MAX_DRAIN_PER_WAKEUP {
+                            handled += 1;
+                            if handled >= MAX_DRAIN_PER_WAKEUP {
                                 // Yield to the `select!` so a flood can't starve
                                 // shutdown; the fd stays readable, so we resume.
                                 break;
@@ -374,6 +380,20 @@ async fn acceptor_loop(
                             log::error!("hord: {e}; stopping acceptor");
                             fatal = true;
                             break;
+                        }
+                        Err(e) if is_connection_setup_failure(&e) => {
+                            // One peer's setup failed; `hord-core` already rejected
+                            // it. This is NOT a listener fault, so it must not touch
+                            // `consecutive_errors` or trigger the back-off — just
+                            // log, count it toward the per-wakeup cap, and keep
+                            // draining the rest of this wakeup's queue (the next
+                            // event, if any). The failed event is consumed, so the
+                            // loop advances rather than re-seeing it.
+                            log::warn!("hord: rejected a peer whose connection setup failed: {e}");
+                            handled += 1;
+                            if handled >= MAX_DRAIN_PER_WAKEUP {
+                                break;
+                            }
                         }
                         Err(e) => {
                             consecutive_errors += 1;

@@ -169,7 +169,8 @@ use rdma_mummy_sys::{
     ibv_qp_attr, rdma_accept, rdma_ack_cm_event, rdma_bind_addr, rdma_cm_event, rdma_cm_event_type, rdma_cm_id,
     rdma_conn_param, rdma_connect, rdma_create_event_channel, rdma_create_id, rdma_destroy_event_channel,
     rdma_destroy_id, rdma_disconnect, rdma_establish, rdma_event_channel, rdma_get_cm_event, rdma_get_peer_addr,
-    rdma_init_qp_attr, rdma_listen, rdma_migrate_id, rdma_port_space, rdma_resolve_addr, rdma_resolve_route,
+    rdma_init_qp_attr, rdma_listen, rdma_migrate_id, rdma_port_space, rdma_reject, rdma_resolve_addr,
+    rdma_resolve_route,
 };
 
 use crate::ibverbs::device_context::DeviceContext;
@@ -463,6 +464,28 @@ pub struct MigrateError(#[from] pub MigrateErrorKind);
 #[error(transparent)]
 #[non_exhaustive]
 pub enum MigrateErrorKind {
+    Rdmacm(#[from] io::Error),
+}
+
+/// Error returned by [`Identifier::reject`] for rejecting a connection request.
+///
+/// # HORD addition
+///
+/// Not part of upstream sideway 0.4.3 — added alongside [`migrate`] so a server
+/// that fails to set up an accepted connection can refuse it explicitly. See
+/// HORD-PATCH.md.
+///
+/// [`migrate`]: crate::rdmacm::communication_manager::Identifier::migrate
+#[derive(Debug, thiserror::Error)]
+#[error("failed to reject connection request")]
+#[non_exhaustive]
+pub struct RejectError(#[from] pub RejectErrorKind);
+
+/// The enum type for [`RejectError`].
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+#[non_exhaustive]
+pub enum RejectErrorKind {
     Rdmacm(#[from] io::Error),
 }
 
@@ -965,6 +988,36 @@ impl Identifier {
         // Hold the new channel alive (and release the old one) so the identifier
         // and the channel its events are delivered on stay consistent.
         *self._event_channel.lock().unwrap() = Arc::clone(channel);
+        Ok(())
+    }
+
+    /// Reject a pending connection request on this [`Identifier`] (`rdma_reject`),
+    /// sending no private data.
+    ///
+    /// # HORD addition
+    ///
+    /// Not part of upstream sideway 0.4.3 — added alongside [`migrate`] so a server
+    /// that has accepted a [`EventType::ConnectRequest`] id (via [`Event::cm_id`])
+    /// but then fails to set the connection up can refuse it explicitly, rather than
+    /// dropping the id and leaving the peer to wait out a connect timeout (with a
+    /// half-open id lingering until timewait). Valid only for a `ConnectRequest` id
+    /// that has not yet been accepted. See HORD-PATCH.md.
+    ///
+    /// # Note
+    ///
+    /// The `ConnectRequest` event must have been acked before rejecting (as for
+    /// [`accept`]).
+    ///
+    /// [`migrate`]: crate::rdmacm::communication_manager::Identifier::migrate
+    /// [`accept`]: crate::rdmacm::communication_manager::Identifier::accept
+    pub fn reject(&self) -> Result<(), RejectError> {
+        let cm_id = self.cm_id;
+        let ret = unsafe { rdma_reject(cm_id.as_ptr(), null(), 0) };
+
+        if ret < 0 {
+            return Err(RejectErrorKind::Rdmacm(io::Error::last_os_error()).into());
+        }
+
         Ok(())
     }
 
