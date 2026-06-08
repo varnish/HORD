@@ -51,10 +51,17 @@
 //! The one-sided RDMA write is driven through [`SharedAsyncStream`], a clonable
 //! handle that lets a `hyper` server reach the connection from inside its request
 //! handler — necessary because the write shares the one completion queue `hyper`
-//! drains, on the one driving task. The client needs no handle: it registers its
-//! destination buffer up front ([`AsyncHordStream::register_remote_writable`])
-//! and reads it after the response. The `X-HORD-RDMA-Write` HTTP semantics live
-//! in `hord-zerocopy`.
+//! drains, on the one driving task. A handler's one call is
+//! [`SharedAsyncStream::serve_rdma_write_pooled`] (or
+//! [`serve_rdma_write`](SharedAsyncStream::serve_rdma_write)): it runs the
+//! §7.3/§7.7 server policy, performs the write, and returns the
+//! [`RdmaWriteStatus`] — including the `bytes_written` count a host's transaction
+//! log needs (the body bypasses `hyper`, so frame-counting sees nothing). The
+//! lower-level [`rdma_write`](SharedAsyncStream::rdma_write) primitive is still
+//! there for callers that drive the policy themselves. The client needs no handle:
+//! it registers its destination buffer up front
+//! ([`AsyncHordStream::register_remote_writable`]) and reads it after the
+//! response. The `X-HORD-RDMA-Write` HTTP semantics live in `hord-zerocopy`.
 //!
 //! ## Timeouts
 //!
@@ -76,6 +83,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use hord_stream::{Connection, HordConfig, HordStream, RegisteredBuffer};
+use hord_zerocopy::{RdmaWriteAction, RdmaWriteReq, RdmaWriteStatus, SourcePool};
 
 mod listener;
 pub use listener::HordListener;
@@ -524,9 +532,10 @@ struct PendingWrite<'a> {
 /// must be driven by the same object, on the same task.)
 ///
 /// Both `hyper` (via [`tokio::io::AsyncRead`]/[`AsyncWrite`]) and the handler (via
-/// [`rdma_write`](Self::rdma_write)) reach the stream through this handle, which
-/// `borrow_mut`s the shared cell **only for the duration of each poll — never
-/// across an await**. That keeps the two borrows *sequential*, which is the whole
+/// [`serve_rdma_write_pooled`](Self::serve_rdma_write_pooled) — the recommended
+/// one-call entry point — or the lower-level [`rdma_write`](Self::rdma_write)) reach
+/// the stream through this handle, which `borrow_mut`s the shared cell **only for
+/// the duration of each poll — never across an await**. That keeps the two borrows *sequential*, which is the whole
 /// safety argument: everything runs on one current-thread task, and within that
 /// task no two polls overlap, so the cell is never borrowed twice at once.
 ///
@@ -630,6 +639,144 @@ impl SharedAsyncStream {
             post_outcome: None,
         };
         std::future::poll_fn(|cx| self.0.borrow_mut().poll_rdma_write(cx, &mut w)).await
+    }
+
+    /// Serve the server side of a zero-copy response (spec §7.3, and §7.7 in split
+    /// mode) over this connection, returning the [`RdmaWriteStatus`] to put in the
+    /// HTTP response — **the single borrow-sound entry point** a `hyper` handler
+    /// should use to deliver a body out-of-band. A fresh source MR is registered per
+    /// call; for a connection that serves many responses (HTTP keep-alive, or a
+    /// split run) use [`serve_rdma_write_pooled`](Self::serve_rdma_write_pooled) to
+    /// amortize registration (spec §8.3).
+    ///
+    /// This is the async counterpart of [`hord_zerocopy::serve_rdma_write`]: it runs
+    /// the same pure §7.3/§7.7 policy ([`RdmaWriteAction::decide`]) and then drives
+    /// the *async* one-sided write through this handle, so the policy can never
+    /// drift from the synchronous path.
+    ///
+    /// # What it returns (the §7.4 outcome — DMA byte count + status for logging)
+    ///
+    /// * [`RdmaWriteStatus::Complete`] `{ bytes_written }` — the body was delivered
+    ///   by RDMA write; `bytes_written` is the count actually placed in the peer's
+    ///   buffer (`== object_size`; `0` for an empty split body, whose immediate
+    ///   still rode). The response carries `Content-Length: 0`. **A host whose
+    ///   transaction log counts `hyper` body frames — which see nothing here — must
+    ///   record `bytes_written` as the body size**; surfacing it for exactly that is
+    ///   why this returns the status rather than `()`.
+    /// * [`RdmaWriteStatus::TooLarge`] `{ object_size }` — the object exceeds the
+    ///   client's advertised buffer (`req.len`); **nothing was written** and `fill`
+    ///   is never called.
+    /// * Never [`RdmaWriteStatus::Declined`]: declining is a host policy decision
+    ///   made *before* calling this (don't call it; send the body on the stream and
+    ///   echo `declined` yourself). [`RdmaWriteAction::decide`] never yields it.
+    ///
+    /// `fill` populates the source buffer's first `object_size` bytes just before
+    /// the write — this prototype's one server-side copy (Milestone 3 removes it by
+    /// gathering from caller-owned MRs). On a transport failure mid-write this
+    /// returns `Err` and the connection closes; the caller MUST NOT report
+    /// `complete` then (§7.4/§7.7.7) — map the `Err` to a 5xx. The too-large and
+    /// error cases never deliver a §7.7 immediate, so a split data-plane consumer
+    /// must bound its wait rather than assume one completion per request.
+    ///
+    /// # Borrow soundness
+    ///
+    /// This is the pattern the module header calls for: an embedder calls one method
+    /// and never touches the `Rc<RefCell<…>>` aliasing rules. It takes only
+    /// *momentary* borrows of the shared cell — to decide, to register, and once per
+    /// write poll — and **never holds one across an `.await`** (the source
+    /// [`RegisteredBuffer`] and the policy live in locals), so the single-task borrow
+    /// discipline that makes [`rdma_write`](Self::rdma_write) sound covers the whole
+    /// serve.
+    pub async fn serve_rdma_write(
+        &self,
+        req: &RdmaWriteReq,
+        object_size: u64,
+        fill: impl FnOnce(&RegisteredBuffer),
+    ) -> io::Result<RdmaWriteStatus> {
+        match RdmaWriteAction::decide(req, object_size, self.split_mode_negotiated()) {
+            RdmaWriteAction::Respond(status) => Ok(status),
+            RdmaWriteAction::Write {
+                payload_len,
+                source_len,
+                transfer_id,
+            } => {
+                let src = self.register_source(source_len)?;
+                self.run_write_plan(&src, req, payload_len, transfer_id, fill).await?;
+                // `src` drops after the write returns: `run_write_plan` awaited the
+                // write's completion (and ack), so no DMA references the MR —
+                // deregistration is sound. Mirrors `hord_zerocopy::serve_rdma_write`.
+                Ok(RdmaWriteStatus::Complete {
+                    bytes_written: payload_len as u64,
+                })
+            }
+        }
+    }
+
+    /// Like [`serve_rdma_write`](Self::serve_rdma_write), but draws the source region
+    /// from a [`SourcePool`] (spec §8.3) instead of registering a fresh MR per
+    /// response — the async counterpart of [`hord_zerocopy::serve_rdma_write_pooled`].
+    /// `ibv_reg_mr` is expensive (§8.1), so a server reusing a connection (HTTP
+    /// keep-alive, or a split run serving many transfers) amortizes it. The
+    /// HTTP-facing behaviour is identical: same status (carrying `bytes_written`),
+    /// same `Content-Length: 0`, same §7.3/§7.7 policy. The pool falls back to a
+    /// one-off registration for an oversized object (§8.4) or a momentarily exhausted
+    /// pool, so correctness never depends on the pool being large enough.
+    pub async fn serve_rdma_write_pooled(
+        &self,
+        pool: &SourcePool,
+        req: &RdmaWriteReq,
+        object_size: u64,
+        fill: impl FnOnce(&RegisteredBuffer),
+    ) -> io::Result<RdmaWriteStatus> {
+        match RdmaWriteAction::decide(req, object_size, self.split_mode_negotiated()) {
+            RdmaWriteAction::Respond(status) => Ok(status),
+            RdmaWriteAction::Write {
+                payload_len,
+                source_len,
+                transfer_id,
+            } => {
+                // The registrar borrows the stream only for the `register_source`
+                // call (the pool calls it with no pool borrow held), so no borrow is
+                // outstanding at the write's `.await`. The lease owns its buffer and
+                // holds only an `Rc` to the pool, so it is safe across the await; it
+                // drops at block end — after the write is acked — returning the
+                // buffer to the pool with no DMA still referencing it.
+                let lease = pool.acquire(source_len, |n| self.register_source(n))?;
+                self.run_write_plan(lease.buffer(), req, payload_len, transfer_id, fill)
+                    .await?;
+                Ok(RdmaWriteStatus::Complete {
+                    bytes_written: payload_len as u64,
+                })
+            }
+        }
+    }
+
+    /// Fill `src`'s first `payload_len` bytes (when there are any) and drive the
+    /// one-sided write into the client's `[addr, rkey]` — write-with-immediate
+    /// carrying `transfer_id` in split mode (§7.7), else a plain write. The async
+    /// sibling of `hord_zerocopy`'s private `run_write_plan`; shared by both serve
+    /// methods so the only thing differing between them is where the source comes
+    /// from. Holds no `RefCell` borrow across the `.await` (it delegates to
+    /// [`rdma_write`](Self::rdma_write) / [`rdma_write_with_imm`](Self::rdma_write_with_imm),
+    /// which borrow per poll).
+    async fn run_write_plan(
+        &self,
+        src: &RegisteredBuffer,
+        req: &RdmaWriteReq,
+        payload_len: usize,
+        transfer_id: Option<u32>,
+        fill: impl FnOnce(&RegisteredBuffer),
+    ) -> io::Result<()> {
+        if payload_len > 0 {
+            fill(src);
+        }
+        match transfer_id {
+            Some(id) => {
+                self.rdma_write_with_imm(src, 0, req.addr, req.rkey, payload_len, id)
+                    .await
+            }
+            None => self.rdma_write(src, 0, req.addr, req.rkey, payload_len).await,
+        }
     }
 
     /// Receive the next split-mode (§7.7) transfer completion off the CQ,

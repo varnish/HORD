@@ -56,7 +56,7 @@ use hord_demo::{
     pattern_fill_registered_from, RangeSpec,
 };
 use hord_stream::HordConfig;
-use hord_zerocopy::{RdmaWriteAction, RdmaWriteReq, RdmaWriteStatus, SourcePool, HEADER};
+use hord_zerocopy::{RdmaWriteReq, RdmaWriteStatus, SourcePool, HEADER};
 
 const DEFAULT_BIND: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
 const DEFAULT_PORT: u16 = 4791;
@@ -291,79 +291,42 @@ async fn serve_zero_copy(
             _ => None,
         }
     };
-    // The §7.3/§7.7 policy (too-large gate, split vs. plain, the zero-length
-    // 1-byte-source workaround) lives in the library so it can't drift from the
-    // sync `serve_rdma_write`; here we only run the chosen plan with async writes
-    // and map the outcome to HTTP. Gated on the range *length*, not the object size.
-    match RdmaWriteAction::decide(req, len as u64, stream.split_mode_negotiated()) {
-        // Nothing to write — map the status to a code and respond. Matched
-        // exhaustively (no wildcard) so adding an RdmaWriteStatus variant is a
-        // compile error here rather than a silent 200; decide() only ever yields
-        // TooLarge or Complete in this path.
-        RdmaWriteAction::Respond(status) => {
-            let code = match status {
-                RdmaWriteStatus::TooLarge { .. } => 413,
-                RdmaWriteStatus::Complete { .. } | RdmaWriteStatus::Declined if partial => 206,
-                RdmaWriteStatus::Complete { .. } | RdmaWriteStatus::Declined => 200,
-            };
-            eprintln!("[server] -> {code} (zero-copy: {})", status.header_value());
+    // One borrow-sound library call runs the whole §7.3/§7.7 server policy (the
+    // too-large gate, split vs. plain, the zero-length 1-byte-source workaround) AND
+    // the async write, then hands back the §7.4 status carrying `bytes_written` — so
+    // the policy can't drift from the sync `serve_rdma_write`, and we only map the
+    // outcome to HTTP here. `fill` is this demo's one server-side copy: the range's
+    // bytes from their absolute object offset `base` (Milestone 3 removes it). Gated
+    // on the range *length*, not the whole object size.
+    match stream
+        .serve_rdma_write_pooled(pool, req, len as u64, |src| pattern_fill_registered_from(src, base, len))
+        .await
+    {
+        // Delivered. Keep the split/plain distinction (and the transfer id) in the
+        // log so a §7.7 data-plane stall can be correlated server-side.
+        Ok(status @ RdmaWriteStatus::Complete { bytes_written }) => {
+            let code = if partial { 206 } else { 200 };
+            match req.id.filter(|_| stream.split_mode_negotiated()) {
+                Some(id) => eprintln!("[server] -> {code} (split: complete id={id} bytes_written={bytes_written})"),
+                None => eprintln!("[server] -> {code} (zero-copy: complete bytes_written={bytes_written})"),
+            }
             zc_response(code, status, range_hdr(&status))
         }
-        RdmaWriteAction::Write { payload_len, source_len, transfer_id } => {
-            // NOTE: the too_large response above and the register_source-500 below
-            // do NOT deliver an immediate; per §7.7.7 those are control-plane
-            // fallbacks the client reconciles via the HTTP status, and a data-plane
-            // consumer must bound its wait with a timeout rather than assume every
-            // request yields a completion.
-            // Lease a source from the per-connection pool (§8.3) — reusing its
-            // registration — falling back to a one-off only when the object exceeds
-            // the slab or the pool is exhausted. The lease (owning its buffer and
-            // only an `Rc`) is held across the await and dropped at function end,
-            // after the write is acknowledged, so the buffer returns to the pool with
-            // no DMA still referencing it.
-            let lease = match pool.acquire(source_len, |n| stream.register_source(n)) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("[server] source acquire failed: {e}");
-                    return respond(500, "text/plain", full(b"internal error\n"), None);
-                }
-            };
-            let src = lease.buffer();
-            if payload_len > 0 {
-                pattern_fill_registered_from(src, base, payload_len);
-            }
-            // Split mode delivers via write-with-immediate (signalling the client's
-            // data plane on its CQ); plain mode is a one-sided write. The HTTP
-            // response is identical either way (§7.7.4); a mid-write Err puts the QP
-            // in error and the connection will close, so returning anything is
-            // best-effort (§7.4). The logs keep the split/plain distinction (and the
-            // transfer id) so a §7.7 data-plane stall can be correlated server-side.
-            let result = match transfer_id {
-                Some(id) => stream.rdma_write_with_imm(src, 0, req.addr, req.rkey, payload_len, id).await,
-                None => stream.rdma_write(src, 0, req.addr, req.rkey, payload_len).await,
-            };
-            match result {
-                Ok(()) => {
-                    let code = if partial { 206 } else { 200 };
-                    match transfer_id {
-                        Some(id) => eprintln!(
-                            "[server] -> {code} (split: complete id={id} bytes_written={payload_len})"
-                        ),
-                        None => eprintln!(
-                            "[server] -> {code} (zero-copy: complete bytes_written={payload_len})"
-                        ),
-                    }
-                    let status = RdmaWriteStatus::Complete { bytes_written: payload_len as u64 };
-                    zc_response(code, status, range_hdr(&status))
-                }
-                Err(e) => {
-                    match transfer_id {
-                        Some(_) => eprintln!("[server] rdma_write_with_imm failed: {e}"),
-                        None => eprintln!("[server] rdma_write failed: {e}"),
-                    }
-                    respond(500, "text/plain", full(b"rdma write failed\n"), None)
-                }
-            }
+        // Object exceeds the client's buffer (§7.4): nothing was written.
+        Ok(status @ RdmaWriteStatus::TooLarge { .. }) => {
+            eprintln!("[server] -> 413 (zero-copy: {})", status.header_value());
+            zc_response(413, status, None)
+        }
+        // `decide` never declines: declining is a host choice made *before* the call
+        // (we serve the body on the stream instead). Matched explicitly so a new
+        // RdmaWriteStatus variant is a compile error here, not a silent 200.
+        Ok(RdmaWriteStatus::Declined) => unreachable!("serve_rdma_write never declines"),
+        // A failed source registration or a mid-write transport error (the QP goes
+        // to error and the connection closes); per §7.4/§7.7.7 we must not report
+        // `complete`, so respond 500 (best-effort — no immediate was delivered).
+        Err(e) => {
+            eprintln!("[server] rdma write failed: {e}");
+            respond(500, "text/plain", full(b"rdma write failed\n"), None)
         }
     }
 }

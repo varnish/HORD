@@ -450,7 +450,7 @@ still does **one copy** (MSE4 page → registered source buffer → DMA) — Mil
 removes that. This is where the workload that justifies HORD (GPU consumers pulling
 segments) actually pays off.
 
-- [ ] **Make `SharedAsyncStream` ergonomic from inside a hyper service handler.**
+- [x] **Make `SharedAsyncStream` ergonomic from inside a hyper service handler.**
       Today the one-sided write is driven via `SharedAsyncStream::rdma_write`
       (`hord-async/src/lib.rs:49-57`), reachable from the handler because it shares the
       one CQ the driving task drains. Carapace's handler (`handle` in `handler.rs`)
@@ -461,12 +461,43 @@ segments) actually pays off.
       `Rc<RefCell<…>>` aliasing rules — a misuse here is a soundness bug, not a perf
       bug.
 
-- [ ] **Surface the DMA'd byte count for logging.** When the body goes out via
+      **Done (HORD side).** `SharedAsyncStream::serve_rdma_write` and
+      `serve_rdma_write_pooled` (`hord-async/src/lib.rs`) are the single-call,
+      borrow-sound entry point: a handler calls one method that runs the §7.3/§7.7
+      policy (`RdmaWriteAction::decide`), registers or leases a source (a `SourcePool`
+      for keep-alive amortization, §8.3), fills it, drives the *async* one-sided write,
+      and returns the `RdmaWriteStatus`. The embedder never touches `RdmaWriteAction`,
+      `rdma_write`, or the `Rc<RefCell<…>>` rules — the method takes only momentary
+      borrows and holds none across an `.await`, so the soundness argument is the
+      library's, not the embedder's (it is the async mirror of the sync
+      `hord_zerocopy::serve_rdma_write*`, sharing `RdmaWriteAction::decide` so the
+      policy can't drift). The demo's `serve_zero_copy`
+      (`hord-demo/src/bin/server_async.rs`) collapsed to that one call plus HTTP
+      mapping, so it doubles as the integration example. `hord-async` gained a
+      cycle-free `hord-zerocopy = { features = ["rdma"] }` dep to host the methods; no
+      device-free property is lost (hord-async is RDMA-only by construction) and the
+      `codec` job's `cargo tree -p hord-zerocopy` stays empty. **Remaining (Carapace
+      side):** thread the `SharedAsyncStream` handle into request context so a route can
+      reach it (the demo shows the shape — capture it in the `service_fn` closure).
+
+- [x] **Surface the DMA'd byte count for logging.** When the body goes out via
       `RDMA_WRITE`, it bypasses hyper entirely — Carapace's `FinalizingBody`
       (`carapace-direct/src/vsl.rs:281`) counts hyper *frame* bytes and would record
       ~0 body bytes for a zero-copy delivery, corrupting VSL `ReqAcct`. HORD must
       report, per transfer, the number of bytes actually written to the peer (and the
       `RdmaWriteStatus` outcome) so Carapace can finalize accurate transaction logs.
+
+      **Done (HORD side).** The async serve methods above return
+      `io::Result<RdmaWriteStatus>`: `Complete { bytes_written }` carries the exact
+      count placed in the peer's buffer (the body size a frame-counting log must
+      record, since hyper sees nothing), `TooLarge { object_size }` reports a no-write,
+      and a transport failure is `Err` (the caller must not log `complete`,
+      §7.4/§7.7.7). The previous async path (`rdma_write` → `io::Result<()>`) forced the
+      demo to reconstruct the status by hand; now it is the return value. Regressed by
+      `serve_rdma_write_pooled_reports_bytes_written` and
+      `serve_rdma_write_too_large_writes_nothing` in `hord-async/tests/zerocopy.rs`.
+      **Remaining (Carapace side):** record `bytes_written` into `FinalizingBody`'s
+      `ReqAcct` for a zero-copy delivery.
 
 ### Milestone 3 — true zero-copy from MSE4 pages (the actual prize)
 

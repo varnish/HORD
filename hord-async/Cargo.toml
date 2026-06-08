@@ -13,6 +13,15 @@ repository.workspace = true
 # host with only a C compiler and rdma-core).
 [dependencies]
 hord-stream = { path = "../hord-stream" }
+# The zero-copy header codec + write policy (RdmaWriteReq / RdmaWriteStatus /
+# RdmaWriteAction / SourcePool): `SharedAsyncStream::serve_rdma_write{,_pooled}`
+# run the §7.3/§7.7 policy and drive the async one-sided write through it, so they
+# are the async counterpart of `hord_zerocopy::serve_rdma_write*`. The `rdma`
+# feature is on because we use that orchestration (SourcePool etc.), not just the
+# codec — but it pulls in nothing beyond hord-stream, which hord-async already
+# links, so hord-async stays RDMA-only by construction (no new external linkage)
+# and there is no dependency cycle (hord-zerocopy does not depend on hord-async).
+hord-zerocopy = { path = "../hord-zerocopy", features = ["rdma"] }
 # "rt": `spawn_local`/`spawn_blocking`/`LocalSet` + the current-thread runtimes
 #   the multi-waiter split (`AsyncHordStream::into_split`) and `HordListener`'s
 #   thread-per-core workers run on.
@@ -30,8 +39,3 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros", "
 # Test-only: per-thread CPU accounting (CLOCK_THREAD_CPUTIME_ID) for the #15
 # busy-poll-vs-park measurement in tests/idle_cpu.rs.
 libc = "0.2"
-# Test-only: reuse the X-HORD-RDMA-Write codec in the zero-copy write test.
-# Default features only (no `rdma`): the tests use just the pure header codec
-# (RdmaWriteReq / RdmaWriteStatus), so this dev-dep pulls no extra RDMA linkage
-# beyond what hord-async already has via hord-stream.
-hord-zerocopy = { path = "../hord-zerocopy" }
