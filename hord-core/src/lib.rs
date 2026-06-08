@@ -625,11 +625,19 @@ impl Connection {
         let event_channel = EventChannel::new().map_err(to_io)?;
         let id = event_channel.create_id(PortSpace::Tcp).map_err(to_io)?;
         let timeout = Duration::from_millis(cm.resolve_timeout_ms.max(0) as u64);
+        // `rdma_resolve_addr`/`_route` self-bound by `timeout` and, on their own
+        // expiry, fire an `AddrError`/`RouteError` event — which arrives first and
+        // yields a descriptive mismatch error. The event-wait bound is purely a
+        // backstop against a CM that delivers *no* event (so it must comfortably
+        // exceed the resolve timeout): at least 2x it, and never below the
+        // establish bound so a tiny configured resolve timeout can't make us
+        // abandon a resolve that is still progressing under load.
+        let resolve_wait = timeout.saturating_mul(2).max(ESTABLISH_TIMEOUT);
 
         id.resolve_addr(None, addr, timeout).map_err(to_io)?;
-        expect_event(&event_channel, EventType::AddressResolved)?;
+        wait_event(&event_channel, EventType::AddressResolved, resolve_wait)?;
         id.resolve_route(timeout).map_err(to_io)?;
-        expect_event(&event_channel, EventType::RouteResolved)?;
+        wait_event(&event_channel, EventType::RouteResolved, resolve_wait)?;
 
         let ep = Endpoint::build(&id, send_wr, recv_wr)?;
         let conn = Connection::new(event_channel, id, ep, Role::Client, cm);
@@ -649,7 +657,10 @@ impl Connection {
 
         // External-QP mode (we created the QP, not librdmacm) reports a connect
         // *response* rather than ESTABLISHED; we ack it then establish manually.
-        expect_event(&self.event_channel, EventType::ConnectResponse)?;
+        // Bounded by the same `ESTABLISH_TIMEOUT` the server's accept uses, so a
+        // peer that accepts the request then stalls cannot pin this thread — the
+        // "no peer pins a thread forever" guarantee now holds on both ends.
+        wait_event(&self.event_channel, EventType::ConnectResponse, ESTABLISH_TIMEOUT)?;
         self.modify_qp(QueuePairState::ReadyToReceive)?;
         self.modify_qp(QueuePairState::ReadyToSend)?;
         self.id.establish().map_err(to_io)?;
@@ -674,7 +685,7 @@ impl Connection {
         let mut param = ConnectionParameter::default();
         param.setup_qp_number(qp_number);
         self.id.accept(param).map_err(to_io)?;
-        expect_event_timed(&self.event_channel, EventType::Established, ESTABLISH_TIMEOUT)?;
+        wait_event(&self.event_channel, EventType::Established, ESTABLISH_TIMEOUT)?;
         Ok(())
     }
 
@@ -1028,32 +1039,30 @@ impl Drop for Connection {
 /// the first-message handshake timeout in `hord-stream`.
 const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Block for the next CM event and require it to be `want`; ack it either way.
-fn expect_event(channel: &Arc<EventChannel>, want: EventType) -> io::Result<()> {
-    let event = channel.get_cm_event().map_err(to_io)?;
-    let got = event.event_type();
-    let status = event.status();
-    event.ack().map_err(to_io)?;
-    if got == want {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "expected CM event {want:?}, got {got:?} (status {status})"
-        )))
-    }
-}
-
-/// Like [`expect_event`], but bounded by `timeout`. Flips the channel non-blocking
-/// and polls for the event with a deadline, so a stalled peer cannot block the
-/// caller indefinitely. Returns [`io::ErrorKind::TimedOut`] if the event does not
-/// arrive in time. The channel is left non-blocking (which is the state the stream
-/// layer wants post-handshake anyway, for half-close detection).
-fn expect_event_timed(
-    channel: &Arc<EventChannel>,
-    want: EventType,
-    timeout: Duration,
-) -> io::Result<()> {
+/// Wait for the next CM event on `channel`, require it to be `want`, and ack it
+/// either way — bounded by `timeout`.
+///
+/// This is the single CM wait shared by **both ends** of the handshake: the
+/// client (address/route resolution, then the connect response) and the server
+/// (established). Routing every wait through one function means the deadline
+/// guarantee, the ack, and the mismatch-error formatting live in exactly one
+/// place, and the two ends can no longer diverge in how they wait.
+///
+/// It is **fd-driven, not sleep-polled**: it parks on the channel fd with
+/// [`poll_readable`] and wakes the instant an event lands, so it adds no polling
+/// latency to a handshake and burns no CPU while waiting (the old timed variant
+/// busy-looped on a 1 ms [`std::thread::sleep`], which both added up to ~1 ms of
+/// latency per handshake and blocked the caller's whole current-thread runtime).
+/// A peer that stalls cannot pin the calling thread past the deadline — on
+/// expiry this returns [`io::ErrorKind::TimedOut`].
+///
+/// The channel is flipped non-blocking so the `get_cm_event` after a readable
+/// `poll` cannot block on a spurious wakeup (or on a benign event we loop past).
+/// Callers do not depend on the mode this leaves: the stream layer sets the
+/// post-handshake channel mode explicitly via [`Connection::set_cm_nonblock`].
+fn wait_event(channel: &Arc<EventChannel>, want: EventType, timeout: Duration) -> io::Result<()> {
     channel.set_nonblocking(true).map_err(to_io)?;
+    let fd = channel.as_raw_fd();
     let deadline = Instant::now() + timeout;
     loop {
         match channel.get_cm_event() {
@@ -1069,21 +1078,59 @@ fn expect_event_timed(
                     )))
                 };
             }
-            // Non-blocking channel with nothing pending: spin to the deadline.
+            // Non-blocking channel with nothing pending: park on the fd until it
+            // is readable or the deadline passes, then loop to drain it.
             // `GetEventError` is `#[non_exhaustive]`; reach its kind via `.0`.
             Err(e) => match &e.0 {
                 GetEventErrorKind::NoEvent => {
-                    if Instant::now() >= deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             format!("timed out waiting for CM event {want:?}"),
                         ));
                     }
-                    std::thread::sleep(Duration::from_millis(1));
+                    poll_readable(fd, remaining)?;
                 }
                 _ => return Err(to_io(e)),
             },
         }
+    }
+}
+
+/// Park on `fd` with `poll(2)` until it is readable or `timeout` elapses.
+///
+/// Returns `Ok(())` on either outcome — a readable fd *or* a poll timeout — and
+/// lets the caller re-check its own deadline and re-drain the channel; only a
+/// genuine `poll(2)` failure is surfaced. `POLLERR`/`POLLHUP` also satisfy the
+/// wait: the follow-up `get_cm_event` is what turns the underlying condition into
+/// a real error. `EINTR` retries within the original `timeout`.
+fn poll_readable(fd: RawFd, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // `poll` takes a `c_int` millisecond timeout. Round a sub-millisecond
+        // remainder up to 1 ms so a `poll(…, 0)` can't busy-spin out the tail of
+        // the deadline, and clamp the (already-bounded) wait to the argument type.
+        let ms = match remaining.as_millis() {
+            0 => 1,
+            n => n.min(libc::c_int::MAX as u128) as libc::c_int,
+        };
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        // SAFETY: `pfd` is a single, live, correctly-initialised `pollfd` for the
+        // duration of the call; `poll` reads/writes only that one element.
+        let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            // EINTR: a signal interrupted the wait; retry within the same deadline.
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        // rc == 0 (timed out) or rc > 0 (readable / error revents): either way,
+        // hand back so the caller re-checks the deadline and drains the channel.
+        return Ok(());
     }
 }
 

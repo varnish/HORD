@@ -19,3 +19,6 @@ authors.workspace = true
 [dependencies]
 sideway = "0.4.3"
 rdma-mummy-sys = "0.2.4"
+# poll(2) on the CM event-channel fd: the timeout-bounded, fd-driven handshake
+# wait (`wait_event`) parks on the fd instead of sleep-polling it.
+libc = "0.2"

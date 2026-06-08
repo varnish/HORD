@@ -314,7 +314,7 @@ The following remain consciously deferred.
       impossible QP sizing → assert the peer's `connect_finish` fails fast, not a
       watchdog timeout, and the server's error is `is_connection_setup_failure`).
 
-- [ ] **`expect_event_timed` is a server-only twin of `expect_event` with a 1 ms poll
+- [x] **`expect_event_timed` is a server-only twin of `expect_event` with a 1 ms poll
       and a divergent channel-mode side effect.** Three issues, all low-severity but
       worth unifying: (1) it busy-polls with a fixed `std::thread::sleep(1ms)` (the old
       `expect_event` blocked on the fd and woke immediately), so each synchronous
@@ -326,6 +326,26 @@ The following remain consciously deferred.
       in channel mode; (3) it duplicates the ack/match/error-format body of
       `expect_event`. **Fix:** one timeout-bearing, fd-driven (not sleep-polled) CM
       wait shared by both ends. Pairs with the handshake-stage item above.
+
+      **Done.** Both helpers collapse into a single `wait_event(channel, want,
+      timeout)`. It is fd-driven, not sleep-polled: on an empty non-blocking channel it
+      parks on the CM fd via a new `poll_readable` (`libc::poll`, added as a hord-core
+      dep) until the fd is readable or the deadline passes, so it wakes the instant the
+      event lands — no ~1 ms granularity, no CPU spin, and no `thread::sleep` stalling
+      the worker's current-thread runtime (issue 1). `poll_readable` rounds a
+      sub-millisecond remainder up to 1 ms (a `poll(…, 0)` can't busy-spin the tail of
+      the deadline), retries `EINTR` within the same deadline, and treats a poll
+      timeout *or* `POLLERR`/`POLLHUP` the same way — hand back and let the follow-up
+      `get_cm_event` surface the real condition. Every handshake wait on both ends now
+      routes through it: server *established* and client *connect-response* share
+      `ESTABLISH_TIMEOUT`, so the "no peer pins a thread forever" guarantee holds
+      client-side too, and both ends leave the channel in the same mode — the
+      divergence is gone (issue 2); the client's resolve waits are bounded by a backstop
+      (`2x resolve_timeout`, floored at `ESTABLISH_TIMEOUT`) since `rdma_resolve_*` fires
+      its own descriptive `AddrError`/`RouteError` first. The ack/match/error-format
+      body now lives in exactly one place (issue 3). The existing RDMA loopback suite
+      (which drives a real `connect`→`connect_finish`/`accept_finish` handshake over
+      `rxe0`) exercises the new path and is green.
 
 - [ ] **`hord-zerocopy` gates the `rdma` layer with 17 scattered
       `#[cfg(feature = "rdma")]` attributes.** The orchestration items form one
