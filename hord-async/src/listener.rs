@@ -108,6 +108,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use tokio::io::unix::AsyncFd;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{Id, JoinError, JoinSet};
 
@@ -142,6 +143,15 @@ const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 50;
 /// the `select!`, so a sustained connection flood can't starve the (biased)
 /// shutdown branch. The fd stays readable, so draining resumes on the next wakeup.
 const MAX_DRAIN_PER_WAKEUP: u32 = 64;
+
+/// Per-worker bound on accepted-but-not-yet-handshaked connections queued to one
+/// worker. Caps the live QP/CM-id backlog a single *wedged* worker (e.g. parked in
+/// its bounded handshake/establish wait, or monopolized by a long zero-copy write)
+/// can accumulate before the acceptor fails new connections over to other workers
+/// (see [`dispatch`]). Small on purpose: the handshake is normally sub-millisecond,
+/// so the queue should rarely hold more than a couple — the bound exists for the
+/// wedged / overloaded case, not the steady state.
+const WORKER_CHANNEL_CAP: usize = 32;
 
 /// One accepted connection plus the peer address to label it with, handed from the
 /// acceptor to a worker.
@@ -232,7 +242,7 @@ impl HordListener {
         let mut senders = Vec::with_capacity(workers);
         let mut worker_handles = Vec::with_capacity(workers);
         for id in 0..workers {
-            let (tx, rx) = mpsc::unbounded_channel::<Accepted>();
+            let (tx, rx) = mpsc::channel::<Accepted>(WORKER_CHANNEL_CAP);
             senders.push(tx);
             let serve_fn = serve_fn.clone();
             let config = config.clone();
@@ -290,7 +300,7 @@ impl HordListener {
 /// the worker channels.
 async fn acceptor_loop(
     listener: Listener,
-    senders: Vec<mpsc::UnboundedSender<Accepted>>,
+    senders: Vec<mpsc::Sender<Accepted>>,
     mut shutdown: watch::Receiver<bool>,
     mut stop: watch::Receiver<bool>,
     config: HordConfig,
@@ -437,26 +447,39 @@ async fn acceptor_loop(
     Ok(())
 }
 
-/// Round-robin one connection to a live worker, skipping any whose thread has
-/// exited (closed receiver). If every worker is gone the connection is dropped
-/// (its `Drop` issues a graceful disconnect).
+/// Round-robin one connection to a live, non-full worker. A worker whose bounded
+/// queue is *full* (wedged or backlogged) is skipped just like one whose thread has
+/// *exited* (closed receiver), so connections fail over to the next available worker
+/// instead of piling unboundedly behind a stuck one. If every worker is full or gone
+/// the connection is dropped (its `Drop` issues a graceful disconnect).
 fn dispatch(
-    senders: &[mpsc::UnboundedSender<Accepted>],
+    senders: &[mpsc::Sender<Accepted>],
     next: &mut usize,
     conn: Connection,
     peer: SocketAddr,
 ) {
     let n = senders.len();
     let mut payload = (conn, peer);
+    // `try_send` (not the async `send`) so the single accept loop never blocks on a
+    // backlogged worker — blocking here would also stall the shutdown check.
     for _ in 0..n {
         let w = *next;
         *next = (*next + 1) % n;
-        match senders[w].send(payload) {
+        match senders[w].try_send(payload) {
             Ok(()) => return,
-            Err(e) => payload = e.0, // worker gone — try the next
+            // Full (wedged/backlogged) or Closed (worker gone): both hand the
+            // payload back so it can be re-offered to the next worker.
+            Err(TrySendError::Full(p) | TrySendError::Closed(p)) => payload = p,
         }
     }
-    log::warn!("hord: all workers unavailable; dropping connection from {}", payload.1);
+    // Every worker is full or gone: shed this connection rather than block the
+    // accept loop — back-pressure on accept under sustained overload. Each queued
+    // item holds a live QP/CM id, so the bounded queues are what keep that backlog
+    // finite; dropping here is the overflow valve.
+    log::warn!(
+        "hord: all workers full or unavailable; dropping connection from {}",
+        payload.1
+    );
 }
 
 /// One worker thread: a current-thread runtime + `LocalSet` that builds and drives
@@ -464,7 +487,7 @@ fn dispatch(
 /// in-flight connections (bounded by `grace`) once the acceptor closes its channel.
 fn run_worker<F, Fut>(
     id: usize,
-    rx: mpsc::UnboundedReceiver<Accepted>,
+    rx: mpsc::Receiver<Accepted>,
     serve_fn: F,
     config: HordConfig,
     grace: Duration,
@@ -506,7 +529,7 @@ fn run_worker<F, Fut>(
 /// `JoinSet`, forces every in-flight connection's QP down — quiescing the NIC so
 /// the aborted futures' buffer frees are sound.
 async fn worker_loop<F, Fut>(
-    mut rx: mpsc::UnboundedReceiver<Accepted>,
+    mut rx: mpsc::Receiver<Accepted>,
     mut serve_fn: F,
     config: HordConfig,
     grace: Duration,
