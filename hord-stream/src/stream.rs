@@ -44,13 +44,14 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
+use std::marker::PhantomData;
 use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hord_core::{
-    CmParams, Completion, Connection, Listener, Opcode, RegisteredBuffer, ACCESS_LOCAL_WRITE,
-    ACCESS_REMOTE_WRITE,
+    CmParams, Completion, Connection, Listener, Mr, Opcode, RegisteredBuffer, Sge,
+    ACCESS_LOCAL_WRITE, ACCESS_REMOTE_WRITE, MAX_WRITE_SGE,
 };
 
 use crate::envelope::{flags as env_flags, Envelope, ENVELOPE_LEN};
@@ -216,6 +217,87 @@ const CM_DISCONNECT_POLL_SPINS: u32 = 4096;
 /// that count to fit the send queue). 1 GiB matches the demo's body ceiling, so
 /// every demo response is a single WR.
 const WRITE_WR_MAX: usize = 1 << 30;
+
+/// One contiguous source span of a *scatter-gather* zero-copy write (spec §7,
+/// Milestone 3): a `[off, off+len)` slice of a registered region — a
+/// [`RegisteredBuffer`] or a caller-owned [`Mr`] — that the NIC reads as part of
+/// one logical write. A fragmented object (e.g. an MSE4 object stored across
+/// non-contiguous allocations) is described as a `&[WriteSegment]` and laid down
+/// contiguously at the peer's offset by
+/// [`rdma_write_gather_all`](HordStream::rdma_write_gather_all).
+///
+/// The `'a` lifetime borrows the source region, so a `WriteSegment` — and hence any
+/// slice passed to a gather write — cannot outlive the buffer/`Mr` it points into.
+/// That is what makes the gather write *safe*: the borrow guarantees the source
+/// stays alive for the whole write (the blocking call drains before it returns; the
+/// async future resolves only once every WR is reaped), exactly as the
+/// single-buffer [`rdma_write_all`](HordStream::rdma_write_all)'s `&RegisteredBuffer`
+/// borrow does. Build them with [`from_registered`](Self::from_registered) /
+/// [`from_mr`](Self::from_mr) (bounds-checked, safe), or [`from_raw`](Self::from_raw)
+/// (unchecked, `unsafe`).
+#[derive(Clone, Copy)]
+pub struct WriteSegment<'a> {
+    local_addr: *const u8,
+    lkey: u32,
+    len: usize,
+    _src: PhantomData<&'a ()>,
+}
+
+impl<'a> WriteSegment<'a> {
+    /// A `[off, off+len)` span of a HORD-owned [`RegisteredBuffer`] source. Panics
+    /// if the span is out of bounds.
+    pub fn from_registered(buf: &'a RegisteredBuffer, off: usize, len: usize) -> Self {
+        assert!(
+            off.checked_add(len).is_some_and(|end| end <= buf.len()),
+            "WriteSegment::from_registered span out of bounds",
+        );
+        WriteSegment {
+            // Pointer derivation only (no read): `off <= buf.len()` and the storage
+            // is one allocation, so `add(off)` is in-bounds.
+            local_addr: unsafe { buf.as_mut_ptr().add(off) },
+            lkey: buf.lkey(),
+            len,
+            _src: PhantomData,
+        }
+    }
+
+    /// A `[off, off+len)` span of a caller-owned [`Mr`] source — the true zero-copy
+    /// case: DMA straight out of the caller's resident pages. Panics if out of
+    /// bounds.
+    pub fn from_mr(mr: &'a Mr, off: usize, len: usize) -> Self {
+        assert!(
+            off.checked_add(len).is_some_and(|end| end <= mr.len()),
+            "WriteSegment::from_mr span out of bounds",
+        );
+        WriteSegment {
+            // Pointer derivation only (no read): `off <= mr.len()`.
+            local_addr: unsafe { mr.as_mut_ptr().add(off) },
+            lkey: mr.lkey(),
+            len,
+            _src: PhantomData,
+        }
+    }
+
+    /// A span from a raw `(addr, lkey, len)`, for a source registered out of band.
+    ///
+    /// # Safety
+    /// `[addr, addr+len)` must lie within a memory region registered on this
+    /// connection's PD under `lkey`, and stay live, resident, and unmodified until
+    /// the write that consumes this segment completes. Prefer the borrow-checked
+    /// [`from_registered`](Self::from_registered) / [`from_mr`](Self::from_mr).
+    pub unsafe fn from_raw(addr: *const u8, lkey: u32, len: usize) -> Self {
+        WriteSegment { local_addr: addr, lkey, len, _src: PhantomData }
+    }
+
+    /// Length of this span in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
 
 /// A received data message whose payload still lives in its receive buffer,
 /// awaiting `read()`. We hold the buffer (rather than copying out and
@@ -681,6 +763,29 @@ impl HordStream {
     /// is sufficient; fill it with [`RegisteredBuffer::copy_in`].
     pub fn register_source(&self, len: usize) -> io::Result<RegisteredBuffer> {
         self.conn.register_buffer(len, ACCESS_LOCAL_WRITE)
+    }
+
+    /// Register **caller-owned** memory `[ptr, ptr+len)` as a zero-copy write
+    /// *source* (spec §7, Milestone 3), returning an [`Mr`] (its `lkey`) without
+    /// copying the bytes into a HORD buffer first. Registered `LOCAL_WRITE` (the NIC
+    /// only reads a source). Combine its spans with [`WriteSegment::from_mr`] and
+    /// deliver them with [`rdma_write_gather_all`](Self::rdma_write_gather_all).
+    ///
+    /// # Safety
+    /// `[ptr, ptr+len)` must stay live, resident, and unmodified until the returned
+    /// [`Mr`] is dropped — and across any in-flight write that references it (see
+    /// [`Connection::register_external`]). The NIC is quiesced before buffers drop
+    /// (the stream destroys the QP in [`Connection::shutdown`] before MRs go).
+    pub unsafe fn register_external(&self, ptr: *mut u8, len: usize) -> io::Result<Mr> {
+        // SAFETY: forwarded — the caller upholds the residency/lifetime contract.
+        unsafe { self.conn.register_external(ptr, len, ACCESS_LOCAL_WRITE) }
+    }
+
+    /// The most scatter/gather segments one gather-write WR carries on this
+    /// connection (the QP's `max_send_sge`); a longer [`WriteSegment`] list spans
+    /// multiple WRs. See [`Connection::max_send_sge`].
+    pub fn max_send_sge(&self) -> usize {
+        self.conn.max_send_sge()
     }
 
     // ---- completion engine -------------------------------------------------
@@ -1220,39 +1325,10 @@ impl HordStream {
                 data
             }
         };
-        let free_slots = self
-            .send_free
-            .len()
-            .saturating_sub(self.writes_outstanding as usize);
-        // A write needs `n_wrs` send-queue slots. If it needs more than the entire
-        // data send pool it can NEVER fit — a caller error, fatal (InvalidInput).
-        if n_wrs > self.send_pool {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "zero-copy write of {len} bytes needs {n_wrs} send-queue slots, \
-                     exceeds the send pool of {}",
-                    self.send_pool
-                ),
-            ));
-        }
-        // Slots are momentarily occupied by in-flight sends/writes: transient, so
-        // back-pressure (WouldBlock) rather than erroring — the facades reap an
-        // outstanding send or write and retry. (A bare-kind error: every caller
-        // matches on the kind and discards the text, so don't allocate a message.)
-        if n_wrs > free_slots {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
-        // Transfer-credit flow control (spec §7.7.6): a write-with-imm consumes
-        // one of the peer's posted recv WRs. Bound our in-flight imm transfers by
-        // the window the peer advertised so we can't overrun it and RNR-stall.
-        // Back-pressure, not a transport error — return `WouldBlock` WITHOUT
-        // marking the stream closed and WITHOUT posting anything, so the blocking /
-        // async facades can reap an outstanding transfer and retry. One imm WR is
-        // posted per call, so one credit is needed.
-        if imm.is_some() && self.imm_outstanding >= self.peer_split_credits {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
+        // Admission: enough send-queue slots, and (for an imm) a transfer credit.
+        // Shared with the scatter-gather core so the slot/credit accounting — the
+        // delicate part — lives in exactly one place and can't drift.
+        self.check_write_capacity(n_wrs, imm.is_some())?;
         let base = src.as_mut_ptr();
         let lkey = src.lkey();
         let mut off = 0usize;
@@ -1326,6 +1402,289 @@ impl HordStream {
             }
         }
         Ok(())
+    }
+
+    /// Shared admission check for a one-sided write of `n_wrs` work requests
+    /// (`has_imm` = the batch ends in a write-with-immediate, §7.7). Returns
+    /// `InvalidInput` if it can never fit the send pool (a caller error);
+    /// `WouldBlock` if the slots or the transfer-credit window (§7.7.6) are
+    /// momentarily full (the facade reaps an outstanding send/write and retries);
+    /// else `Ok`. Posts nothing. Used by both the single-buffer
+    /// ([`begin_rdma_write_inner`](Self::begin_rdma_write_inner)) and the
+    /// scatter-gather ([`begin_rdma_write_gather_inner`](Self::begin_rdma_write_gather_inner))
+    /// cores, so this accounting lives in one place.
+    fn check_write_capacity(&self, n_wrs: usize, has_imm: bool) -> io::Result<()> {
+        // `send_free` tracks free data slots; `writes_outstanding` already hold some
+        // (writes don't draw from `send_free`). The control slot stays reserved.
+        let free_slots = self
+            .send_free
+            .len()
+            .saturating_sub(self.writes_outstanding as usize);
+        if n_wrs > self.send_pool {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "zero-copy write needs {n_wrs} send-queue slots, exceeds the send pool of {}",
+                    self.send_pool
+                ),
+            ));
+        }
+        // Transient back-pressure (a bare kind: callers match the kind, discard text).
+        if n_wrs > free_slots {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        // One imm WR is posted per call, so it needs one transfer credit (§7.7.6):
+        // a write-with-imm consumes one of the peer's posted recvs, so bound our
+        // in-flight imm transfers by the peer's advertised window. Back-pressure,
+        // not a transport error — WouldBlock without marking the stream closed.
+        if has_imm && self.imm_outstanding >= self.peer_split_credits {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        Ok(())
+    }
+
+    /// Plan a scatter-gather write: walk `segments`, packing them into work
+    /// requests of at most `max_sge` SGEs **and** at most [`WRITE_WR_MAX`] bytes
+    /// each, invoking `emit(remote_off, &sges)` for every WR in order (`remote_off`
+    /// is that WR's running byte offset from the start of the gather). A segment
+    /// longer than a WR's remaining byte budget is split across WRs; zero-length
+    /// segments contribute nothing. Returns the number of WRs. Pure planning — the
+    /// same deterministic packing whether `emit` counts (for admission) or posts. A
+    /// single segment `<=` `WRITE_WR_MAX` is one 1-SGE WR, so the single-buffer
+    /// path's WR pattern is preserved exactly.
+    fn plan_gather(
+        segments: &[WriteSegment<'_>],
+        max_sge: usize,
+        mut emit: impl FnMut(u64, &[Sge]) -> io::Result<()>,
+    ) -> io::Result<usize> {
+        let max_sge = max_sge.clamp(1, MAX_WRITE_SGE);
+        let mut sges = [Sge { addr: 0, length: 0, lkey: 0 }; MAX_WRITE_SGE];
+        let mut n_sge = 0usize; // SGEs staged in the in-progress WR
+        let mut wr_bytes = 0u64; // bytes staged in the in-progress WR
+        let mut remote_off = 0u64; // byte offset of the in-progress WR
+        let mut wr_count = 0usize;
+        for seg in segments {
+            let mut seg_off = 0usize;
+            while seg_off < seg.len {
+                // Flush the WR once it is full by SGE count or by the byte cap.
+                if n_sge == max_sge || wr_bytes == WRITE_WR_MAX as u64 {
+                    emit(remote_off, &sges[..n_sge])?;
+                    wr_count += 1;
+                    remote_off += wr_bytes;
+                    n_sge = 0;
+                    wr_bytes = 0;
+                }
+                let budget = WRITE_WR_MAX as u64 - wr_bytes;
+                let take = ((seg.len - seg_off) as u64).min(budget);
+                sges[n_sge] = Sge {
+                    addr: seg.local_addr as u64 + seg_off as u64,
+                    length: take as u32,
+                    lkey: seg.lkey,
+                };
+                n_sge += 1;
+                wr_bytes += take;
+                seg_off += take as usize;
+            }
+        }
+        if n_sge > 0 {
+            emit(remote_off, &sges[..n_sge])?;
+            wr_count += 1;
+        }
+        Ok(wr_count)
+    }
+
+    /// Shared driver behind the public scatter-gather write entry points: lay
+    /// `segments` down contiguously into the peer's `[peer_addr, peer_addr+total)`
+    /// (`total` = sum of segment lengths), packing them into WRs (spec §7,
+    /// Milestone 3). With `imm` `Some`, the *last* WR is a write-with-immediate
+    /// (§7.7); an all-empty gather with `imm` still emits one empty imm-only WR so
+    /// the transfer ID is delivered (§7.7.4 step 2). Posts nothing on a
+    /// back-pressure / capacity error (`WouldBlock` / `InvalidInput`, like the
+    /// single-buffer path).
+    fn begin_rdma_write_gather_inner(
+        &mut self,
+        segments: &[WriteSegment<'_>],
+        peer_addr: u64,
+        peer_rkey: u32,
+        imm: Option<u32>,
+    ) -> io::Result<()> {
+        if self.peer_closed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
+        }
+        let max_sge = self.conn.max_send_sge();
+        // Count the WRs the packing will produce (no posting), for admission.
+        let n_data_wrs = Self::plan_gather(segments, max_sge, |_, _| Ok(()))?;
+        // An all-empty gather still needs one WR to carry the immediate.
+        let n_wrs = if n_data_wrs == 0 && imm.is_some() { 1 } else { n_data_wrs };
+        if n_wrs == 0 {
+            return Ok(()); // nothing to write and no immediate to deliver
+        }
+        self.check_write_capacity(n_wrs, imm.is_some())?;
+
+        // All-empty gather + imm: emit one 0-length imm-only WR. Forming the
+        // (zero-length) SGE needs a valid registered (addr, lkey) — use the first
+        // segment's; with no segment at all there is nothing to reference, so it is
+        // a caller error (the immediate would never be sent) rather than a no-op.
+        if n_data_wrs == 0 {
+            let Some(seg) = segments.first() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "empty scatter-gather write with an immediate needs at least one segment",
+                ));
+            };
+            let id = imm.expect("n_wrs == 1 with no data implies imm is Some");
+            let sge = [Sge { addr: seg.local_addr as u64, length: 0, lkey: seg.lkey }];
+            // SAFETY: `seg` borrows a live registered region (its `'a`); a 0-length
+            // SGE reads nothing; a bad rkey fails the WR -> QP error -> peer_closed,
+            // handled on the completion.
+            let r = unsafe {
+                self.conn
+                    .post_write_gather(imm_write_wr_id(0), &sge, peer_addr, peer_rkey, Some(id))
+            };
+            if let Err(e) = r {
+                self.peer_closed = true;
+                return Err(e);
+            }
+            self.writes_outstanding += 1;
+            self.imm_outstanding += 1;
+            return Ok(());
+        }
+
+        // Post every planned WR. The imm rides the final one (§7.7.4 step 2); each
+        // WR writes at `peer_addr + remote_off` so the segments land contiguously.
+        // A mid-batch post failure marks the stream closed and returns the error;
+        // the WRs already posted are drained by the facade before any source `Mr` is
+        // freed (the use-after-free guard).
+        let mut idx = 0usize;
+        let post_result = Self::plan_gather(segments, max_sge, |remote_off, sges| {
+            let is_last = idx == n_wrs - 1;
+            let imm_here = if is_last { imm } else { None };
+            let wr_id = if imm_here.is_some() {
+                imm_write_wr_id(idx as u64)
+            } else {
+                write_wr_id(idx as u64)
+            };
+            // SAFETY: each SGE spans a live registered region (the `'a` borrow on
+            // `segments` keeps the sources alive for the whole write); the
+            // destination is authorized by the peer-supplied rkey.
+            unsafe {
+                self.conn
+                    .post_write_gather(wr_id, sges, peer_addr + remote_off, peer_rkey, imm_here)
+            }?;
+            self.writes_outstanding += 1;
+            if imm_here.is_some() {
+                self.imm_outstanding += 1;
+            }
+            idx += 1;
+            Ok(())
+        });
+        if let Err(e) = post_result {
+            self.peer_closed = true;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Begin a scatter-gather one-sided RDMA write (spec §7, Milestone 3): lay the
+    /// `segments` down contiguously at the peer's `[peer_addr, …]` and return
+    /// immediately (the WRs are posted; the caller drains completions). The
+    /// scatter-gather analogue of [`begin_rdma_write`](Self::begin_rdma_write) — for
+    /// a single contiguous source that one is simpler. Back-pressure surfaces as
+    /// `WouldBlock` (posting nothing), so a facade reaps and retries.
+    ///
+    /// The `segments` borrow keeps every source [`Mr`] / [`RegisteredBuffer`] alive
+    /// for the call; the caller must keep them alive until the matching completions
+    /// are reaped — which the blocking
+    /// [`rdma_write_gather_all`](Self::rdma_write_gather_all) does before returning.
+    pub fn begin_rdma_write_gather(
+        &mut self,
+        segments: &[WriteSegment<'_>],
+        peer_addr: u64,
+        peer_rkey: u32,
+    ) -> io::Result<()> {
+        self.begin_rdma_write_gather_inner(segments, peer_addr, peer_rkey, None)
+    }
+
+    /// Like [`begin_rdma_write_gather`](Self::begin_rdma_write_gather), but the
+    /// final WR is a write-with-immediate carrying `transfer_id` (§7.7). An empty
+    /// gather still delivers the immediate via one empty WR.
+    pub fn begin_rdma_write_gather_with_imm(
+        &mut self,
+        segments: &[WriteSegment<'_>],
+        peer_addr: u64,
+        peer_rkey: u32,
+        transfer_id: u32,
+    ) -> io::Result<()> {
+        self.begin_rdma_write_gather_inner(segments, peer_addr, peer_rkey, Some(transfer_id))
+    }
+
+    fn rdma_write_gather_all_inner(
+        &mut self,
+        segments: &[WriteSegment<'_>],
+        peer_addr: u64,
+        peer_rkey: u32,
+        imm: Option<u32>,
+    ) -> io::Result<()> {
+        // Post, retrying on back-pressure (mirrors `rdma_write_all_inner`): reap an
+        // outstanding send/write to free a slot/credit and retry. If nothing is in
+        // flight the block can't clear, so surface it rather than spin forever.
+        let posted = loop {
+            match self.begin_rdma_write_gather_inner(segments, peer_addr, peer_rkey, imm) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if !self.sends_outstanding() && !self.writes_pending() {
+                        break Err(io::Error::other(
+                            "RDMA gather write back-pressured with nothing in flight to drain",
+                        ));
+                    }
+                    self.pump(true)?;
+                }
+                other => break other,
+            }
+        };
+        // Drain every posted write before returning — else the caller may drop a
+        // source `Mr` (deregistering it, freeing nothing it owns but releasing the
+        // pin) while the NIC is still DMA-reading it. Drain first, propagate the
+        // post error after.
+        while self.writes_pending() {
+            self.pump(true)?;
+        }
+        posted?;
+        if self.peer_closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection closed before the RDMA gather write completed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Blocking scatter-gather write (spec §7, Milestone 3): post the gather and
+    /// busy-poll (servicing interleaved stream completions) until every WR is
+    /// acknowledged — at which point the bytes are in the peer's memory and acked,
+    /// so the caller may report `status=complete`. The scatter-gather analogue of
+    /// [`rdma_write_all`](Self::rdma_write_all). A transport failure mid-write closes
+    /// the stream and returns an error (§7.4: never report `complete` on a partial
+    /// write). The `segments` borrow keeps the source regions alive for the whole
+    /// call; on return no DMA references them, so they may be dropped.
+    pub fn rdma_write_gather_all(
+        &mut self,
+        segments: &[WriteSegment<'_>],
+        peer_addr: u64,
+        peer_rkey: u32,
+    ) -> io::Result<()> {
+        self.rdma_write_gather_all_inner(segments, peer_addr, peer_rkey, None)
+    }
+
+    /// Like [`rdma_write_gather_all`](Self::rdma_write_gather_all) with a final
+    /// write-with-immediate carrying `transfer_id` (§7.7).
+    pub fn rdma_write_gather_all_with_imm(
+        &mut self,
+        segments: &[WriteSegment<'_>],
+        peer_addr: u64,
+        peer_rkey: u32,
+        transfer_id: u32,
+    ) -> io::Result<()> {
+        self.rdma_write_gather_all_inner(segments, peer_addr, peer_rkey, Some(transfer_id))
     }
 
     /// Whether any one-sided RDMA write is still unacknowledged.
@@ -2299,5 +2658,122 @@ mod split_tests {
         drop(bufs);
         drop(client);
         server.join().expect("server thread panicked");
+    }
+}
+
+#[cfg(test)]
+mod gather_tests {
+    //! Scatter-gather zero-copy write (spec §7, Milestone 3): a *fragmented* source
+    //! — several separately-registered, caller-owned MRs, mimicking an MSE4 object
+    //! stored across non-contiguous allocations — is laid down **contiguously** into
+    //! the client's single registered buffer by one logical
+    //! [`HordStream::rdma_write_gather_all`]. Uses more segments than the QP's
+    //! `max_send_sge`, so the gather spans multiple WRs (exercising the SGE-packing),
+    //! and verifies every byte lands in order.
+    //!
+    //! Needs the host's Soft-RoCE device (see CLAUDE.md), so it is `#[ignore]`d:
+    //! ```sh
+    //! cargo test -p hord-stream -- --ignored --nocapture gather
+    //! ```
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+
+    const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+    const PORT: u16 = 18530; // distinct from the other in-crate loopback tests
+    const SEG_LEN: usize = 64 * 1024; // per-allocation (per-segment) size
+    const N_SEG: usize = 40; // > MAX_WRITE_SGE (16) -> the gather spans several WRs
+    const TOTAL: usize = SEG_LEN * N_SEG; // 2.5 MiB contiguous object
+
+    /// The contiguous object's byte at absolute offset `i`.
+    fn pattern_byte(i: usize) -> u8 {
+        (i % 251) as u8
+    }
+
+    #[test]
+    #[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+    fn gather_writes_fragments_contiguously() {
+        let config = HordConfig::default();
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+
+        let srv_config = config.clone();
+        let server = std::thread::spawn(move || {
+            let listener = Listener::bind(IP, PORT).expect("bind");
+            ready_tx.send(()).expect("ready");
+            let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
+            // The whole point of the test is multi-WR packing; the QP cap (<= 16)
+            // is always below N_SEG, so this holds — it documents the intent.
+            assert!(
+                s.max_send_sge() < N_SEG,
+                "N_SEG ({N_SEG}) must exceed max_send_sge ({}) to force multi-WR packing",
+                s.max_send_sge(),
+            );
+
+            // The fragmented source: N_SEG separate caller-owned allocations (each
+            // its own Vec — non-contiguous, like MSE4's alloc list), each holding
+            // the slice of the global pattern it represents, each its own MR. Keep
+            // `backing` (and `mrs`) alive until after the gather drains.
+            let mut backing: Vec<Vec<u8>> = Vec::with_capacity(N_SEG);
+            let mut mrs: Vec<Mr> = Vec::with_capacity(N_SEG);
+            for seg in 0..N_SEG {
+                let mut v = vec![0u8; SEG_LEN];
+                for (j, b) in v.iter_mut().enumerate() {
+                    *b = pattern_byte(seg * SEG_LEN + j);
+                }
+                // SAFETY: `v` stays live in `backing` until after
+                // `rdma_write_gather_all` returns (which drains every WR).
+                let mr = unsafe { s.register_external(v.as_mut_ptr(), v.len()) }.expect("reg ext");
+                backing.push(v);
+                mrs.push(mr);
+            }
+
+            // Client's destination descriptor: "addr rkey".
+            let line = read_line(&mut s);
+            let mut it = line.split_whitespace();
+            let addr: u64 = it.next().unwrap().parse().unwrap();
+            let rkey: u32 = it.next().unwrap().parse().unwrap();
+
+            let segments: Vec<WriteSegment> =
+                mrs.iter().map(|mr| WriteSegment::from_mr(mr, 0, SEG_LEN)).collect();
+            s.rdma_write_gather_all(&segments, addr, rkey).expect("gather write");
+            write_line(&mut s, "done");
+            // The write drained, so the source MRs/backing may now be released.
+            drop(segments);
+            drop(mrs);
+            drop(backing);
+            s.disconnect();
+        });
+
+        ready_rx.recv().expect("ready");
+        let mut c = HordStream::connect(IP, PORT, &config).expect("connect");
+        let buf = c.register_remote_writable(TOTAL).expect("reg dst");
+        write_line(&mut c, &format!("{} {}", buf.as_mut_ptr() as u64, buf.rkey()));
+        assert_eq!(read_line(&mut c), "done");
+
+        // The fragmented source must have landed contiguously, in order.
+        let mut got = vec![0u8; TOTAL];
+        buf.copy_out(0, &mut got);
+        for (i, &b) in got.iter().enumerate() {
+            assert_eq!(b, pattern_byte(i), "payload mismatch at byte {i}");
+        }
+        server.join().expect("server thread panicked");
+    }
+
+    fn read_line<S: Read>(s: &mut S) -> String {
+        let mut out = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            match s.read(&mut b).expect("read") {
+                0 => break,
+                _ if b[0] == b'\n' => break,
+                _ => out.push(b[0]),
+            }
+        }
+        String::from_utf8(out).expect("utf-8")
+    }
+    fn write_line<S: Write>(s: &mut S, line: &str) {
+        s.write_all(line.as_bytes()).expect("write");
+        s.write_all(b"\n").expect("write newline");
+        s.flush().expect("flush");
     }
 }

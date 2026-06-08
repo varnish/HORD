@@ -66,6 +66,30 @@ pub const ACCESS_LOCAL_WRITE: i32 = 1;
 /// `ACCESS_LOCAL_WRITE | ACCESS_REMOTE_WRITE`.
 pub const ACCESS_REMOTE_WRITE: i32 = 2;
 
+/// Upper bound on the scatter/gather entries HORD packs into one one-sided
+/// RDMA-write WR (spec §7, Milestone 3: gathering a fragmented source — e.g. an
+/// MSE4 object stored across non-contiguous allocations — into the peer's
+/// contiguous buffer). The QP is created with `max_send_sge =
+/// min(MAX_WRITE_SGE, device max_sge)` (see [`Connection::max_send_sge`]); a gather
+/// list longer than that spans multiple WRs at increasing remote offsets. It also
+/// bounds the per-WR stack `ibv_sge` array in [`Connection::post_write_gather`], so
+/// it is a compile-time cap, not merely a tunable.
+pub const MAX_WRITE_SGE: usize = 16;
+
+/// One local scatter/gather entry for [`Connection::post_write_gather`]: a span
+/// `[addr, addr+length)` inside a registered MR named by `lkey`. Mirrors `ibv_sge`
+/// (the local address as a `u64`) but is HORD's own type, so the verbs /
+/// `rdma-sys` layer never leaks into the public API.
+#[derive(Debug, Clone, Copy)]
+pub struct Sge {
+    /// Local virtual address of the span (must lie within an MR with `lkey`).
+    pub addr: u64,
+    /// Length of the span in bytes.
+    pub length: u32,
+    /// Local key of the MR the span lies in.
+    pub lkey: u32,
+}
+
 /// CM listen backlog. Generous; one HORD server fields many prefetch clients.
 const LISTEN_BACKLOG: i32 = 128;
 
@@ -273,6 +297,55 @@ pub struct RegisteredBuffer {
     rkey: u32,
     // Keeps the endpoint (hence the PD) alive for this buffer's whole life.
     _conn: Arc<Connection>,
+}
+
+/// A registered memory region over **caller-owned** storage (spec §7, Milestone 3:
+/// zero-copy straight from pages the caller already holds resident — e.g. an MSE4
+/// mmap'd store or its AIO buffers). Created by [`Connection::register_external`].
+///
+/// Unlike [`RegisteredBuffer`] it does **not** allocate or own the backing bytes —
+/// it holds only the registration and an `Arc<Connection>` (so the MR cannot
+/// outlive its PD). The caller owns the storage and guarantees it stays live,
+/// resident, and unmodified for the `Mr`'s whole life and across any in-flight
+/// transfer (see [`Connection::register_external`]'s safety contract). As for any
+/// registration the NIC must be quiesced (QP destroyed) before the `Mr` is
+/// dropped; its `Drop` then runs `ibv_dereg_mr` — `_mr` is declared first so it is
+/// deregistered while the PD (kept alive by `_conn`) is still alive.
+///
+/// `!Send` (it carries a raw pointer into caller memory), like the rest of the
+/// zero-copy data path.
+pub struct Mr {
+    // Deregistered first on drop; holds its own `Arc<ProtectionDomain>`.
+    _mr: Arc<MemoryRegion>,
+    addr: *mut u8,
+    len: usize,
+    lkey: u32,
+    rkey: u32,
+    // Keeps the endpoint (hence the PD) alive for this MR's whole life.
+    _conn: Arc<Connection>,
+}
+
+impl Mr {
+    /// Base address the region was registered over (the caller's pointer).
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.addr
+    }
+    /// Registered length in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    /// Local key — names this region as a source in a one-sided write SGE.
+    pub fn lkey(&self) -> u32 {
+        self.lkey
+    }
+    /// Remote key — authorizes a peer to RDMA into this region (only meaningful if
+    /// it was registered with [`ACCESS_REMOTE_WRITE`]).
+    pub fn rkey(&self) -> u32 {
+        self.rkey
+    }
 }
 
 impl RegisteredBuffer {
@@ -513,6 +586,9 @@ struct Endpoint {
     comp_channel: Arc<CompletionChannel>,
     cq: Arc<ExtendedCompletionQueue>,
     qp: ExtendedQueuePair,
+    /// Effective `max_send_sge` the QP was created with (see
+    /// [`Connection::max_send_sge`]) — copied onto the `Connection`.
+    max_send_sge: usize,
 }
 
 impl Endpoint {
@@ -538,13 +614,24 @@ impl Endpoint {
         // One CQ for both send and recv. The builder defaults already enable
         // Send / Write / WriteWithImmediate send-ops, which is everything HORD
         // posts, so no extra send-ops flags are needed.
+        // Gather support (spec §7, Milestone 3): build the QP able to carry up to
+        // `MAX_WRITE_SGE` scatter/gather entries per send WR, clamped to what the
+        // device permits (`max_sge`), so a fragmented zero-copy source becomes one
+        // multi-SGE write instead of many. `max_recv_sge` stays the default 1 (a
+        // recv lands in a single slot). A device reporting < 1 is implausible, but
+        // clamp up so the QP is always created with at least the single-SGE cap the
+        // non-gather path needs.
+        let dev_max_sge = ctx.query_device().map_err(to_io)?.max_sge();
+        let max_send_sge = (dev_max_sge.max(1) as usize).min(MAX_WRITE_SGE);
+
         let shared_cq = GenericCompletionQueue::from(Arc::clone(&cq));
         let mut qp_builder = pd.create_qp_builder();
         qp_builder
             .setup_send_cq(shared_cq.clone())
             .setup_recv_cq(shared_cq)
             .setup_max_send_wr(send_wr as u32)
-            .setup_max_recv_wr(recv_wr as u32);
+            .setup_max_recv_wr(recv_wr as u32)
+            .setup_max_send_sge(max_send_sge as u32);
         let qp = qp_builder.build_ex().map_err(to_io)?;
 
         Ok(Endpoint {
@@ -552,6 +639,7 @@ impl Endpoint {
             comp_channel,
             cq,
             qp,
+            max_send_sge,
         })
     }
 }
@@ -574,6 +662,10 @@ pub struct Connection {
     id: Arc<Identifier>,
     event_channel: Arc<EventChannel>,
     role: Role,
+    // `max_send_sge` the QP was built with — the most SGEs one one-sided write WR
+    // may carry, so the gather path knows how many source segments to pack per WR
+    // (see `post_write_gather` / `max_send_sge`).
+    max_send_sge: usize,
     // Guards `rdma_disconnect` so it runs at most once across
     // disconnect()/shutdown()/Drop. (`Cell` keeps `Connection` `!Sync` already
     // via the `RefCell`, and it's only touched single-threaded.)
@@ -606,6 +698,7 @@ impl Connection {
             id,
             event_channel,
             role,
+            max_send_sge: ep.max_send_sge,
             disconnected: Cell::new(false),
             _cm: cm,
         }
@@ -737,6 +830,49 @@ impl Connection {
         })
     }
 
+    /// Register **caller-owned** memory `[ptr, ptr+len)` as an MR, returning an
+    /// [`Mr`] (carrying its `lkey`/`rkey`) **without allocating or owning the
+    /// bytes** — so a caller (e.g. Carapace/MSE4) can DMA straight out of pages it
+    /// already holds resident, instead of copying them into a HORD-owned
+    /// [`RegisteredBuffer`] first (spec §7, Milestone 3). `access` is the same
+    /// `ACCESS_*` bitset as [`register_buffer`](Self::register_buffer); a write
+    /// *source* needs only [`ACCESS_LOCAL_WRITE`].
+    ///
+    /// # Safety
+    /// `[ptr, ptr+len)` must be valid and must stay **live, resident, and
+    /// unmodified** from now until the returned [`Mr`] is dropped — and, for any
+    /// RDMA that references it, until that transfer's completion is reaped
+    /// (otherwise the NIC may DMA freed or rewritten memory). As for every
+    /// registration the NIC must be quiesced (QP destroyed) before the `Mr` is
+    /// dropped; the stream layer enforces that via [`shutdown`](Self::shutdown).
+    pub unsafe fn register_external(
+        self: &Arc<Self>,
+        ptr: *mut u8,
+        len: usize,
+        access: i32,
+    ) -> io::Result<Mr> {
+        // SAFETY: the caller's contract (above) guarantees `[ptr, ptr+len)` is
+        // valid and stays resident for the MR's life.
+        let mr = unsafe { self._pd.reg_mr(ptr as usize, len, access_flags(access)) }.map_err(to_io)?;
+        let lkey = mr.lkey();
+        let rkey = mr.rkey();
+        Ok(Mr {
+            _mr: mr,
+            addr: ptr,
+            len,
+            lkey,
+            rkey,
+            _conn: Arc::clone(self),
+        })
+    }
+
+    /// The QP's `max_send_sge`: the most scatter/gather entries one one-sided write
+    /// WR can carry (`min(`[`MAX_WRITE_SGE`]`, device max_sge)`), i.e. how many
+    /// source segments the gather write packs per WR.
+    pub fn max_send_sge(&self) -> usize {
+        self.max_send_sge
+    }
+
     /// Post a receive WR over `[addr, addr+length)` (must lie within an MR with
     /// the given `lkey`). Valid in any QP state from INIT onward.
     ///
@@ -845,6 +981,64 @@ impl Connection {
                 .setup_write_imm(rkey, remote_addr, imm.to_be());
             // SAFETY: caller guarantees the local buffer outlives the completion.
             handle.setup_sge(lkey, addr as u64, length);
+            guard.post().map_err(to_io)
+        })
+    }
+
+    /// Post a signaled one-sided RDMA write that **gathers** from multiple local
+    /// scatter/gather entries (`sg_list`, each a span inside an MR named by its
+    /// `lkey`) into the peer's *contiguous* region starting at `remote_addr`,
+    /// authorized by `rkey`. The NIC lays the segments down back-to-back in order,
+    /// so a fragmented local source becomes one contiguous remote object (spec §7,
+    /// Milestone 3). With `imm` `Some`, it is delivered as write-with-immediate
+    /// (§7.7), consuming one of the peer's posted receives; the local completion is
+    /// still [`Opcode::RdmaWrite`]. Only valid once established (RTS).
+    ///
+    /// `sg_list.len()` must be in `1..=`[`MAX_WRITE_SGE`] (and `<=` the QP's
+    /// [`max_send_sge`](Self::max_send_sge)); splitting a longer gather list across
+    /// WRs is the stream layer's job. A zero-`length` SGE is allowed — an imm-only
+    /// empty write carries one.
+    ///
+    /// # Safety
+    /// Every `(addr, length)` in `sg_list` must reference live, registered local
+    /// memory until the matching completion is reaped; `remote_addr`/`rkey` carry
+    /// the same contract as [`post_write`](Self::post_write).
+    pub unsafe fn post_write_gather(
+        &self,
+        wr_id: u64,
+        sg_list: &[Sge],
+        remote_addr: u64,
+        rkey: u32,
+        imm: Option<u32>,
+    ) -> io::Result<()> {
+        assert!(
+            (1..=MAX_WRITE_SGE).contains(&sg_list.len()),
+            "post_write_gather: sg_list len {} out of 1..={MAX_WRITE_SGE}",
+            sg_list.len(),
+        );
+        // Build the verbs SGE array on the stack (bounded by `MAX_WRITE_SGE`), so
+        // there is no per-write heap allocation and the rdma-sys type stays out of
+        // the public API.
+        let mut sges = [rdma_mummy_sys::ibv_sge { addr: 0, length: 0, lkey: 0 }; MAX_WRITE_SGE];
+        for (slot, s) in sges.iter_mut().zip(sg_list) {
+            *slot = rdma_mummy_sys::ibv_sge {
+                addr: s.addr,
+                length: s.length,
+                lkey: s.lkey,
+            };
+        }
+        let n = sg_list.len();
+        self.with_qp(|qp| {
+            let mut guard = qp.start_post_send();
+            let wr = guard.construct_wr(wr_id, WorkRequestFlags::Signaled);
+            // The imm rides the WR via write-with-immediate (big-endian on the wire,
+            // as in `post_write_with_imm`); a plain write otherwise.
+            let handle = match imm {
+                Some(id) => wr.setup_write_imm(rkey, remote_addr, id.to_be()),
+                None => wr.setup_write(rkey, remote_addr),
+            };
+            // SAFETY: caller guarantees every span outlives the completion.
+            handle.setup_sge_list(&sges[..n]);
             guard.post().map_err(to_io)
         })
     }

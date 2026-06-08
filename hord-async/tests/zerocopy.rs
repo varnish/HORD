@@ -18,13 +18,14 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use hord_async::{AsyncHordStream, SharedAsyncStream};
-use hord_stream::{HordConfig, HordStream, Listener, RegisteredBuffer};
+use hord_stream::{HordConfig, HordStream, Listener, Mr, RegisteredBuffer, WriteSegment};
 use hord_zerocopy::{RdmaWriteReq, RdmaWriteStatus, SourcePool};
 
 const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
 const PORT: u16 = 18820; // distinct from the demo (4791) and other loopback tests
 const PORT_POOLED: u16 = 18821; // serve_rdma_write_pooled_reports_bytes_written
 const PORT_TOO_LARGE: u16 = 18822; // serve_rdma_write_too_large_writes_nothing
+const PORT_GATHER: u16 = 18823; // gather_write_lands_fragments_contiguously
 const OBJECT: usize = 4 * 1024 * 1024; // 4 MiB — many MTUs, dwarfs the credit window
 
 fn pattern_byte(i: usize) -> u8 {
@@ -281,6 +282,101 @@ fn serve_rdma_write_too_large_writes_nothing() {
         let mut got = vec![0u8; SMALL];
         buf.copy_out(0, &mut got);
         assert!(got.iter().all(|&b| b == SENTINEL), "TooLarge must not write into the buffer");
+    });
+
+    server.join().expect("server thread panicked");
+}
+
+/// True zero-copy from a *fragmented* caller-owned source (spec §7, Milestone 3):
+/// the server registers N separate allocations with
+/// [`SharedAsyncStream::register_external`] (mimicking an MSE4 object's
+/// non-contiguous `allocs` list — no copy into a HORD buffer), then delivers them
+/// as one logical [`SharedAsyncStream::rdma_write_gather`]. With N > the QP's
+/// `max_send_sge` the gather spans multiple WRs (exercising the SGE-packing), and
+/// the client verifies the fragments landed **contiguously, in order**, in its
+/// single destination buffer.
+#[test]
+#[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+fn gather_write_lands_fragments_contiguously() {
+    const SEG: usize = 256 * 1024; // per-allocation size
+    const N: usize = 24; // > MAX_WRITE_SGE (16) -> multiple gather WRs
+    const TOTAL: usize = SEG * N; // 6 MiB contiguous object
+    let config = HordConfig::default();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+
+    let srv_config = config.clone();
+    let server = std::thread::spawn(move || {
+        let listener = Listener::bind(IP, PORT_GATHER).expect("bind");
+        ready_tx.send(()).expect("signal ready");
+        let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
+        current_thread_rt().block_on(async move {
+            let stream = AsyncHordStream::from_accepted(conn, &srv_config).expect("accept");
+            let mut shared = SharedAsyncStream::new(stream);
+
+            // Fragmented caller-owned source: N separate allocations, each holding
+            // its slice of the global pattern, each its own externally-registered
+            // MR. Keep `backing` (and `mrs`) alive until after the gather drains.
+            let mut backing: Vec<Vec<u8>> = Vec::with_capacity(N);
+            let mut mrs: Vec<Mr> = Vec::with_capacity(N);
+            for seg in 0..N {
+                let mut v = vec![0u8; SEG];
+                for (j, b) in v.iter_mut().enumerate() {
+                    *b = pattern_byte(seg * SEG + j);
+                }
+                // SAFETY: `v` stays live in `backing` until after the gather write
+                // completes (it drains every WR before resolving).
+                let mr = unsafe { shared.register_external(v.as_mut_ptr(), v.len()) }.expect("reg ext");
+                backing.push(v);
+                mrs.push(mr);
+            }
+
+            let req = RdmaWriteReq::parse(&read_line(&mut shared).await).expect("parse request");
+            let segments: Vec<WriteSegment> =
+                mrs.iter().map(|mr| WriteSegment::from_mr(mr, 0, SEG)).collect();
+            shared
+                .rdma_write_gather(&segments, req.addr, req.rkey)
+                .await
+                .expect("rdma_write_gather");
+            let status = RdmaWriteStatus::Complete { bytes_written: TOTAL as u64 };
+            write_line(&mut shared, &status.header_value()).await;
+            drop(segments);
+            drop(mrs);
+            drop(backing);
+            shared.disconnect();
+        });
+    });
+
+    ready_rx.recv().expect("server ready");
+    current_thread_rt().block_on(async move {
+        let mut s = AsyncHordStream::connect(IP, PORT_GATHER, &config).expect("connect");
+        let buf = s.register_remote_writable(TOTAL).expect("register dest");
+        let req = RdmaWriteReq {
+            addr: buf.as_mut_ptr() as u64,
+            rkey: buf.rkey(),
+            len: buf.len() as u64,
+            id: None,
+        };
+        write_line(&mut s, &req.header_value()).await;
+
+        let status = tokio::time::timeout(Duration::from_secs(30), read_line(&mut s))
+            .await
+            .expect("status read timed out");
+        assert_eq!(
+            RdmaWriteStatus::parse(&status),
+            Some(RdmaWriteStatus::Complete { bytes_written: TOTAL as u64 }),
+        );
+
+        // The fragmented source must have landed contiguously, in order.
+        let mut tmp = vec![0u8; 256 * 1024];
+        let mut off = 0;
+        while off < TOTAL {
+            let take = tmp.len().min(TOTAL - off);
+            buf.copy_out(off, &mut tmp[..take]);
+            for (i, &got) in tmp[..take].iter().enumerate() {
+                assert_eq!(got, pattern_byte(off + i), "payload mismatch at byte {}", off + i);
+            }
+            off += take;
+        }
     });
 
     server.join().expect("server thread panicked");

@@ -508,14 +508,24 @@ read API; HORD must accept caller-owned MRs and gather from them. Carapace's
 "response bodies are immutable end-to-end" principle is exactly what makes stable
 page references safe to hand to the NIC — but the plumbing is absent today.
 
-- [ ] **Register caller-provided memory as an MR (`register_external`).** Today
+- [x] **Register caller-provided memory as an MR (`register_external`).** Today
       `register_source(len)` hands back a *HORD-owned* `RegisteredBuffer`, forcing
       Carapace to copy each MSE4 page into it — that is not zero-copy. HORD must expose
       `register_external(ptr, len) -> Mr` (returns an `lkey`) so Carapace/MSE4 can
       register the mmap'd store (or the AIO buffers) **once** and DMA straight out of
       resident pages.
 
-- [ ] **Scatter-gather source for a single logical transfer.** An MSE4 object is
+      **Done.** `unsafe Connection::register_external(ptr, len, access) -> Mr`
+      (`hord-core`) calls `pd.reg_mr` over the caller's pointer and returns a new `Mr`
+      handle — `lkey`/`rkey`/`as_mut_ptr`/`len`, deregisters on drop, holds an
+      `Arc<Connection>` so it can't outlive its PD, `!Send` (raw pointer), and owns no
+      storage. Surfaced as `unsafe HordStream::register_external(ptr, len)` (LOCAL_WRITE
+      source) and `AsyncHordStream` / `SharedAsyncStream::register_external`, re-exported
+      through `hord-stream`/`hord-async`. The `unsafe` contract is documented in one
+      place (`Connection::register_external`): the region must stay live/resident/
+      unmodified until the `Mr` drops and across any in-flight transfer.
+
+- [x] **Scatter-gather source for a single logical transfer.** An MSE4 object is
       stored across multiple non-contiguous allocations (the `Mse4HitHandler.allocs:
       Vec<(disk_off, alloc_size, buf_off)>` list in `storage.rs`). The client's
       destination buffer is contiguous; the source is fragmented. `rdma_write_all`
@@ -525,7 +535,25 @@ page references safe to hand to the NIC — but the plumbing is absent today.
       chained sequence at increasing remote offsets — so a fragmented cached object
       becomes one logical zero-copy write.
 
-- [ ] **Pin/lifetime contract for registered pages.** A page that is RDMA-registered
+      **Done (both strategies).** A `WriteSegment<'a>` (a `[off,len)` span of a
+      `RegisteredBuffer` or `Mr`; the `'a` borrow makes the gather write *safe* — the
+      source can't be dropped while a transfer references it, as the single-buffer
+      `&RegisteredBuffer` borrow does) is the gather unit. `HordStream::begin_rdma_write_gather{,_with_imm}`
+      / blocking `rdma_write_gather_all{,_with_imm}` and async
+      `SharedAsyncStream::rdma_write_gather{,_with_imm}` lay a `&[WriteSegment]` down
+      contiguously at the peer offset. The packer (`plan_gather`) uses **both**
+      strategies: it packs up to `max_send_sge` segments into one SGE-list WR
+      (`Connection::post_write_gather` → `setup_sge_list`) **and** chains WRs at
+      increasing remote offsets when the list exceeds the SGE cap or `WRITE_WR_MAX`
+      bytes. The QP now sets `max_send_sge = min(MAX_WRITE_SGE=16, device max_sge)`
+      (was the default 1). The single-buffer path is the 1-segment case (its WR pattern
+      is preserved exactly), and the async single-buffer `rdma_write` now routes through
+      the same gather core — so the slot/credit accounting lives in one shared
+      `check_write_capacity`. Verified by `gather_writes_fragments_contiguously`
+      (`hord-stream`, 40 segments → multi-WR) and `gather_write_lands_fragments_contiguously`
+      (`hord-async`, 24 external MRs → contiguous landing).
+
+- [x] **Pin/lifetime contract for registered pages.** A page that is RDMA-registered
       and in flight must not be evicted or rewritten underneath the NIC — that is a
       DMA-into-freed-memory hazard. This collides directly with MSE4 eviction
       (TinyUFO is shared and eviction is the documented multi-tenant failure mode) and
@@ -536,6 +564,20 @@ page references safe to hand to the NIC — but the plumbing is absent today.
       hot path. Carapace owns the "keep the page resident until the transfer
       completes" half; HORD owns stating the contract and exposing completion so
       Carapace knows when it is safe to release.
+
+      **Done (contract + deregister).** The lifetime contract is stated as the
+      `unsafe` safety section on `Connection::register_external` (and forwarded on the
+      stream/async wrappers): the backing pages must stay live, resident, and unmodified
+      from registration until the `Mr` drops **and** across any in-flight write that
+      references it; the NIC must be quiesced (QP destroyed) before the `Mr` drops,
+      which the stream upholds via `Connection::shutdown` before buffers go. Deregister
+      is RAII: dropping the `Mr` runs `ibv_dereg_mr` (field order deregisters before the
+      PD is released). Completion is already exposed — a gather write resolves only once
+      every WR is reaped (RC ack == in peer memory), so Carapace knows when the source
+      is safe to release. **Remaining (optional / Carapace side):** an `MrCache` so
+      Carapace isn't registering on the hot path (`ibv_reg_mr` is expensive, §8.1) — a
+      pure optimization, deferred; and the eviction-coordination half (keep the page
+      resident until completion) is Carapace's, guided by this contract.
 
 ### Cross-cutting
 

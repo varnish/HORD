@@ -82,7 +82,7 @@ use std::task::{Context, Poll, Waker};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use hord_stream::{Connection, HordConfig, HordStream, RegisteredBuffer};
+use hord_stream::{Connection, HordConfig, HordStream, Mr, RegisteredBuffer, WriteSegment};
 use hord_zerocopy::{RdmaWriteAction, RdmaWriteReq, RdmaWriteStatus, SourcePool};
 
 mod listener;
@@ -192,6 +192,21 @@ impl AsyncHordStream {
         self.stream.register_source(len)
     }
 
+    /// Register caller-owned memory as a zero-copy write *source* (server side),
+    /// returning an [`Mr`] — DMA straight out of resident pages instead of copying
+    /// into a HORD buffer. Combine its spans with [`WriteSegment::from_mr`] and
+    /// deliver them with [`SharedAsyncStream::rdma_write_gather`]. See
+    /// [`HordStream::register_external`].
+    ///
+    /// # Safety
+    /// `[ptr, ptr+len)` must stay live, resident, and unmodified until the returned
+    /// [`Mr`] is dropped — and across any in-flight write that references it (same
+    /// contract as [`HordStream::register_external`]).
+    pub unsafe fn register_external(&self, ptr: *mut u8, len: usize) -> io::Result<Mr> {
+        // SAFETY: forwarded to the stream's register_external (same contract).
+        unsafe { self.stream.register_external(ptr, len) }
+    }
+
     /// Non-blocking driver for a one-sided RDMA write: post the WR(s) on the first
     /// poll (tracked by `w.posted`), then park on the completion fd until every WR
     /// is acknowledged. Mirrors [`poll_write`] / [`poll_flush`] — it reuses
@@ -209,13 +224,16 @@ impl AsyncHordStream {
         // returns `WouldBlock` having posted nothing, so leave `post_outcome` unset
         // and pump events to free a credit, retrying on a later poll.
         while w.post_outcome.is_none() {
+            // The gather entry points subsume the single-buffer case (a 1-segment
+            // list), so one post path drives both `rdma_write` and
+            // `rdma_write_gather`; the immediate rides the final WR.
             let r = match w.imm {
-                Some(id) => self.stream.begin_rdma_write_with_imm(
-                    w.src, w.src_off, w.peer_addr, w.peer_rkey, w.len, id,
+                Some(id) => self.stream.begin_rdma_write_gather_with_imm(
+                    w.segments, w.peer_addr, w.peer_rkey, id,
                 ),
                 None => self
                     .stream
-                    .begin_rdma_write(w.src, w.src_off, w.peer_addr, w.peer_rkey, w.len),
+                    .begin_rdma_write_gather(w.segments, w.peer_addr, w.peer_rkey),
             };
             match r {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -238,9 +256,9 @@ impl AsyncHordStream {
             }
         }
         // Drain EVERY write that posted before resolving — even on a post error or
-        // a closed stream. Otherwise an error return would let the caller drop
-        // `src` (deregistering its MR + freeing the storage) while the NIC is
-        // still DMA-reading it from an outstanding write (use-after-free).
+        // a closed stream. Otherwise an error return would let the caller drop a
+        // source buffer/`Mr` (deregistering its MR + freeing/unpinning the storage)
+        // while the NIC is still DMA-reading it from an outstanding write (UAF).
         while self.stream.writes_pending() {
             match self.poll_events(cx)? {
                 Poll::Ready(()) => continue,
@@ -511,14 +529,16 @@ fn write_aborted() -> io::Error {
 /// In-progress one-sided RDMA write, threaded through
 /// [`AsyncHordStream::poll_rdma_write`] across polls. `post_outcome` is `None`
 /// until the first poll issues the WR(s); thereafter it holds that `begin`
-/// call's result, which is reported only *after* every posted WR has been
-/// drained (so a post error can't drop the source buffer with DMA outstanding).
+/// call's result, which is reported only *after* every posted WR has been drained
+/// (so a post error can't drop a source region with DMA outstanding). The source
+/// is a scatter-gather [`WriteSegment`] list — the single-buffer
+/// [`rdma_write`](SharedAsyncStream::rdma_write) is just the 1-segment case — laid
+/// down contiguously at `[peer_addr, …]`. The `'a` borrow keeps the source regions
+/// alive for the whole write.
 struct PendingWrite<'a> {
-    src: &'a RegisteredBuffer,
-    src_off: usize,
+    segments: &'a [WriteSegment<'a>],
     peer_addr: u64,
     peer_rkey: u32,
-    len: usize,
     /// `Some(id)` for split mode (§7.7): the final WR is a write-with-immediate
     /// carrying `id`. `None` for a plain zero-copy write.
     imm: Option<u32>,
@@ -585,6 +605,19 @@ impl SharedAsyncStream {
         self.0.borrow().register_remote_writable(len)
     }
 
+    /// Register caller-owned memory as a zero-copy write *source*, returning an
+    /// [`Mr`] to gather from via [`rdma_write_gather`](Self::rdma_write_gather). See
+    /// [`AsyncHordStream::register_external`].
+    ///
+    /// # Safety
+    /// Same contract as [`AsyncHordStream::register_external`]: the region must stay
+    /// live, resident, and unmodified until the `Mr` is dropped and across any
+    /// in-flight write that references it.
+    pub unsafe fn register_external(&self, ptr: *mut u8, len: usize) -> io::Result<Mr> {
+        // SAFETY: forwarded (same residency/lifetime contract).
+        unsafe { self.0.borrow().register_external(ptr, len) }
+    }
+
     /// Best-effort graceful disconnect.
     pub fn disconnect(&self) {
         self.0.borrow().disconnect();
@@ -593,7 +626,9 @@ impl SharedAsyncStream {
     /// RDMA-write `src[src_off .. src_off+len]` into the peer's `[peer_addr,
     /// peer_rkey]`, awaiting completion. The body is delivered out-of-band; the
     /// caller then sends an HTTP response with `Content-Length: 0`. Borrows the
-    /// shared stream afresh on each poll (no borrow held across an await).
+    /// shared stream afresh on each poll (no borrow held across an await). For a
+    /// *fragmented* source use [`rdma_write_gather`](Self::rdma_write_gather); this
+    /// is the single-segment case of it.
     pub async fn rdma_write(
         &self,
         src: &RegisteredBuffer,
@@ -602,12 +637,11 @@ impl SharedAsyncStream {
         peer_rkey: u32,
         len: usize,
     ) -> io::Result<()> {
+        let segments = [WriteSegment::from_registered(src, src_off, len)];
         let mut w = PendingWrite {
-            src,
-            src_off,
+            segments: &segments,
             peer_addr,
             peer_rkey,
-            len,
             imm: None,
             post_outcome: None,
         };
@@ -629,12 +663,55 @@ impl SharedAsyncStream {
         len: usize,
         transfer_id: u32,
     ) -> io::Result<()> {
+        let segments = [WriteSegment::from_registered(src, src_off, len)];
         let mut w = PendingWrite {
-            src,
-            src_off,
+            segments: &segments,
             peer_addr,
             peer_rkey,
-            len,
+            imm: Some(transfer_id),
+            post_outcome: None,
+        };
+        std::future::poll_fn(|cx| self.0.borrow_mut().poll_rdma_write(cx, &mut w)).await
+    }
+
+    /// Scatter-gather counterpart of [`rdma_write`](Self::rdma_write) (spec §7,
+    /// Milestone 3): deliver a *fragmented* source — a `&[WriteSegment]`, e.g. an
+    /// MSE4 object's non-contiguous allocations registered via
+    /// [`register_external`](Self::register_external) — as one logical zero-copy
+    /// write, laid down contiguously at the peer's `[peer_addr, peer_rkey]`. The
+    /// `segments` borrow keeps every source [`Mr`]/buffer alive until the write
+    /// completes (no copy into a HORD buffer first — the actual zero-copy path).
+    /// Borrows the shared stream afresh on each poll (no borrow across an await).
+    pub async fn rdma_write_gather(
+        &self,
+        segments: &[WriteSegment<'_>],
+        peer_addr: u64,
+        peer_rkey: u32,
+    ) -> io::Result<()> {
+        let mut w = PendingWrite {
+            segments,
+            peer_addr,
+            peer_rkey,
+            imm: None,
+            post_outcome: None,
+        };
+        std::future::poll_fn(|cx| self.0.borrow_mut().poll_rdma_write(cx, &mut w)).await
+    }
+
+    /// Split-mode (§7.7) counterpart of [`rdma_write_gather`](Self::rdma_write_gather):
+    /// the final WR is a write-with-immediate carrying `transfer_id`, signalling the
+    /// peer's data plane on its CQ. An empty gather still delivers the immediate.
+    pub async fn rdma_write_gather_with_imm(
+        &self,
+        segments: &[WriteSegment<'_>],
+        peer_addr: u64,
+        peer_rkey: u32,
+        transfer_id: u32,
+    ) -> io::Result<()> {
+        let mut w = PendingWrite {
+            segments,
+            peer_addr,
+            peer_rkey,
             imm: Some(transfer_id),
             post_outcome: None,
         };
