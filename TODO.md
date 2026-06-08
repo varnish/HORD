@@ -374,19 +374,27 @@ The following remain consciously deferred.
       feature so the adapter dependency surface stays minimal. (Low priority — `log` is
       near-zero-cost; Carapace gates the whole `hord-async` dep behind its own feature.)
 
-- [ ] **Test-support duplication and a weak backpressure assertion.**
-      `tests/listener.rs` adds a 6th copy of the `pattern_byte`/`pattern_vec` helpers
-      (the `pattern()` LCG dup already tracked below) and of `current_thread_rt`
+- [ ] **Test-support duplication** (the weak-assertion half of this item is now fixed —
+      see below). `tests/listener.rs` adds a 6th copy of the `pattern_byte`/`pattern_vec`
+      helpers (the `pattern()` LCG dup already tracked below) and of `current_thread_rt`
       (identical in 5 other `hord-async` test modules), and the
       acceptor/worker/demo each re-build a current-thread runtime with the same
       boilerplate — all candidates for a shared `tests/common` module + a
-      `build_current_thread_rt()` helper. Separately,
-      `poll_write_backpressures_slow_reader` proves backpressure via
-      `blocked_observed = !write_done` after a fixed 500 ms sleep, which cannot
-      distinguish "`poll_write` returned `Pending`" from "the write hadn't started
-      yet" — a regression that merely delays the write start would pass. **Fix:** make
-      the assertion observe the write genuinely stalling mid-flight (e.g. bytes
-      received so far `<` payload while `write_done` is false) rather than a timer.
+      `build_current_thread_rt()` helper.
+
+      **Done (the weak-assertion half).** `poll_write_backpressures_slow_reader`
+      previously proved backpressure via `blocked_observed = !write_done` after a fixed
+      500 ms sleep, which could not distinguish "`poll_write` returned `Pending`" from
+      "the write never started" — both leave `write_done` false — so a regression that
+      merely delayed the write start would pass. The test now reads a bounded 1 MiB
+      prefix *first* (under a 10 s timeout, so a write that produces no data fails cleanly
+      instead of hanging), which proves the write genuinely started and bytes are
+      flowing; only then does it stop reading and assert `!write_done && got.len() <
+      PAYLOAD`, pinning a genuine mid-flight stall rather than a timer. It now fails on
+      all three regressions it guards (write-never-starts → prefix-read timeout;
+      `poll_write` buffers unbounded → `write_done` true at the check; corruption →
+      pattern mismatch) where the timer-only version caught only the last. Verified green
+      on `rxe0`. The **test-support dedup** above remains the open work.
 
 ### Milestone 1 — HTTP/1.1 over RDMA (byte-stream parity)
 

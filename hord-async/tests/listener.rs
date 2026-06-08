@@ -258,9 +258,13 @@ fn conn_meta_surfaces_peer_addr_and_caps() {
 fn poll_write_backpressures_slow_reader() {
     const PORT: u16 = 18631;
     const PAYLOAD: usize = 16 * 1024 * 1024; // 16 MiB — dwarfs the credit window
+    // A prefix far below PAYLOAD: big enough to prove the write genuinely started
+    // and bytes are flowing, small enough that draining it can't let the full write
+    // complete — the server re-blocks on credits well short of PAYLOAD.
+    const PREFIX: usize = 1024 * 1024; // 1 MiB
 
     // The server writes PAYLOAD bytes, flips `write_done` only once the whole write
-    // is acknowledged, then half-closes. With a non-reading client the write must
+    // is acknowledged, then half-closes. With a barely-reading client the write must
     // block on credit exhaustion long before completing.
     let write_done = Arc::new(AtomicBool::new(false));
     let wd = write_done.clone();
@@ -284,13 +288,26 @@ fn poll_write_backpressures_slow_reader() {
             .expect("write request");
         s.flush().await.expect("flush request");
 
-        // Deliberately do NOT read for a while. The server fills the window (a few
-        // MiB at most) and then blocks in poll_write — so `write_done` stays false.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let blocked_observed = !write_done.load(SeqCst);
+        // Read a bounded PREFIX first. This proves the write GENUINELY STARTED and
+        // bytes are flowing: the old "sleep, then check !write_done" couldn't tell a
+        // back-pressured mid-flight stall from a write that never began — both leave
+        // write_done false. A timeout here means the write produced no data at all,
+        // which fails cleanly (its own message) instead of hanging.
+        let mut got = vec![0u8; PREFIX];
+        tokio::time::timeout(Duration::from_secs(10), s.read_exact(&mut got))
+            .await
+            .expect("server sent no data — the write may never have started")
+            .expect("read prefix");
 
-        // Now drain everything; the backpressured write resumes as we read.
-        let mut got = Vec::with_capacity(PAYLOAD);
+        // Now STOP reading. With the prefix proven flowing, the server refills the
+        // credit window and blocks in poll_write; only PREFIX of PAYLOAD bytes have
+        // been consumed, so `write_done` must still be false. The `got.len() < PAYLOAD`
+        // conjunct states the "mid-flight" half explicitly, next to the "started" half
+        // (the read_exact above) — together they pin a genuine stall, not a timer.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let blocked_observed = !write_done.load(SeqCst) && got.len() < PAYLOAD;
+
+        // Now drain the rest; the backpressured write resumes as we read.
         tokio::time::timeout(Duration::from_secs(30), s.read_to_end(&mut got))
             .await
             .expect("read timed out")
@@ -305,8 +322,8 @@ fn poll_write_backpressures_slow_reader() {
 
     assert!(
         blocked_observed,
-        "server completed a {PAYLOAD}-byte write while the client read nothing — \
-         poll_write buffered unbounded instead of back-pressuring",
+        "server completed the {PAYLOAD}-byte write while the client had read only a \
+         {PREFIX}-byte prefix — poll_write buffered unbounded instead of back-pressuring",
     );
     assert_eq!(got.len(), PAYLOAD, "wrong payload length");
     let mismatch = got.iter().enumerate().find(|(i, &b)| b != pattern_byte(*i));
