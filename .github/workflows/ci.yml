@@ -27,7 +27,8 @@ jobs:
       - name: cargo test --workspace (incl. ignored)
         # --test-threads=1: a couple of in-binary tests reuse the same TCP/RDMA-CM
         # port, so serialize to avoid bind() races. The suite runs in seconds.
-        run: cargo test --workspace -- --include-ignored --test-threads=1
+        # --locked: fail if Cargo.lock is stale rather than silently regenerating it.
+        run: cargo test --locked --workspace -- --include-ignored --test-threads=1
 
   # Milestone-1 "device-free build" guarantee. The hord-zerocopy header codec
   # (RdmaWriteReq / RdmaWriteStatus / RdmaWriteAction) must link and test with the
@@ -47,7 +48,7 @@ jobs:
           set -euxo pipefail
           # Default features (rdma off): the normal-dependency tree must be empty —
           # no hord-stream/hord-core and so none of sideway/rdma-mummy-sys/rdma-core.
-          tree=$(cargo tree -p hord-zerocopy --edges normal)
+          tree=$(cargo tree --locked -p hord-zerocopy --edges normal)
           echo "$tree"
           if echo "$tree" | grep -Eiq 'sideway|rdma-mummy-sys|hord-core|hord-stream'; then
             echo "::error::hord-zerocopy default build pulled an RDMA crate; the pure codec must stay device-free (Milestone 1)"
@@ -57,7 +58,7 @@ jobs:
         # Compiles the lib + runs the codec unit tests; the RDMA loopback tests are
         # `#![cfg(feature = "rdma")]` so they compile to empty here. No device, no
         # rdma-core, no setup-soft-roce — proving the laptop story end to end.
-        run: cargo test -p hord-zerocopy
+        run: cargo test --locked -p hord-zerocopy
 
   coverage:
     name: coverage (llvm-cov)
@@ -75,7 +76,7 @@ jobs:
           set -euxo pipefail
           # --no-report runs the instrumented suite and stashes the raw profiles;
           # the two `report` calls then render from that data without recompiling.
-          cargo llvm-cov --workspace --no-report -- --include-ignored --test-threads=1
+          cargo llvm-cov --locked --workspace --no-report -- --include-ignored --test-threads=1
           cargo llvm-cov report --lcov --output-path lcov.info
           cargo llvm-cov report --summary-only | tee coverage-summary.txt
       - name: Publish coverage summary
