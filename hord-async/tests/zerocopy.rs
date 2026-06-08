@@ -241,6 +241,7 @@ fn serve_rdma_write_too_large_writes_nothing() {
         let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
         current_thread_rt().block_on(async move {
             let stream = AsyncHordStream::from_accepted(conn, &srv_config).expect("accept");
+            assert!(stream.zero_copy_negotiated(), "server: zero-copy not negotiated");
             let mut shared = SharedAsyncStream::new(stream);
 
             let req = RdmaWriteReq::parse(&read_line(&mut shared).await).expect("parse request");
@@ -258,6 +259,7 @@ fn serve_rdma_write_too_large_writes_nothing() {
     ready_rx.recv().expect("server ready");
     current_thread_rt().block_on(async move {
         let mut s = AsyncHordStream::connect(IP, PORT_TOO_LARGE, &config).expect("connect");
+        assert!(s.zero_copy_negotiated(), "client: zero-copy not negotiated");
         let buf = s.register_remote_writable(SMALL).expect("register dest");
         // Seed the buffer so we can prove the server wrote nothing into it.
         buf.copy_in(0, &vec![SENTINEL; SMALL]);
@@ -312,6 +314,15 @@ fn gather_write_lands_fragments_contiguously() {
         current_thread_rt().block_on(async move {
             let stream = AsyncHordStream::from_accepted(conn, &srv_config).expect("accept");
             let mut shared = SharedAsyncStream::new(stream);
+            // The point of the test is multi-WR packing; assert (don't just comment)
+            // that N exceeds the QP's per-WR SGE cap so the gather really spans
+            // several WRs — otherwise this would silently degrade to a 1-WR test if
+            // MAX_WRITE_SGE ever rose.
+            assert!(
+                shared.max_send_sge() < N,
+                "N ({N}) must exceed max_send_sge ({}) to force multi-WR packing",
+                shared.max_send_sge(),
+            );
 
             // Fragmented caller-owned source: N separate allocations, each holding
             // its slice of the global pattern, each its own externally-registered

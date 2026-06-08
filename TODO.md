@@ -579,6 +579,51 @@ page references safe to hand to the NIC — but the plumbing is absent today.
       pure optimization, deferred; and the eviction-coordination half (keep the page
       resident until completion) is Carapace's, guided by this contract.
 
+### Deferred from the M2/M3 zero-copy code review
+
+A max-effort review of the M2 serve methods + M3 scatter-gather work **fixed the
+findings worth fixing**: the 🔴 write-future cancellation use-after-free (a dropped
+write future now force-tears-down the QP via a `WriteCancelGuard` before any source
+is freed — `hord-async`); the duplicated blocking post→drain harness (one
+`drive_write_all` — `hord-stream`); the four near-identical async `rdma_write*`
+methods (one `drive_write`); the undocumented scatter-gather capacity ceiling (now
+documented on the gather entry points); `plan_gather`'s untested byte-cap split (now
+a device-free unit test) plus a `==`→`>=` robustness tweak; the async gather test's
+missing multi-WR assertion; and stale/over-broad docs (the "cancelled write drops
+cleanly" claim and the "Milestone 3 removes the copy" claim on `serve_rdma_write`).
+The following were consciously **deferred** — each touches proven RDMA-semantic code
+or is a pure optimization, and none is a live bug on the supported path:
+
+- [ ] **Unify the *sync* single-buffer transport path into the gather core.** The
+      async path already routes single-buffer writes through the gather core (a
+      1-segment list), but `hord-stream` still keeps `begin_rdma_write_inner` (with its
+      own `WRITE_WR_MAX` chunking and zero-length-imm WR) alongside
+      `begin_rdma_write_gather_inner`. Making the single-buffer one a 1-segment shim and
+      deleting the duplicate would leave one WR-posting core. Deferred: it touches the
+      proven single-buffer path; the shared `check_write_capacity` already removes the
+      *accounting* drift, leaving only the posting loop duplicated.
+
+- [ ] **Reroute `post_write` / `post_write_with_imm` through `post_write_gather`.**
+      The single-SGE primitives are now the 1-SGE special case of the gather primitive,
+      and each re-encodes the `imm.to_be()` byte order (the cross-referencing comments
+      admit the drift risk). Collapsing them onto `post_write_gather([one_sge])` would
+      put the WR-construction + endianness in one place. Deferred (touches hord-core's
+      verb-posting primitives).
+
+- [ ] **Batch a scatter-gather write that exceeds the send-pool cap.** A source
+      fragmented into more than `send_pool * max_send_sge` segments (defaults: 16 × ≤16
+      = 256) currently fails with a non-retryable `InvalidInput` rather than being
+      delivered in several drained batches. Documented on the gather entry points for
+      now; batching is the real fix when an MSE4 workload proves it necessary.
+
+- [ ] **An imm-only (zero-SGE) write-with-immediate primitive.** An all-empty gather
+      with an immediate currently borrows `segments.first()`'s `(addr, lkey)` for a
+      0-length SGE, and an *empty* segment list with an immediate is an `InvalidInput`
+      rather than delivering the bare transfer ID. Verbs permits `num_sge == 0` for a
+      write-with-imm; a dedicated imm-only WR would make the immediate-as-signal case
+      stop masquerading as a degenerate data write. Niche; the current behavior is safe
+      (a returned error, no UB).
+
 ### Cross-cutting
 
 - [ ] **Peer identity + trust model for multi-tenancy.** Carapace is multi-tenant by

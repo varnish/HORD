@@ -325,8 +325,12 @@ async fn serve_zero_copy(
         // to error and the connection closes); per §7.4/§7.7.7 we must not report
         // `complete`, so respond 500 (best-effort — no immediate was delivered).
         Err(e) => {
-            eprintln!("[server] rdma write failed: {e}");
-            respond(500, "text/plain", full(b"rdma write failed\n"), None)
+            // `serve_rdma_write_pooled` folds source registration and the write into
+            // one call, so the message must cover both causes the comment above names
+            // (a §8.1 registration failure never reaches the wire) rather than blaming
+            // the write.
+            eprintln!("[server] zero-copy serve failed (source registration or write): {e}");
+            respond(500, "text/plain", full(b"zero-copy serve failed\n"), None)
         }
     }
 }

@@ -69,8 +69,12 @@
 //! [`tokio::time::timeout`] — rather than baked into the stream. Combined with
 //! the now-tunable CM retry params (`hord_stream::HordConfig::cm`), a
 //! stalled-but-alive peer no longer hangs a reader forever (review item #11). A
-//! cancelled (timed-out) read/write future drops cleanly: already-reaped
-//! completions stay reaped and no slot is leaked.
+//! cancelled (timed-out) *read* future drops cleanly: already-reaped completions
+//! stay reaped and no slot is leaked. A cancelled *write* future needs more care —
+//! dropping it before its WRs are reaped would leave the NIC DMA-reading a source
+//! the caller may now free — so the write futures carry a drop guard that
+//! force-tears-down the QP (quiescing the NIC) if cancelled with writes still in
+//! flight; see [`SharedAsyncStream::rdma_write`].
 
 use std::cell::RefCell;
 use std::io;
@@ -205,6 +209,21 @@ impl AsyncHordStream {
     pub unsafe fn register_external(&self, ptr: *mut u8, len: usize) -> io::Result<Mr> {
         // SAFETY: forwarded to the stream's register_external (same contract).
         unsafe { self.stream.register_external(ptr, len) }
+    }
+
+    /// Whether any one-sided RDMA write posted on this connection is still
+    /// unacknowledged. The write-cancellation guard
+    /// ([`SharedAsyncStream::rdma_write`]) consults it to decide whether a dropped
+    /// write future left WRs in flight that require a NIC quiesce.
+    pub fn writes_pending(&self) -> bool {
+        self.stream.writes_pending()
+    }
+
+    /// The most scatter/gather segments one gather-write WR carries on this
+    /// connection (the QP's `max_send_sge`); a longer [`WriteSegment`] list spans
+    /// multiple WRs. See [`HordStream::max_send_sge`].
+    pub fn max_send_sge(&self) -> usize {
+        self.stream.max_send_sge()
     }
 
     /// Non-blocking driver for a one-sided RDMA write: post the WR(s) on the first
@@ -545,6 +564,37 @@ struct PendingWrite<'a> {
     post_outcome: Option<io::Result<()>>,
 }
 
+/// Drop guard for a one-sided write future (see
+/// [`SharedAsyncStream::drive_write`]). [`AsyncHordStream::poll_rdma_write`] only
+/// drains posted WRs while it is being polled, so a write future *cancelled*
+/// mid-flight (a `tokio::time::timeout`, or a handler dropped because its connection
+/// went away) would leave WRs posted with the NIC still DMA-reading a source the
+/// caller is about to free — a use-after-free / torn delivery. On such a drop this
+/// guard force-tears-down the QP, making the NIC quiescent *before* the source is
+/// released — the same `ConnTeardown` quiesce [`HordListener`] performs at its grace
+/// deadline, extended to per-future cancellation. It is disarmed on normal
+/// completion, where the drain already idled the NIC.
+struct WriteCancelGuard<'a> {
+    stream: &'a SharedAsyncStream,
+    armed: bool,
+}
+
+impl Drop for WriteCancelGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return; // normal completion: poll_rdma_write drained every posted WR.
+        }
+        // Cancelled / panicked with the write unfinished. `try_borrow` so a drop
+        // amid an unrelated panic (the cell already borrowed) can't double-panic;
+        // `force_teardown` is idempotent and only needed while WRs are still posted.
+        if let Ok(inner) = self.stream.0.try_borrow() {
+            if inner.writes_pending() {
+                inner.teardown_handle().force_teardown();
+            }
+        }
+    }
+}
+
 /// A clonable handle to an [`AsyncHordStream`], so a `hyper` *server* can drive a
 /// zero-copy RDMA write from inside its request handler while `hyper` owns the
 /// stream for HTTP. (`hyper`'s `service_fn` never receives the connection, and
@@ -618,6 +668,12 @@ impl SharedAsyncStream {
         unsafe { self.0.borrow().register_external(ptr, len) }
     }
 
+    /// The most scatter/gather segments one gather-write WR carries on this
+    /// connection (the QP's `max_send_sge`). See [`HordStream::max_send_sge`].
+    pub fn max_send_sge(&self) -> usize {
+        self.0.borrow().max_send_sge()
+    }
+
     /// Best-effort graceful disconnect.
     pub fn disconnect(&self) {
         self.0.borrow().disconnect();
@@ -629,6 +685,14 @@ impl SharedAsyncStream {
     /// shared stream afresh on each poll (no borrow held across an await). For a
     /// *fragmented* source use [`rdma_write_gather`](Self::rdma_write_gather); this
     /// is the single-segment case of it.
+    ///
+    /// **Cancellation:** if this future is dropped before the write completes (e.g. a
+    /// [`tokio::time::timeout`] fires, or the connection task is aborted) while WRs
+    /// are still posted, the connection's QP is force-torn-down so the NIC stops
+    /// DMA-reading `src` before the caller frees it — a cancelled write therefore
+    /// ends the connection rather than risking a use-after-free. All four
+    /// `rdma_write*` methods (and the `serve_*` methods built on them) share this
+    /// guard.
     pub async fn rdma_write(
         &self,
         src: &RegisteredBuffer,
@@ -638,22 +702,16 @@ impl SharedAsyncStream {
         len: usize,
     ) -> io::Result<()> {
         let segments = [WriteSegment::from_registered(src, src_off, len)];
-        let mut w = PendingWrite {
-            segments: &segments,
-            peer_addr,
-            peer_rkey,
-            imm: None,
-            post_outcome: None,
-        };
-        std::future::poll_fn(|cx| self.0.borrow_mut().poll_rdma_write(cx, &mut w)).await
+        self.drive_write(&segments, peer_addr, peer_rkey, None).await
     }
 
-    /// Split-mode (§7.7) counterpart of [`rdma_write`](Self::rdma_write): deliver
-    /// the body with RDMA write-with-immediate carrying `transfer_id`, so the
-    /// peer's data plane is signalled on its CQ. On `Ok(())` the payload landed
-    /// and the immediate was delivered; the caller then sends the HTTP response
-    /// (still `Content-Length: 0`). `len` may be `0` — an empty WR still carries
-    /// the immediate. Borrows the shared stream afresh on each poll.
+    /// Split-mode (§7.7) counterpart of [`rdma_write`](Self::rdma_write): deliver the
+    /// body with RDMA write-with-immediate carrying `transfer_id`, so the peer's data
+    /// plane is signalled on its CQ. On `Ok(())` the payload landed and the immediate
+    /// was delivered; the caller then sends the HTTP response (still
+    /// `Content-Length: 0`). `len` may be `0` — an empty WR still carries the
+    /// immediate. Same per-poll borrow and cancellation guard as
+    /// [`rdma_write`](Self::rdma_write).
     pub async fn rdma_write_with_imm(
         &self,
         src: &RegisteredBuffer,
@@ -664,14 +722,7 @@ impl SharedAsyncStream {
         transfer_id: u32,
     ) -> io::Result<()> {
         let segments = [WriteSegment::from_registered(src, src_off, len)];
-        let mut w = PendingWrite {
-            segments: &segments,
-            peer_addr,
-            peer_rkey,
-            imm: Some(transfer_id),
-            post_outcome: None,
-        };
-        std::future::poll_fn(|cx| self.0.borrow_mut().poll_rdma_write(cx, &mut w)).await
+        self.drive_write(&segments, peer_addr, peer_rkey, Some(transfer_id)).await
     }
 
     /// Scatter-gather counterpart of [`rdma_write`](Self::rdma_write) (spec §7,
@@ -680,22 +731,15 @@ impl SharedAsyncStream {
     /// [`register_external`](Self::register_external) — as one logical zero-copy
     /// write, laid down contiguously at the peer's `[peer_addr, peer_rkey]`. The
     /// `segments` borrow keeps every source [`Mr`]/buffer alive until the write
-    /// completes (no copy into a HORD buffer first — the actual zero-copy path).
-    /// Borrows the shared stream afresh on each poll (no borrow across an await).
+    /// completes (no copy into a HORD buffer first — the actual zero-copy path), and
+    /// the same cancellation guard as [`rdma_write`](Self::rdma_write) applies.
     pub async fn rdma_write_gather(
         &self,
         segments: &[WriteSegment<'_>],
         peer_addr: u64,
         peer_rkey: u32,
     ) -> io::Result<()> {
-        let mut w = PendingWrite {
-            segments,
-            peer_addr,
-            peer_rkey,
-            imm: None,
-            post_outcome: None,
-        };
-        std::future::poll_fn(|cx| self.0.borrow_mut().poll_rdma_write(cx, &mut w)).await
+        self.drive_write(segments, peer_addr, peer_rkey, None).await
     }
 
     /// Split-mode (§7.7) counterpart of [`rdma_write_gather`](Self::rdma_write_gather):
@@ -708,14 +752,38 @@ impl SharedAsyncStream {
         peer_rkey: u32,
         transfer_id: u32,
     ) -> io::Result<()> {
+        self.drive_write(segments, peer_addr, peer_rkey, Some(transfer_id)).await
+    }
+
+    /// Shared driver behind the four `rdma_write*` entry points (and, through the
+    /// `serve_*` methods, the policy path): build the [`PendingWrite`], arm the
+    /// [`WriteCancelGuard`], drive it to completion on the shared stream, then
+    /// disarm. Centralising it keeps the borrow-per-poll discipline and the
+    /// use-after-free cancellation guard in exactly one place. `segments` is the
+    /// gather list (a 1-element slice for the single-buffer callers); `imm` rides the
+    /// final WR in split mode (§7.7).
+    async fn drive_write(
+        &self,
+        segments: &[WriteSegment<'_>],
+        peer_addr: u64,
+        peer_rkey: u32,
+        imm: Option<u32>,
+    ) -> io::Result<()> {
         let mut w = PendingWrite {
             segments,
             peer_addr,
             peer_rkey,
-            imm: Some(transfer_id),
+            imm,
             post_outcome: None,
         };
-        std::future::poll_fn(|cx| self.0.borrow_mut().poll_rdma_write(cx, &mut w)).await
+        // Declared after `w` so it drops *before* `w` on cancellation: the guard
+        // quiesces the NIC, then the segments borrow is released.
+        let mut guard = WriteCancelGuard { stream: self, armed: true };
+        let r = std::future::poll_fn(|cx| self.0.borrow_mut().poll_rdma_write(cx, &mut w)).await;
+        // Completed (Ok or Err): poll_rdma_write drained every posted WR, so the NIC
+        // is idle — no teardown needed.
+        guard.armed = false;
+        r
     }
 
     /// Serve the server side of a zero-copy response (spec §7.3, and §7.7 in split
@@ -748,12 +816,16 @@ impl SharedAsyncStream {
     ///   echo `declined` yourself). [`RdmaWriteAction::decide`] never yields it.
     ///
     /// `fill` populates the source buffer's first `object_size` bytes just before
-    /// the write — this prototype's one server-side copy (Milestone 3 removes it by
-    /// gathering from caller-owned MRs). On a transport failure mid-write this
-    /// returns `Err` and the connection closes; the caller MUST NOT report
-    /// `complete` then (§7.4/§7.7.7) — map the `Err` to a 5xx. The too-large and
-    /// error cases never deliver a §7.7 immediate, so a split data-plane consumer
-    /// must bound its wait rather than assume one completion per request.
+    /// the write — this serve method still does that one server-side copy. The
+    /// Milestone-3 *true* zero-copy path (deliver straight from caller-owned MRs, no
+    /// copy) ships as [`rdma_write_gather`](Self::rdma_write_gather) +
+    /// [`register_external`](Self::register_external), but is not yet wired into this
+    /// policy entry point (a `serve_rdma_write_gather` is the natural follow-up). On
+    /// a transport failure mid-write this returns `Err` and the connection closes;
+    /// the caller MUST NOT report `complete` then (§7.4/§7.7.7) — map the `Err` to a
+    /// 5xx. The too-large and error cases never deliver a §7.7 immediate, so a split
+    /// data-plane consumer must bound its wait rather than assume one completion per
+    /// request.
     ///
     /// # Borrow soundness
     ///

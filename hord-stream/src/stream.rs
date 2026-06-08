@@ -1467,7 +1467,10 @@ impl HordStream {
             let mut seg_off = 0usize;
             while seg_off < seg.len {
                 // Flush the WR once it is full by SGE count or by the byte cap.
-                if n_sge == max_sge || wr_bytes == WRITE_WR_MAX as u64 {
+                // `>=` not `==`: `take` is capped to `budget` so `wr_bytes` lands
+                // exactly on `WRITE_WR_MAX` today, but `>=` keeps the cap robust if
+                // that ever changes (never emit an over-cap WR).
+                if n_sge == max_sge || wr_bytes >= WRITE_WR_MAX as u64 {
                     emit(remote_off, &sges[..n_sge])?;
                     wr_count += 1;
                     remote_off += wr_bytes;
@@ -1596,6 +1599,14 @@ impl HordStream {
     /// for the call; the caller must keep them alive until the matching completions
     /// are reaped — which the blocking
     /// [`rdma_write_gather_all`](Self::rdma_write_gather_all) does before returning.
+    ///
+    /// **Capacity.** The whole gather must fit the send queue at once: it needs
+    /// `ceil(total_segments / max_send_sge)` WRs (plus byte-cap splits for any
+    /// segment over [`WRITE_WR_MAX`]), and if that exceeds the send pool the call
+    /// fails with `InvalidInput` (a caller error, *not* retryable back-pressure). So
+    /// the practical fragment ceiling is `send_pool * `[`max_send_sge`](Self::max_send_sge)
+    /// (defaults: 16 × ≤16). A source fragmented beyond that must be delivered in
+    /// several gather calls (drain between them), or coalesced first.
     pub fn begin_rdma_write_gather(
         &mut self,
         segments: &[WriteSegment<'_>],
@@ -1618,22 +1629,30 @@ impl HordStream {
         self.begin_rdma_write_gather_inner(segments, peer_addr, peer_rkey, Some(transfer_id))
     }
 
-    fn rdma_write_gather_all_inner(
+    /// The blocking post→drain harness shared by the single-buffer and
+    /// scatter-gather writes. Post via `begin`, retrying on `WouldBlock`
+    /// back-pressure by reaping an outstanding send/write (surfacing a permanent
+    /// stall if nothing is in flight to drain); then **drain every posted WR before
+    /// returning** — even on a mid-batch post error — so the caller can't free a
+    /// source the NIC is still DMA-reading (the use-after-free guard); then surface a
+    /// post error or a mid-write peer close. Both [`rdma_write_all_inner`] and
+    /// [`rdma_write_gather_all_inner`] route through here, so this drain ordering —
+    /// the load-bearing safety step — lives in exactly one place.
+    fn drive_write_all(
         &mut self,
-        segments: &[WriteSegment<'_>],
-        peer_addr: u64,
-        peer_rkey: u32,
-        imm: Option<u32>,
+        mut begin: impl FnMut(&mut Self) -> io::Result<()>,
     ) -> io::Result<()> {
-        // Post, retrying on back-pressure (mirrors `rdma_write_all_inner`): reap an
-        // outstanding send/write to free a slot/credit and retry. If nothing is in
-        // flight the block can't clear, so surface it rather than spin forever.
+        // `begin` returns `WouldBlock` having posted nothing when a send-queue slot
+        // or the transfer-credit window (§7.7.6) is momentarily full. Reap to free
+        // it and retry; if NOTHING is outstanding the block can never clear (e.g. an
+        // imm write on a connection that never negotiated split, peer_split_credits
+        // == 0), so surface it rather than spin forever.
         let posted = loop {
-            match self.begin_rdma_write_gather_inner(segments, peer_addr, peer_rkey, imm) {
+            match begin(self) {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     if !self.sends_outstanding() && !self.writes_pending() {
                         break Err(io::Error::other(
-                            "RDMA gather write back-pressured with nothing in flight to drain",
+                            "RDMA write back-pressured with nothing in flight to drain",
                         ));
                     }
                     self.pump(true)?;
@@ -1641,10 +1660,10 @@ impl HordStream {
                 other => break other,
             }
         };
-        // Drain every posted write before returning — else the caller may drop a
-        // source `Mr` (deregistering it, freeing nothing it owns but releasing the
-        // pin) while the NIC is still DMA-reading it. Drain first, propagate the
-        // post error after.
+        // Drain every WR that posted before returning — even on a post error — or the
+        // caller could drop the source (deregistering its MR / releasing an external
+        // `Mr`'s pin) while the NIC is still DMA-reading it. Drain first, propagate
+        // the post error after.
         while self.writes_pending() {
             self.pump(true)?;
         }
@@ -1652,10 +1671,20 @@ impl HordStream {
         if self.peer_closed {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "connection closed before the RDMA gather write completed",
+                "connection closed before the RDMA write completed",
             ));
         }
         Ok(())
+    }
+
+    fn rdma_write_gather_all_inner(
+        &mut self,
+        segments: &[WriteSegment<'_>],
+        peer_addr: u64,
+        peer_rkey: u32,
+        imm: Option<u32>,
+    ) -> io::Result<()> {
+        self.drive_write_all(|s| s.begin_rdma_write_gather_inner(segments, peer_addr, peer_rkey, imm))
     }
 
     /// Blocking scatter-gather write (spec §7, Milestone 3): post the gather and
@@ -1738,44 +1767,7 @@ impl HordStream {
         len: usize,
         imm: Option<u32>,
     ) -> io::Result<()> {
-        // Post, retrying on back-pressure: `begin` returns `WouldBlock` (posting
-        // nothing) when either the transfer-credit window (§7.7.6) or the send
-        // pool is momentarily full. Reap an outstanding send/write to free the
-        // resource and retry. Something must be in flight to drain — a full credit
-        // window implies an imm write is pending, a full send pool implies a
-        // send/write is — so if NOTHING is outstanding the block can't clear
-        // (e.g. an imm write attempted on a connection that never negotiated
-        // split, peer_split_credits == 0); surface that rather than spin forever.
-        let posted = loop {
-            match self.begin_rdma_write_inner(src, src_off, peer_addr, peer_rkey, len, imm) {
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    if !self.sends_outstanding() && !self.writes_pending() {
-                        break Err(io::Error::other(
-                            "RDMA write back-pressured with nothing in flight to drain",
-                        ));
-                    }
-                    self.pump(true)?;
-                }
-                other => break other,
-            }
-        };
-        // If a WR fails to post mid-batch, the begin call returns Err but the WRs
-        // that DID post are still queued on the NIC. We must drain every posted
-        // write (reap its completion) before returning, or the caller will drop
-        // `src` — deregistering its MR and freeing the storage — while the NIC is
-        // still DMA-reading it (use-after-free). So drain first, propagate the
-        // post error after.
-        while self.writes_pending() {
-            self.pump(true)?;
-        }
-        posted?;
-        if self.peer_closed {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "connection closed before the RDMA write completed",
-            ));
-        }
-        Ok(())
+        self.drive_write_all(|s| s.begin_rdma_write_inner(src, src_off, peer_addr, peer_rkey, len, imm))
     }
 
     /// Mark the stream closed — e.g. when the async layer observes a CM
@@ -2775,5 +2767,95 @@ mod gather_tests {
         s.write_all(line.as_bytes()).expect("write");
         s.write_all(b"\n").expect("write newline");
         s.flush().expect("flush");
+    }
+}
+
+#[cfg(test)]
+mod plan_gather_tests {
+    //! Device-free unit tests for the scatter-gather WR packer
+    //! ([`HordStream::plan_gather`]). The packer is pure arithmetic over
+    //! `(addr, lkey, len)` tuples — it never dereferences a pointer — so these run
+    //! under a plain `cargo test` with no RDMA device, and a "segment" can be larger
+    //! than any real allocation. They lock the two packing dimensions (the
+    //! `max_send_sge` count cap and the [`WRITE_WR_MAX`] byte cap), the contiguous
+    //! remote-offset advance, and zero-length handling — the most intricate logic in
+    //! the gather path, which the rxe0 integration tests exercise only in the
+    //! all-small-segments regime (every WR packed purely by SGE count).
+    use super::*;
+
+    /// A fake source span over an arbitrary `(addr, len)`. No memory is touched
+    /// (the packer only reads addr/len arithmetically), so `len` may exceed any real
+    /// allocation to exercise the byte-cap split.
+    fn seg(addr: u64, len: usize) -> WriteSegment<'static> {
+        // SAFETY: fed only to plan_gather, which never dereferences the pointer; the
+        // lkey is a stand-in and no WR is ever posted from these segments.
+        unsafe { WriteSegment::from_raw(addr as *const u8, 0xABCD, len) }
+    }
+
+    /// Run the packer, returning each emitted WR as `(remote_off, [(addr, len)])`.
+    fn plan(segments: &[WriteSegment<'_>], max_sge: usize) -> Vec<(u64, Vec<(u64, u32)>)> {
+        let mut wrs = Vec::new();
+        let n = HordStream::plan_gather(segments, max_sge, |remote_off, sges| {
+            wrs.push((remote_off, sges.iter().map(|s| (s.addr, s.length)).collect()));
+            Ok(())
+        })
+        .expect("plan_gather");
+        assert_eq!(n, wrs.len(), "returned WR count must match the emitted WRs");
+        wrs
+    }
+
+    #[test]
+    fn single_small_segment_is_one_1sge_wr() {
+        assert_eq!(plan(&[seg(0x1000, 4096)], 16), vec![(0, vec![(0x1000, 4096)])]);
+    }
+
+    #[test]
+    fn empty_or_all_zero_length_emits_nothing() {
+        assert!(plan(&[], 16).is_empty());
+        assert!(plan(&[seg(0x1000, 0), seg(0x2000, 0)], 16).is_empty());
+    }
+
+    #[test]
+    fn packs_up_to_max_sge_per_wr_at_contiguous_offsets() {
+        // 5 segments of 100 bytes, max_sge 2 -> WRs of [2, 2, 1] SGEs; each WR's
+        // remote offset is the running total of the prior WRs' bytes.
+        let segs: Vec<_> = (0..5).map(|i| seg(0x1000 * (i + 1) as u64, 100)).collect();
+        let wrs = plan(&segs, 2);
+        assert_eq!(wrs.len(), 3);
+        assert_eq!([wrs[0].1.len(), wrs[1].1.len(), wrs[2].1.len()], [2, 2, 1]);
+        assert_eq!([wrs[0].0, wrs[1].0, wrs[2].0], [0, 200, 400]);
+    }
+
+    #[test]
+    fn zero_length_segment_between_data_is_skipped() {
+        // A 0-length segment must consume neither an SGE slot nor a WR.
+        let wrs = plan(&[seg(0x1000, 50), seg(0x2000, 0), seg(0x3000, 50)], 16);
+        assert_eq!(wrs, vec![(0, vec![(0x1000, 50), (0x3000, 50)])]);
+    }
+
+    #[test]
+    fn segment_larger_than_byte_cap_splits_across_wrs() {
+        // A 2.5 * WRITE_WR_MAX segment -> 3 WRs (1 GiB, 1 GiB, 0.5 GiB), 1 SGE each
+        // (the byte cap fills a WR before a second SGE of the same segment is added),
+        // at contiguous remote offsets. No memory is allocated (the addr is fake).
+        let cap = WRITE_WR_MAX as u64;
+        let half = WRITE_WR_MAX / 2;
+        let total = 2 * WRITE_WR_MAX + half;
+        let base = 0x4000_0000u64;
+        let wrs = plan(&[seg(base, total)], 16);
+        assert_eq!(wrs.len(), 3);
+        assert_eq!(wrs[0], (0, vec![(base, WRITE_WR_MAX as u32)]));
+        assert_eq!(wrs[1], (cap, vec![(base + cap, WRITE_WR_MAX as u32)]));
+        assert_eq!(wrs[2], (2 * cap, vec![(base + 2 * cap, half as u32)]));
+        // Every byte of the segment is laid down exactly once.
+        let laid: u64 = wrs.iter().flat_map(|(_, s)| s.iter().map(|&(_, l)| l as u64)).sum();
+        assert_eq!(laid, total as u64);
+    }
+
+    #[test]
+    fn max_sge_zero_is_clamped_to_one() {
+        // A degenerate max_sge must clamp to 1 (no divide-by-zero, no 0-SGE WR).
+        let wrs = plan(&[seg(0x1000, 10), seg(0x2000, 10)], 0);
+        assert_eq!(wrs, vec![(0, vec![(0x1000, 10)]), (10, vec![(0x2000, 10)])]);
     }
 }
