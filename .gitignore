@@ -1,5 +1,4 @@
 target/
-Cargo.lock
 
 # Coverage artifacts (cargo-llvm-cov)
 /lcov.info
