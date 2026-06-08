@@ -174,13 +174,24 @@ supported single-host path.
       multi-tenant trust model (below) rides on. **Fix when that lands:** surface
       `Option<SocketAddr>` (ideally plus the GID) to the service rather than a default.
 
-- [ ] **Unbounded acceptor→worker channel + blind round-robin.** `dispatch` round-robins
+- [x] **Unbounded acceptor→worker channel + blind round-robin.** `dispatch` round-robins
       over an unbounded `mpsc`, skipping only *closed* channels, not a merely-wedged
       worker (e.g. one in its now-bounded ~10 s handshake/establish wait, or monopolized
       by a long zero-copy write). A wedged worker silently accumulates a backlog of
       accepted connections, each already holding a live QP/CM id. **Fix:** bounded
       channel with `try_send` + failover to the next live worker, or least-loaded
       selection. Pairs with the handshake-stage item below.
+
+      **Done.** Each worker channel is now bounded (`WORKER_CHANNEL_CAP = 32`) and
+      `dispatch` uses `try_send`: a worker whose queue is *full* is skipped exactly like
+      a *closed* (dead-thread) one, so a connection fails over to the next live, non-full
+      worker instead of piling unboundedly behind a wedged one. If every worker is full
+      or gone the connection is shed (its `Drop` issues a graceful disconnect) rather
+      than blocking the single accept loop — back-pressure on accept under sustained
+      overload; the bounded queues keep the half-open-QP backlog finite. The deeper
+      **handshake-stage** item below (run establishment off the worker so a slow peer
+      never wedges it in the first place) remains open — this bounds and routes around a
+      wedged worker; it doesn't stop a worker from wedging.
 
 - [ ] **Synchronous handshake still pins the worker (now bounded, not unbounded).**
       With `ESTABLISH_TIMEOUT` + the existing `HANDSHAKE_TIMEOUT`, a stalled peer can no
@@ -255,7 +266,7 @@ The following remain consciously deferred.
       item above) so the abort stays a true last resort, but the UAF is now closed
       even when it is reached.
 
-- [ ] **`try_accept` abandons sibling connect-requests and leaks a cm_id on a
+- [x] **`try_accept` abandons sibling connect-requests and leaks a cm_id on a
       per-connection setup failure.** A `process_event` error for one `ConnectRequest`
       (e.g. `Endpoint::build` / `migrate` failing) makes `try_accept` return `Err`
       before draining other requests queued in the same fd wakeup (they are not lost —
@@ -265,6 +276,24 @@ The following remain consciously deferred.
       **Fix:** isolate per-connection setup failures from the listener error cap — log
       + reject that one connection and keep draining the rest — rather than treating a
       single bad peer as a listener-level error. Pairs with the unbounded-channel item.
+
+      **Done.** `process_event`'s `ConnectRequest` arm now runs all post-ack setup (its
+      own CM channel, the migrate, the `Endpoint::build`, the INIT transition) as one
+      fallible block; on any failure it best-effort `rdma_reject`s the peer (so the
+      client fails fast instead of timing out, no half-open id lingers) and returns the
+      error tagged `hord_core::ConnectionSetupFailed` (recognised by
+      `is_connection_setup_failure`, re-exported through `hord-stream`). The
+      `HordListener` acceptor gained a match arm for it: log + skip that one peer and
+      keep draining the wakeup's queue **without** touching `consecutive_errors` or the
+      back-off, so a single bad peer can't climb toward `MAX_CONSECUTIVE_ACCEPT_ERRORS`;
+      the skip still counts toward the per-wakeup drain cap so a flood can't starve the
+      biased shutdown branch. `sideway` 0.4.3 exposes no reject, so the vendored copy
+      gained `Identifier::reject` (`rdma_reject`, no private data) alongside
+      `migrate`/`peer_addr` (HORD-PATCH.md updated). Regressed by device-free marker
+      unit tests (the two listener markers must not cross-trigger) and the `#[ignore]`d
+      `hord-core/tests/reject_on_setup_failure.rs` (induce the failure with an
+      impossible QP sizing → assert the peer's `connect_finish` fails fast, not a
+      watchdog timeout, and the server's error is `is_connection_setup_failure`).
 
 - [ ] **`expect_event_timed` is a server-only twin of `expect_event` with a 1 ms poll
       and a divergent channel-mode side effect.** Three issues, all low-severity but
