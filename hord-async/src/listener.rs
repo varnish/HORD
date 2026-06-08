@@ -109,7 +109,7 @@ use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, watch};
 
-use hord_stream::{Connection, HordConfig, HordStream, Listener};
+use hord_stream::{is_device_removed, Connection, HordConfig, HordStream, Listener};
 
 // `ReactorFd` (crate root) is the shared "raw fd owned elsewhere; drop deregisters
 // but does not close" AsyncFd wrapper — reused here for the listener's CM fd.
@@ -300,6 +300,15 @@ async fn acceptor_loop(
     let mut consecutive_errors: u32 = 0;
 
     'accept: loop {
+        // Honour a shutdown that is already set — including one set *before*
+        // serve() started: `watch::changed()` only fires on a *change* from the
+        // value present at receiver creation, so an already-true signal would
+        // otherwise be ignored until a later toggle. A plain `borrow()` doesn't
+        // advance the seen-version, so the `changed()` arm below still works.
+        if *shutdown.borrow() {
+            break 'accept;
+        }
+
         tokio::select! {
             // Shutdown wins over a flood of inbound connections.
             biased;
@@ -326,9 +335,17 @@ async fn acceptor_loop(
                 // the AsyncFd footgun that hot-spins on a persistent error.
                 let mut drained = false;
                 let mut accepted = 0u32;
+                // Set by a terminal listener error (device removal) so the post-loop
+                // logic stops the acceptor immediately rather than backing off.
+                let mut fatal = false;
                 loop {
                     match HordStream::try_accept_begin(&listener, &config) {
                         Ok(Some(conn)) => {
+                            // A real accept is the only evidence the listener is
+                            // healthy, so it is the only thing that clears the
+                            // error run. (`Ok(None)`/empty is *not* recovery — see
+                            // below — or a removed device would reset the counter
+                            // and the cap could never trip.)
                             consecutive_errors = 0;
                             let peer = conn.peer_addr().unwrap_or(UNKNOWN_PEER);
                             dispatch(&senders, &mut next, conn, peer);
@@ -340,8 +357,20 @@ async fn acceptor_loop(
                             }
                         }
                         Ok(None) => {
-                            consecutive_errors = 0;
+                            // Channel drained to empty. Do NOT reset
+                            // `consecutive_errors`: an empty poll is not proof of
+                            // health (a removed device also reads empty after its
+                            // one event is acked), so resetting here would let a
+                            // persistent error evade MAX_CONSECUTIVE_ACCEPT_ERRORS.
                             drained = true;
+                            break;
+                        }
+                        Err(e) if is_device_removed(&e) => {
+                            // Terminal: the device is gone, no further CM events
+                            // will arrive. Stop now instead of backing off forever
+                            // (the blocking `Listener::accept` surfaces this too).
+                            log::error!("hord: {e}; stopping acceptor");
+                            fatal = true;
                             break;
                         }
                         Err(e) => {
@@ -352,6 +381,9 @@ async fn acceptor_loop(
                             break;
                         }
                     }
+                }
+                if fatal {
+                    break 'accept;
                 }
                 if drained {
                     guard.clear_ready();

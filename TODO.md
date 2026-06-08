@@ -138,7 +138,9 @@ cancellation thread-leak (a `StopOnCancel` drop guard now winds the threads down
 the future is dropped); the unbounded `accept_finish` establishment wait (now bounded
 by `ESTABLISH_TIMEOUT`, so a half-open peer can't wedge a worker forever); the
 acceptor error-spin on a fatal CM event (now only `clear_ready`s on a clean drain,
-backs off, and terminates after `MAX_CONSECUTIVE_ACCEPT_ERRORS`); the `peer_addr`
+backs off, and terminates after `MAX_CONSECUTIVE_ACCEPT_ERRORS` — though the recall
+pass below found this fix was incomplete and device removal still hung; now fixed);
+the `peer_addr`
 AF_INET6 out-of-provenance read (now copies through a `cm_id`-wide pointer); and two
 flaky/lossy tests (listener binds before the serving thread spawns; the keep-alive
 test cleans up before asserting).
@@ -187,6 +189,117 @@ supported single-host path.
       documented handshake **stage** — run establishment/handshake off the worker (or
       async) so a slow peer never blocks a worker's reactor. Deferred (bigger; the
       bound makes it non-urgent).
+
+### Deferred from the second HordListener code review (recall pass, 2026-06-08)
+
+A second, recall-oriented review of the Blocker 0 work **fixed three acceptor
+control-flow bugs the first review's fix had left incomplete** (commit alongside
+this note):
+
+- **`DeviceRemoval` is now terminal in the async acceptor.** The previous pass
+  claimed device removal "terminates after `MAX_CONSECUTIVE_ACCEPT_ERRORS`", but
+  it was folded into the *transient* error counter as a generic `io::Error::other`
+  string, so after the one removal event was acked the next poll read empty
+  (`Ok(None)`), reset `consecutive_errors` to 0, and the acceptor re-parked on a
+  dead fd **forever** — the cap never tripped. Fixed by carrying a typed
+  `hord_core::DeviceRemoved` (recognised via `is_device_removed`); the acceptor now
+  stops immediately, matching the blocking `Listener::accept` contract.
+- **The error cap can no longer be evaded by an interleaved empty poll.** `Ok(None)`
+  (drained-empty) no longer resets `consecutive_errors`; only a real accept
+  (`Ok(Some)`) does. A persistent-but-punctuated CM error now climbs to the cap
+  instead of looping at ~10 attempts/sec forever.
+- **An already-set shutdown is honoured at `serve()` entry.** The acceptor now checks
+  `*shutdown.borrow()` before the accept loop; `watch::changed()` does not fire for
+  the value present at receiver creation, so a receiver that is already `true` (e.g.
+  `watch::channel(true)`) would otherwise have been ignored until a later toggle.
+  Regression-tested by `shutdown_already_set_returns_promptly` in
+  `hord-async/tests/listener.rs`.
+
+The following remain consciously deferred.
+
+- [ ] **🔴 Use-after-free / torn delivery when a connection task is aborted
+      mid-`RDMA_WRITE` (fix before any production use).** `worker_loop`'s
+      grace-timeout drain aborts in-flight connection tasks by dropping the `JoinSet`
+      (`hord-async/src/listener.rs`, the `timeout(grace, drain)`). If a task is parked
+      inside `poll_rdma_write` with a posted-but-unreaped write WR (the documented
+      backpressure case: a slow / non-reading RDMA peer), the abort drops the future
+      and, because the nested hyper/service future holding the **source**
+      `RegisteredBuffer` drops before the outer `SharedAsyncStream` locals, the source
+      MR is deregistered and its storage freed **while the QP still has the outstanding
+      write** — the NIC can DMA-read freed memory and the peer gets a torn write. The
+      careful drain in `poll_rdma_write` / `rdma_write_all` (which exists *precisely* to
+      prevent this on every poll-return path) is bypassed by task abort, and
+      `HordStream::Drop`'s "destroy the QP before deregistering buffers" ordering only
+      covers the stream's own send/recv pools, not a separately-owned source buffer.
+      **Note:** this is the same hazard the §13 "QP ripped mid-`RDMA_WRITE` is a torn
+      delivery; draining is not optional" warning calls out — but with memory-unsafety
+      on top, not just a torn byte stream. Wiring the per-connection graceful drain
+      (the idle-keep-alive item above) makes the abort a true last resort and shrinks
+      the window, but does **not** close it for a genuinely stuck peer at the grace
+      deadline. **Candidate fixes (need design + an `rxe0` regression test that
+      shuts down mid-backpressured-write):** (a) tie the source buffer's storage
+      lifetime to QP teardown so storage can't be freed before the QP is destroyed
+      (e.g. the buffer holds the storage in an `Arc` the `Connection` also holds);
+      (b) give `HordListener` a way to force a *synchronous* QP teardown for each
+      in-flight connection before dropping its task on timeout; (c) make
+      `RegisteredBuffer::Drop` drain/confirm no in-flight write references it (needs
+      access to drive the CQ). Until fixed, hosts MUST drive per-connection graceful
+      shutdown so the abort path is not reached under normal operation.
+
+- [ ] **`try_accept` abandons sibling connect-requests and leaks a cm_id on a
+      per-connection setup failure.** A `process_event` error for one `ConnectRequest`
+      (e.g. `Endpoint::build` / `migrate` failing) makes `try_accept` return `Err`
+      before draining other requests queued in the same fd wakeup (they are not lost —
+      the fd stays readable — but are delayed behind the 100 ms backoff), and the
+      already-acked+migrated cm_id is dropped without an explicit `rdma_reject`, so that
+      peer waits out a connect timeout and a half-open id lingers until timewait.
+      **Fix:** isolate per-connection setup failures from the listener error cap — log
+      + reject that one connection and keep draining the rest — rather than treating a
+      single bad peer as a listener-level error. Pairs with the unbounded-channel item.
+
+- [ ] **`expect_event_timed` is a server-only twin of `expect_event` with a 1 ms poll
+      and a divergent channel-mode side effect.** Three issues, all low-severity but
+      worth unifying: (1) it busy-polls with a fixed `std::thread::sleep(1ms)` (the old
+      `expect_event` blocked on the fd and woke immediately), so each synchronous
+      handshake on a worker now adds up to ~1 ms latency and that sleep blocks the
+      worker's whole current-thread runtime; (2) it leaves the *server* CM channel
+      non-blocking on every return path, while the client's `connect_finish` still uses
+      the unbounded blocking `expect_event` and leaves it blocking — so the "no peer
+      pins a thread forever" guarantee holds only server-side and the two ends diverge
+      in channel mode; (3) it duplicates the ack/match/error-format body of
+      `expect_event`. **Fix:** one timeout-bearing, fd-driven (not sleep-polled) CM
+      wait shared by both ends. Pairs with the handshake-stage item above.
+
+- [ ] **`hord-zerocopy` gates the `rdma` layer with 17 scattered
+      `#[cfg(feature = "rdma")]` attributes.** The orchestration items form one
+      contiguous region, so a single `#[cfg(feature = "rdma")] mod rdma { … }`
+      (re-exported) would collapse them to one and make the device-free boundary
+      structurally unleakable rather than a matter of per-item discipline (forgetting
+      one either breaks the default build or pulls a `hord-stream` type into the codec
+      layer — the very regression the `codec` CI job guards). Mechanical; deferred to
+      avoid a large move in the same change as the correctness fixes.
+
+- [ ] **`hord-async` carries server-only deps for embedders that want only the
+      adapter.** `HordListener` pulled `log` + tokio `sync`/`macros` into what was a
+      stream-adapter crate; a host that brings its own accept loop and wants only the
+      `AsyncRead`/`AsyncWrite` adapter still compiles the listener and its deps. **Fix:**
+      put the listener behind a `listener = ["dep:log", "tokio/sync", "tokio/macros"]`
+      feature so the adapter dependency surface stays minimal. (Low priority — `log` is
+      near-zero-cost; Carapace gates the whole `hord-async` dep behind its own feature.)
+
+- [ ] **Test-support duplication and a weak backpressure assertion.**
+      `tests/listener.rs` adds a 6th copy of the `pattern_byte`/`pattern_vec` helpers
+      (the `pattern()` LCG dup already tracked below) and of `current_thread_rt`
+      (identical in 5 other `hord-async` test modules), and the
+      acceptor/worker/demo each re-build a current-thread runtime with the same
+      boilerplate — all candidates for a shared `tests/common` module + a
+      `build_current_thread_rt()` helper. Separately,
+      `poll_write_backpressures_slow_reader` proves backpressure via
+      `blocked_observed = !write_done` after a fixed 500 ms sleep, which cannot
+      distinguish "`poll_write` returned `Pending`" from "the write hadn't started
+      yet" — a regression that merely delays the write start would pass. **Fix:** make
+      the assertion observe the write genuinely stalling mid-flight (e.g. bytes
+      received so far `<` payload while `write_done` is false) rather than a timer.
 
 ### Milestone 1 — HTTP/1.1 over RDMA (byte-stream parity)
 

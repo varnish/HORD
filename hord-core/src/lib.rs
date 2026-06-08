@@ -80,6 +80,31 @@ fn invalid_ip(ip: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, format!("invalid ip address: {ip}"))
 }
 
+/// Terminal error carried by the [`io::Error`] that [`Listener::accept`] /
+/// [`Listener::try_accept`] return when the RDMA device backing the listener is
+/// removed. It is the *inner* error (recognise it with [`is_device_removed`]),
+/// so the `Display` text is unchanged from the previous string-only error. A
+/// threaded acceptor must treat this as fatal and stop — no further CM events
+/// will ever arrive, so retrying would park forever.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceRemoved;
+
+impl std::fmt::Display for DeviceRemoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RDMA device removed while listening for connections")
+    }
+}
+
+impl std::error::Error for DeviceRemoved {}
+
+/// True if `e` is the terminal listener device-removal error (its inner error is
+/// a [`DeviceRemoved`]). An accept loop should stop on this rather than counting
+/// it as a transient failure and backing off, since the listener can accept no
+/// more connections.
+pub fn is_device_removed(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<DeviceRemoved>())
+}
+
 fn parse_addr(ip: &str, port: u16) -> io::Result<SocketAddr> {
     let addr: IpAddr = ip.parse().map_err(|_| invalid_ip(ip))?;
     Ok(SocketAddr::new(addr, port))
@@ -388,12 +413,13 @@ impl Listener {
                 Ok(Some(conn))
             }
             // Device removal on the listener is terminal — surface it rather than
-            // ack-and-spin (the next get_cm_event would block forever).
+            // ack-and-spin (the next get_cm_event would block forever). Carry a
+            // typed `DeviceRemoved` so a non-blocking acceptor can tell this fatal
+            // condition apart from a transient per-connection setup error and stop
+            // instead of backing off forever (see `is_device_removed`).
             EventType::DeviceRemoval => {
                 let _ = event.ack();
-                Err(io::Error::other(
-                    "RDMA device removed while listening for connections",
-                ))
+                Err(io::Error::other(DeviceRemoved))
             }
             // Other events can legitimately appear on the listener channel (e.g. a
             // stray TimewaitExit); they are benign — ack and keep waiting.

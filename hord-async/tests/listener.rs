@@ -290,3 +290,38 @@ fn serve_cancellation_winds_down_threads() {
         );
     });
 }
+
+#[test]
+#[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+fn shutdown_already_set_returns_promptly() {
+    const PORT: u16 = 18633;
+
+    // A shutdown receiver that is ALREADY `true` when serve() starts must make the
+    // acceptor wind down immediately, never accepting. `watch::channel(true)` is
+    // the trigger: the receiver's seen-version already equals the (true) initial
+    // value, so `Receiver::changed()` never fires — without the acceptor's own
+    // initial `*shutdown.borrow()` check it would park on the CM fd forever.
+    // (Regression for the "already-true shutdown ignored until a later toggle" bug.)
+    let (_keep_sender_alive, rx) = watch::channel(true);
+    let listener = HordListener::bind(IP, PORT, HordConfig::default())
+        .expect("bind")
+        .workers(1)
+        .grace_timeout(Duration::from_secs(5));
+
+    let done = std::thread::spawn(move || {
+        current_thread_rt().block_on(listener.serve(rx, |_s, _p| async {}));
+    });
+
+    // serve() must return well within the grace window; if the pre-set signal were
+    // ignored the acceptor would park forever and this join would hang (the test
+    // harness then kills it — a clear failure either way).
+    let start = std::time::Instant::now();
+    while !done.is_finished() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "serve() did not return on an already-set shutdown — acceptor ignored the pre-set signal",
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    done.join().expect("serve thread panicked");
+}
