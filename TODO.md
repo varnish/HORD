@@ -217,34 +217,43 @@ this note):
 
 The following remain consciously deferred.
 
-- [ ] **🔴 Use-after-free / torn delivery when a connection task is aborted
-      mid-`RDMA_WRITE` (fix before any production use).** `worker_loop`'s
-      grace-timeout drain aborts in-flight connection tasks by dropping the `JoinSet`
-      (`hord-async/src/listener.rs`, the `timeout(grace, drain)`). If a task is parked
-      inside `poll_rdma_write` with a posted-but-unreaped write WR (the documented
-      backpressure case: a slow / non-reading RDMA peer), the abort drops the future
-      and, because the nested hyper/service future holding the **source**
-      `RegisteredBuffer` drops before the outer `SharedAsyncStream` locals, the source
-      MR is deregistered and its storage freed **while the QP still has the outstanding
-      write** — the NIC can DMA-read freed memory and the peer gets a torn write. The
-      careful drain in `poll_rdma_write` / `rdma_write_all` (which exists *precisely* to
-      prevent this on every poll-return path) is bypassed by task abort, and
-      `HordStream::Drop`'s "destroy the QP before deregistering buffers" ordering only
-      covers the stream's own send/recv pools, not a separately-owned source buffer.
-      **Note:** this is the same hazard the §13 "QP ripped mid-`RDMA_WRITE` is a torn
-      delivery; draining is not optional" warning calls out — but with memory-unsafety
-      on top, not just a torn byte stream. Wiring the per-connection graceful drain
-      (the idle-keep-alive item above) makes the abort a true last resort and shrinks
-      the window, but does **not** close it for a genuinely stuck peer at the grace
-      deadline. **Candidate fixes (need design + an `rxe0` regression test that
-      shuts down mid-backpressured-write):** (a) tie the source buffer's storage
-      lifetime to QP teardown so storage can't be freed before the QP is destroyed
-      (e.g. the buffer holds the storage in an `Arc` the `Connection` also holds);
-      (b) give `HordListener` a way to force a *synchronous* QP teardown for each
-      in-flight connection before dropping its task on timeout; (c) make
-      `RegisteredBuffer::Drop` drain/confirm no in-flight write references it (needs
-      access to drive the CQ). Until fixed, hosts MUST drive per-connection graceful
-      shutdown so the abort path is not reached under normal operation.
+- [x] **🔴 Use-after-free / torn delivery when a connection task is aborted
+      mid-`RDMA_WRITE`.** `worker_loop`'s grace-timeout drain aborts in-flight
+      connection tasks by dropping the `JoinSet` (`hord-async/src/listener.rs`, the
+      `timeout(grace, drain)`). If a task is parked inside `poll_rdma_write` with a
+      posted-but-unreaped write WR (the documented backpressure case: a slow /
+      non-reading RDMA peer), the abort drops the future and, because the nested
+      hyper/service future holding the **source** `RegisteredBuffer` drops before the
+      outer `SharedAsyncStream` locals, the source MR is deregistered and its storage
+      freed **while the QP still has the outstanding write** — the NIC can DMA-read
+      freed memory and the peer gets a torn write. The careful drain in
+      `poll_rdma_write` / `rdma_write_all` (which exists *precisely* to prevent this on
+      every poll-return path) is bypassed by task abort, and `HordStream::Drop`'s
+      "destroy the QP before deregistering buffers" ordering only covers the stream's
+      own send/recv pools, not a separately-owned source buffer.
+
+      **Done (candidate b — force synchronous QP teardown before the abort).** This
+      is the option that generalises: it makes the NIC quiescent regardless of who
+      owns the source storage (so it also covers the caller-owned external MRs of
+      Milestone 3, which option (a) — "HORD pins the storage" — cannot, and without
+      (c)'s per-buffer in-flight tracking or a `Drop` that has to drive the CQ).
+      `HordStream::teardown_handle()` hands back a `ConnTeardown` (an `Arc<Connection>`
+      whose `force_teardown()` calls the idempotent `Connection::shutdown` →
+      `ibv_destroy_qp`), surfaced through `AsyncHordStream::teardown_handle()`.
+      `worker_loop` keeps one `ConnTeardown` per live task, keyed by `tokio::task::Id`
+      (pruned as tasks finish, so it never pins a dead connection's resources). When
+      the grace drain times out, it force-tears-down every still-in-flight
+      connection's QP **before** dropping the `JoinSet` — so by the time an aborted
+      future frees its source buffer, the QP is gone and no DMA can race the free.
+      Mirrors `HordStream::Drop`'s "stop the NIC before touching buffers" invariant,
+      extended to externally-owned buffers; no hot-path or steady-state memory cost.
+      Regressed by `shutdown_mid_backpressured_rdma_write_is_safe` in
+      `hord-async/tests/listener.rs` (split-write into a non-draining peer → server
+      wedges mid-`RDMA_WRITE` → listener shutdown → asserts the abort path ran and
+      `serve()` returned bounded by the grace window, no torn-teardown panic/hang).
+      Hosts should still drive the per-connection graceful drain (the idle-keep-alive
+      item above) so the abort stays a true last resort, but the UAF is now closed
+      even when it is reached.
 
 - [ ] **`try_accept` abandons sibling connect-requests and leaks a cm_id on a
       per-connection setup failure.** A `process_event` error for one `ConnectRequest`

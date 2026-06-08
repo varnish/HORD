@@ -16,13 +16,14 @@
 
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::watch;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{oneshot, watch};
 
-use hord_async::{AsyncHordStream, HordListener};
+use hord_async::{AsyncHordStream, HordListener, SharedAsyncStream};
 use hord_stream::HordConfig;
+use hord_zerocopy::RdmaWriteReq;
 
 const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
 
@@ -324,4 +325,154 @@ fn shutdown_already_set_returns_promptly() {
         std::thread::sleep(Duration::from_millis(50));
     }
     done.join().expect("serve thread panicked");
+}
+
+/// Read a single `\n`-terminated line (no trailing newline); empty string on EOF.
+async fn read_line<R: AsyncRead + Unpin>(s: &mut R) -> std::io::Result<String> {
+    let mut out = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        match s.read(&mut b).await? {
+            0 => break,
+            _ if b[0] == b'\n' => break,
+            _ => out.push(b[0]),
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Regression for the 🔴 use-after-free / torn delivery when a connection task is
+/// aborted *mid-`RDMA_WRITE`* at the grace deadline (TODO.md, "recall pass").
+///
+/// Setup: the server protocol-splits (write-with-immediate, §7.7) into a client
+/// buffer, but the client never drains its data plane, so after its pre-posted
+/// recv WRs are consumed the server's writes RNR-stall and the connection task
+/// parks inside `poll_rdma_write` with write WRs **outstanding** against a source
+/// `RegisteredBuffer` the task owns. We then fire the listener's graceful
+/// shutdown. The drain cannot complete (the task is wedged), so it hits the grace
+/// timeout and the worker aborts the task — which drops the source buffer.
+///
+/// Before the fix that drop deregistered the source MR and freed its storage
+/// while the QP still had the write posted (NIC DMA-into-freed-memory). The fix
+/// makes the worker force every in-flight connection's QP down *before* the abort,
+/// so the NIC is quiescent first. This test exercises that path end to end: it
+/// asserts the server genuinely reached the wedged write (so the abort path ran),
+/// that `serve()` returns bounded by the grace window (no hang, no panic/segfault
+/// from a torn teardown), and that it did pay ~the grace timeout (proving a task
+/// was stuck at the deadline, i.e. the abort — not a clean drain — happened).
+#[test]
+#[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+fn shutdown_mid_backpressured_rdma_write_is_safe() {
+    const PORT: u16 = 18634;
+    const CHUNK: usize = 64 * 1024; // per-transfer payload; size is immaterial
+    const GRACE: Duration = Duration::from_secs(2);
+    // Generous slack so a slow CI box doesn't flake; the point is "bounded".
+    const SLACK: Duration = Duration::from_secs(8);
+
+    // Server: split-write in a loop until it wedges (credit window exhausted,
+    // peer not draining). It signals once it is actively writing, then loops —
+    // the loop parks inside `rdma_write_with_imm` and never returns, so the task
+    // is in-flight at the grace deadline.
+    let (writing_tx, writing_rx) = mpsc::channel::<()>();
+    let (shutdown, listener_thread) = {
+        let (tx, rx) = watch::channel(false);
+        let listener = HordListener::bind(IP, PORT, HordConfig::default())
+            .expect("bind listener")
+            .workers(1)
+            .grace_timeout(GRACE);
+        let writing_tx = writing_tx.clone();
+        let handle = std::thread::spawn(move || {
+            current_thread_rt().block_on(listener.serve(rx, move |stream, _peer| {
+                let writing_tx = writing_tx.clone();
+                async move {
+                    let mut shared = SharedAsyncStream::new(stream);
+                    assert!(
+                        shared.split_mode_negotiated(),
+                        "server: split mode not negotiated (needed to reach the backpressure park)",
+                    );
+                    // The client's "addr rkey" line — where to write.
+                    let req = RdmaWriteReq::parse(&read_line(&mut shared).await.expect("read req"))
+                        .expect("parse request");
+                    let src = shared.register_source(CHUNK).expect("register source");
+                    src.copy_in(0, &pattern_vec(CHUNK));
+                    let _ = writing_tx.send(()); // we are about to drive writes
+                    // Loop write-with-immediate. The first N (the client's recv-WR
+                    // count) land; thereafter the peer has no recv WR and the writes
+                    // RNR-stall, so this call parks in `poll_rdma_write` forever — the
+                    // task is wedged with a write outstanding against `src`.
+                    let mut id = 0u32;
+                    loop {
+                        if shared
+                            .rdma_write_with_imm(&src, 0, req.addr, req.rkey, CHUNK, id)
+                            .await
+                            .is_err()
+                        {
+                            break; // QP torn down (force_teardown) — clean exit
+                        }
+                        id = id.wrapping_add(1);
+                    }
+                }
+            }));
+        });
+        (tx, handle)
+    };
+
+    // Client: register a destination buffer, send its coordinates, then hold the
+    // connection open WITHOUT ever draining — so the server's data plane stalls.
+    // `release_rx` keeps the !Send stream (and its runtime) alive until the test
+    // has finished tearing the server down.
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let client_thread = std::thread::spawn(move || {
+        current_thread_rt().block_on(async move {
+            let mut s = AsyncHordStream::connect(IP, PORT, &HordConfig::default()).expect("connect");
+            assert!(s.split_mode_negotiated(), "client: split mode not negotiated");
+            let buf = s.register_remote_writable(CHUNK).expect("register dest");
+            let req = RdmaWriteReq {
+                addr: buf.as_mut_ptr() as u64,
+                rkey: buf.rkey(),
+                len: buf.len() as u64,
+                id: None,
+            };
+            s.write_all(format!("{}\n", req.header_value()).as_bytes())
+                .await
+                .expect("write request");
+            s.flush().await.expect("flush request");
+            // Deliberately never read / never drain the data plane. Just stay alive.
+            let _ = release_rx.await;
+            drop(buf);
+            drop(s);
+        });
+    });
+
+    // Wait until the server is actively writing, then give it a moment to fill the
+    // credit window and wedge before we shut down — so the abort genuinely lands
+    // on a task parked mid-write.
+    writing_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("server never reached the write phase");
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Fire shutdown and time how long the drain+abort takes to return.
+    let t0 = Instant::now();
+    shutdown.send(true).expect("send shutdown");
+    listener_thread.join().expect("listener thread panicked (torn teardown?)");
+    let elapsed = t0.elapsed();
+
+    // Release the client and join it (no assertion needed — it must not have
+    // crashed when the server tore its QP out from under the in-flight write).
+    let _ = release_tx.send(());
+    client_thread.join().expect("client thread panicked");
+
+    // The wedged task could only end via the grace-timeout abort, so serve() must
+    // have paid ~GRACE — proving the abort path (not a clean drain) executed —
+    // and must still be bounded (no hang from a teardown that blocked).
+    assert!(
+        elapsed >= GRACE.saturating_sub(Duration::from_millis(500)),
+        "serve() returned in {elapsed:?}, well under the {GRACE:?} grace — the task wasn't \
+         wedged mid-write, so this didn't exercise the abort path",
+    );
+    assert!(
+        elapsed < GRACE + SLACK,
+        "serve() took {elapsed:?} (> {GRACE:?} + {SLACK:?}) — the mid-write teardown hung",
+    );
 }

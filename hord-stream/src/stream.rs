@@ -1451,6 +1451,50 @@ impl HordStream {
     pub fn check_disconnect(&self) -> io::Result<bool> {
         self.conn.check_disconnect()
     }
+
+    /// A detached handle that can force this connection's NIC resources down
+    /// (destroy the QP) out-of-band — independently of the stream's own [`Drop`].
+    ///
+    /// It exists for one purpose: a server runtime that may **abandon** (abort) a
+    /// connection task while it is parked mid-`RDMA_WRITE`. On the normal path the
+    /// write driver ([`rdma_write_all`](Self::rdma_write_all) /
+    /// `poll_rdma_write`) drains every posted write before returning, so by the
+    /// time a caller drops a source [`RegisteredBuffer`] no work request still
+    /// references it. Aborting the task bypasses that drain: the future is dropped
+    /// with a write WR still posted, and the source buffer it owns is freed (MR
+    /// deregistered, storage released) **while the QP can still DMA-read it** — a
+    /// use-after-free. Calling [`force_teardown`](ConnTeardown::force_teardown)
+    /// *before* the task (and its buffers) drop destroys the QP first, quiescing
+    /// the NIC, so the subsequent buffer frees are sound. Generalises to
+    /// externally-registered MRs (caller-owned pages) for the same reason.
+    pub fn teardown_handle(&self) -> ConnTeardown {
+        ConnTeardown {
+            conn: Arc::clone(&self.conn),
+        }
+    }
+}
+
+/// A cheap, owned handle to force a connection's QP teardown out-of-band — see
+/// [`HordStream::teardown_handle`] for why it exists. Holds an `Arc<Connection>`
+/// so the connection (and its CQ/PD, needed to deregister MRs afterward) stays
+/// alive until the handle is dropped; it does **not** keep the QP itself alive
+/// (the QP lives behind the connection's own `RefCell<Option<_>>` and is taken on
+/// teardown).
+pub struct ConnTeardown {
+    conn: Arc<Connection>,
+}
+
+impl ConnTeardown {
+    /// Synchronously destroy the connection's QP (idempotent). After this returns
+    /// the NIC will not DMA against any buffer registered on the connection, so it
+    /// is safe to free or deregister source buffers even if an RDMA write was
+    /// still outstanding when the owning task was abandoned. Safe to call from off
+    /// the connection's driving task as long as that task is not concurrently
+    /// mid-poll (the single-threaded worker upholds this: it tears down between
+    /// polls, never during one).
+    pub fn force_teardown(&self) {
+        self.conn.shutdown();
+    }
 }
 
 impl Read for HordStream {

@@ -147,6 +147,17 @@ impl AsyncHordStream {
         self.stream.disconnect();
     }
 
+    /// A handle that can force this connection's QP down out-of-band, making the
+    /// NIC quiescent so source buffers can be freed safely. See
+    /// [`HordStream::teardown_handle`]. [`HordListener`] takes one per connection
+    /// so that, if it must *abort* a task parked mid-`RDMA_WRITE` at the grace
+    /// deadline, it can quiesce the NIC before the aborted future frees a source
+    /// buffer the QP still references — closing the use-after-free that task abort
+    /// would otherwise open.
+    pub fn teardown_handle(&self) -> hord_stream::ConnTeardown {
+        self.stream.teardown_handle()
+    }
+
     // ---- zero-copy extension (spec §7) -------------------------------------
 
     /// Whether the zero-copy extension was negotiated on this connection.

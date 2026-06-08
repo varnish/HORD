@@ -11,7 +11,7 @@ pub mod envelope;
 pub mod handshake;
 mod stream;
 
-pub use stream::{HordConfig, HordStream};
+pub use stream::{ConnTeardown, HordConfig, HordStream};
 
 // Re-export the transport handle types so callers only need this crate.
 pub use hord_core::{is_device_removed, Connection, DeviceRemoved, Listener, RegisteredBuffer};

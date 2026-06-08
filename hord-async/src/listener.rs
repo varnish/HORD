@@ -101,6 +101,7 @@
 //! stall a worker's other connections. The seam to do so is local to the worker
 //! loop.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -108,8 +109,9 @@ use std::time::Duration;
 
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, watch};
+use tokio::task::{Id, JoinError, JoinSet};
 
-use hord_stream::{is_device_removed, Connection, HordConfig, HordStream, Listener};
+use hord_stream::{is_device_removed, ConnTeardown, Connection, HordConfig, HordStream, Listener};
 
 // `ReactorFd` (crate root) is the shared "raw fd owned elsewhere; drop deregisters
 // but does not close" AsyncFd wrapper — reused here for the listener's CM fd.
@@ -469,6 +471,20 @@ fn run_worker<F, Fut>(
 /// finish, bounded by `grace`. Driven inside `LocalSet::run_until`, so the spawned
 /// tasks make progress while this loop awaits them — the drain wall-clock is the
 /// slowest connection, not the sum.
+///
+/// ## Why the per-task teardown map
+///
+/// At the grace deadline the worker must abandon any still-running task (the
+/// `tasks` `JoinSet` is dropped, aborting them). A task parked inside an
+/// `RDMA_WRITE` — the documented back-pressure case, a slow/non-reading peer —
+/// holds a posted-but-unreaped write WR against a source buffer it also owns.
+/// Abort drops that future, freeing the source buffer (deregistering its MR and
+/// releasing its storage) **while the QP can still DMA-read it** — a
+/// use-after-free / torn delivery. The normal write driver drains every posted
+/// WR before returning precisely to prevent this; task abort bypasses it. So the
+/// worker keeps a [`ConnTeardown`] per live task and, *before* dropping the
+/// `JoinSet`, forces every in-flight connection's QP down — quiescing the NIC so
+/// the aborted futures' buffer frees are sound.
 async fn worker_loop<F, Fut>(
     mut rx: mpsc::UnboundedReceiver<Accepted>,
     mut serve_fn: F,
@@ -480,18 +496,25 @@ async fn worker_loop<F, Fut>(
 {
     // A JoinSet reaps finished connection tasks in O(1) per task (no per-accept
     // scan of a handle Vec) and surfaces a handler panic instead of swallowing it.
-    let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    let mut tasks: JoinSet<()> = JoinSet::new();
+    // One QP-teardown handle per live task, keyed by task id. Pruned as tasks
+    // finish (so it never pins a dead connection's resources); drained on a
+    // grace-timeout abort to quiesce the NIC first (see the fn docs above).
+    let mut teardowns: HashMap<Id, ConnTeardown> = HashMap::new();
+
     while let Some((conn, peer)) = rx.recv().await {
         // Reap any connection tasks that have finished since the last accept.
-        while let Some(res) = tasks.try_join_next() {
-            log_task_result(res);
-        }
+        reap_finished(&mut tasks, &mut teardowns);
         // Build the !Send stream on this worker thread — the handshake runs here
         // (see the type's "synchronous handshake" caveat). On failure, drop the
         // connection and keep serving the rest.
         match AsyncHordStream::from_accepted(conn, &config) {
             Ok(stream) => {
-                tasks.spawn_local(serve_fn(stream, peer));
+                // Grab the teardown handle *before* moving the stream into the
+                // service future, and key it by the spawned task's id.
+                let teardown = stream.teardown_handle();
+                let handle = tasks.spawn_local(serve_fn(stream, peer));
+                teardowns.insert(handle.id(), teardown);
             }
             Err(e) => log::warn!("hord: handshake failed for {peer}: {e}"),
         }
@@ -499,25 +522,51 @@ async fn worker_loop<F, Fut>(
 
     // Channel closed → shutdown. Let in-flight connections finish, bounded by
     // `grace`; they run concurrently on this LocalSet (driven by the enclosing
-    // `run_until`), so the wall-clock is the slowest one, not the sum. On timeout
-    // `tasks` drops, aborting anything still running.
+    // `run_until`), so the wall-clock is the slowest one, not the sum. Pruning
+    // the map as tasks complete keeps it tracking only still-running connections.
     let drain = async {
-        while let Some(res) = tasks.join_next().await {
-            log_task_result(res);
+        while let Some(res) = tasks.join_next_with_id().await {
+            reap_one(res, &mut teardowns);
         }
     };
     if tokio::time::timeout(grace, drain).await.is_err() {
         log::warn!("hord: graceful drain timed out after {grace:?}; abandoning in-flight connections");
+        // The drain timed out and `tasks` is about to be dropped, aborting every
+        // survivor. Force each in-flight connection's QP down FIRST so the NIC is
+        // quiescent before the aborted futures free the source buffers their
+        // outstanding writes reference (the use-after-free this map exists to
+        // close). QP teardown is idempotent, so any entry whose task finished
+        // during the drain (but wasn't pruned) is a harmless no-op.
+        for teardown in teardowns.values() {
+            teardown.force_teardown();
+        }
+    }
+    // `tasks` drops here, aborting any survivors — now sound: their QPs are gone,
+    // so freeing their buffers cannot race the NIC.
+}
+
+/// Drain every connection task that has already finished, pruning its teardown
+/// handle. Non-blocking: stops at the first task still running.
+fn reap_finished(tasks: &mut JoinSet<()>, teardowns: &mut HashMap<Id, ConnTeardown>) {
+    while let Some(res) = tasks.try_join_next_with_id() {
+        reap_one(res, teardowns);
     }
 }
 
-/// Log a connection task's join result, surfacing a panic (which a bare
-/// `let _ = handle.await` would have swallowed) rather than letting it vanish.
-/// A cancellation (abort at the grace-timeout / `JoinSet` drop) is expected.
-fn log_task_result(res: Result<(), tokio::task::JoinError>) {
-    if let Err(e) = res {
-        if e.is_panic() {
-            log::error!("hord: connection task panicked: {e}");
+/// Handle one finished task's join result: drop its teardown handle (the
+/// connection is gone, so the NIC no longer references its buffers) and surface a
+/// panic, which a bare `let _ = ...` would have swallowed. A cancellation (abort
+/// at the grace deadline) is expected and silent.
+fn reap_one(res: Result<(Id, ()), JoinError>, teardowns: &mut HashMap<Id, ConnTeardown>) {
+    match res {
+        Ok((id, ())) => {
+            teardowns.remove(&id);
+        }
+        Err(e) => {
+            teardowns.remove(&e.id());
+            if e.is_panic() {
+                log::error!("hord: connection task panicked: {e}");
+            }
         }
     }
 }
