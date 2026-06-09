@@ -1596,6 +1596,73 @@ impl HordStream {
         Ok(wr_count)
     }
 
+    /// Plan the next *batch* of an over-cap scatter-gather write: starting at the
+    /// front of `segments`, how many leading segments pack into at most `wr_budget`
+    /// work requests (using [`plan_gather`](Self::plan_gather)'s two caps —
+    /// `max_sge` SGEs and [`WRITE_WR_MAX`] bytes per WR), returning that prefix's
+    /// `(segment_count, byte_length)`. A heavily fragmented source whose whole WR
+    /// count exceeds the send pool is delivered in several drained batches, each cut
+    /// at a segment boundary; this picks each cut. Pure arithmetic (no posting, no
+    /// pointer deref), mirroring the packer exactly so a batch re-planned by
+    /// `begin_rdma_write_gather_inner` produces the same WR count this counted.
+    ///
+    /// Always returns `segment_count >= 1` for a non-empty `segments` (even if the
+    /// first segment alone needs more than `wr_budget` WRs — i.e. a single span over
+    /// `wr_budget * WRITE_WR_MAX` bytes — so the caller makes progress; that lone
+    /// segment then surfaces its own over-cap `InvalidInput`, never a silent hang).
+    fn next_batch_len(segments: &[WriteSegment<'_>], max_sge: usize, wr_budget: usize) -> (usize, u64) {
+        let max_sge = max_sge.clamp(1, MAX_WRITE_SGE);
+        let budget = wr_budget.max(1);
+        let mut n_sge = 0usize; // SGEs in the in-progress WR
+        let mut wr_bytes = 0u64; // bytes in the in-progress WR
+        let mut wr_count = 0usize; // flushed WRs so far
+        let mut bytes = 0u64; // cumulative bytes over all segments walked
+        let mut fit_segs = 0usize; // segments that fit so far (exclusive prefix len)
+        let mut fit_bytes = 0u64;
+        for seg in segments {
+            // Pack this segment exactly as `plan_gather` would (flush on either cap).
+            let mut seg_off = 0usize;
+            while seg_off < seg.len {
+                if n_sge == max_sge || wr_bytes >= WRITE_WR_MAX as u64 {
+                    wr_count += 1;
+                    n_sge = 0;
+                    wr_bytes = 0;
+                }
+                let take = ((seg.len - seg_off) as u64).min(WRITE_WR_MAX as u64 - wr_bytes);
+                n_sge += 1;
+                wr_bytes += take;
+                seg_off += take as usize;
+            }
+            bytes += seg.len as u64;
+            // WRs if the batch were sealed right after this segment (flush the partial).
+            let sealed = wr_count + usize::from(n_sge > 0);
+            if sealed <= budget {
+                fit_segs += 1;
+                fit_bytes = bytes;
+            } else {
+                break;
+            }
+        }
+        if fit_segs == 0 {
+            // The first segment alone exceeds the budget: take it alone so the caller
+            // advances and `begin_rdma_write_gather_inner` reports its over-cap error.
+            (1, segments[0].len as u64)
+        } else {
+            (fit_segs, fit_bytes)
+        }
+    }
+
+    /// Plan the next over-cap gather batch starting at segment `from` (a `&self`
+    /// wrapper over [`next_batch_len`](Self::next_batch_len) bound to this stream's
+    /// send pool and QP `max_send_sge`). The blocking
+    /// [`rdma_write_gather_all`](Self::rdma_write_gather_all) and the async
+    /// `rdma_write_gather` both step through an over-cap gather with this, draining
+    /// each `(segment_count, byte_length)` batch before posting the next so a source
+    /// fragmented past the one-shot send-queue limit is still delivered in full.
+    pub fn next_gather_batch(&self, segments: &[WriteSegment<'_>], from: usize) -> (usize, u64) {
+        Self::next_batch_len(&segments[from..], self.conn.max_send_sge(), self.send_pool)
+    }
+
     /// Shared driver behind the public scatter-gather write entry points: lay
     /// `segments` down contiguously into the peer's `[peer_addr, peer_addr+total)`
     /// (`total` = sum of segment lengths), packing them into WRs (spec §7,
@@ -1693,13 +1760,17 @@ impl HordStream {
     /// are reaped — which the blocking
     /// [`rdma_write_gather_all`](Self::rdma_write_gather_all) does before returning.
     ///
-    /// **Capacity.** The whole gather must fit the send queue at once: it needs
-    /// `ceil(total_segments / max_send_sge)` WRs (plus byte-cap splits for any
-    /// segment over [`WRITE_WR_MAX`]), and if that exceeds the send pool the call
-    /// fails with `InvalidInput` (a caller error, *not* retryable back-pressure). So
-    /// the practical fragment ceiling is `send_pool * `[`max_send_sge`](Self::max_send_sge)
-    /// (defaults: 16 × ≤16). A source fragmented beyond that must be delivered in
-    /// several gather calls (drain between them), or coalesced first.
+    /// **Capacity.** This *non-blocking* entry posts the whole gather at once, so it
+    /// must fit the send queue: it needs `ceil(total_segments / max_send_sge)` WRs
+    /// (plus byte-cap splits for any segment over [`WRITE_WR_MAX`]), and if that
+    /// exceeds the send pool the call fails with `InvalidInput` (a caller error, *not*
+    /// retryable back-pressure) — it can't drain to make room without blocking. The
+    /// practical one-shot fragment ceiling is `send_pool *
+    /// `[`max_send_sge`](Self::max_send_sge) (defaults: 16 × ≤16). The *blocking*
+    /// [`rdma_write_gather_all`](Self::rdma_write_gather_all) (and the async
+    /// `rdma_write_gather`) lift this: they split an over-cap source into drained
+    /// batches automatically. A direct caller of this entry must instead deliver a
+    /// larger source in several gather calls (drain between), or coalesce it first.
     pub fn begin_rdma_write_gather(
         &mut self,
         segments: &[WriteSegment<'_>],
@@ -1779,7 +1850,32 @@ impl HordStream {
         peer_rkey: u32,
         imm: Option<u32>,
     ) -> io::Result<()> {
-        self.drive_write_all(|s| s.begin_rdma_write_gather_inner(segments, peer_addr, peer_rkey, imm))
+        // Deliver in send-pool-sized batches, draining between, so a source whose WR
+        // count exceeds the send queue (a heavily fragmented gather, > `send_pool *
+        // max_send_sge` fragments) is delivered in several passes rather than rejected.
+        // The common case — the whole gather fits — is a single batch == the original
+        // one-shot path. The immediate rides the final WR of the *final* batch.
+        if segments.is_empty() {
+            // Empty gather: one pass (imm-only WR if `imm` is Some, else a no-op).
+            return self.drive_write_all(|s| {
+                s.begin_rdma_write_gather_inner(&[], peer_addr, peer_rkey, imm)
+            });
+        }
+        let mut start = 0usize;
+        let mut base = 0u64; // remote byte offset of the current batch
+        while start < segments.len() {
+            let (n, n_bytes) = self.next_gather_batch(segments, start);
+            let end = start + n;
+            let batch_imm = if end == segments.len() { imm } else { None };
+            let batch = &segments[start..end];
+            let addr = peer_addr + base;
+            self.drive_write_all(|s| {
+                s.begin_rdma_write_gather_inner(batch, addr, peer_rkey, batch_imm)
+            })?;
+            start = end;
+            base += n_bytes;
+        }
+        Ok(())
     }
 
     /// Blocking scatter-gather write (spec §7, Milestone 3): post the gather and
@@ -1790,6 +1886,15 @@ impl HordStream {
     /// the stream and returns an error (§7.4: never report `complete` on a partial
     /// write). The `segments` borrow keeps the source regions alive for the whole
     /// call; on return no DMA references them, so they may be dropped.
+    ///
+    /// **Over-cap sources are batched.** Unlike the non-blocking
+    /// [`begin_rdma_write_gather`](Self::begin_rdma_write_gather), a source whose WR
+    /// count exceeds the send pool (more than `send_pool *
+    /// `[`max_send_sge`](Self::max_send_sge) fragments) is delivered in several
+    /// send-pool-sized batches, draining between — so heavy fragmentation is not a
+    /// caller error here. (A *single* segment over `send_pool * `[`WRITE_WR_MAX`]
+    /// bytes — ~16 GiB by default — still can't be split across batches and surfaces
+    /// `InvalidInput`.)
     pub fn rdma_write_gather_all(
         &mut self,
         segments: &[WriteSegment<'_>],
@@ -2916,6 +3021,92 @@ mod gather_tests {
         server.join().expect("server thread panicked");
     }
 
+    /// An **over-cap** gather — more WRs than the send pool holds — is delivered in
+    /// several drained batches by the blocking facade (deferral 1) rather than
+    /// rejected with `InvalidInput`. A small `send_pool` (2) forces batching for the
+    /// 40-fragment source. Split mode rides the immediate on the final WR of the
+    /// *final* batch, so the client must observe the transfer ID *and* find every
+    /// fragment landed contiguously — if the immediate had ridden an earlier batch,
+    /// the later fragments would not yet be present when the ID surfaced (§7.7.2).
+    #[test]
+    #[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+    fn over_cap_gather_batches_and_lands_contiguously() {
+        use std::sync::{Arc, Barrier};
+        const PORT_BATCH: u16 = 18531; // distinct from the plain gather test (18530)
+        const TRANSFER_ID: u32 = 0x7E57_1D00;
+
+        // send_pool below the gather's WR count -> forces batching.
+        let config = HordConfig { send_pool_size: 2, ..HordConfig::default() };
+
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (desc_tx, desc_rx) = mpsc::channel::<(u64, u32)>();
+        let teardown = Arc::new(Barrier::new(2));
+
+        let srv_config = config.clone();
+        let srv_teardown = Arc::clone(&teardown);
+        let server = std::thread::spawn(move || {
+            let listener = Listener::bind(IP, PORT_BATCH).expect("bind");
+            ready_tx.send(()).expect("ready");
+            let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
+            assert!(s.split_mode_negotiated(), "server: split mode should negotiate");
+            // The gather must exceed the send pool, else nothing would batch.
+            let n_wrs = N_SEG.div_ceil(s.max_send_sge());
+            assert!(
+                n_wrs > srv_config.send_pool_size,
+                "gather of {n_wrs} WRs must exceed send_pool {} to exercise batching",
+                srv_config.send_pool_size,
+            );
+
+            // One contiguous source MR, sliced into N_SEG separate segments (each its
+            // own SGE) — the fragmentation that forces multi-WR, multi-batch packing.
+            let src = s.register_source(TOTAL).expect("register src");
+            let mut whole = vec![0u8; TOTAL];
+            for (i, b) in whole.iter_mut().enumerate() {
+                *b = pattern_byte(i);
+            }
+            src.copy_in(0, &whole);
+            let segments: Vec<WriteSegment> = (0..N_SEG)
+                .map(|k| WriteSegment::from_registered(&src, k * SEG_LEN, SEG_LEN))
+                .collect();
+
+            let (addr, rkey) = desc_rx.recv().expect("recv descriptor");
+            s.rdma_write_gather_all_with_imm(&segments, addr, rkey, TRANSFER_ID)
+                .expect("over-cap gather with imm");
+            srv_teardown.wait();
+            drop(segments);
+            drop(src);
+        });
+
+        ready_rx.recv().expect("server ready");
+        let mut client = HordStream::connect(IP, PORT_BATCH, &config).expect("connect");
+        assert!(client.split_mode_negotiated(), "client: split mode should negotiate");
+        let buf = client.register_remote_writable(TOTAL).expect("register dst");
+        desc_tx
+            .send((buf.as_mut_ptr() as u64, buf.rkey()))
+            .expect("send descriptor");
+
+        // One transfer ID for the whole over-cap gather (the immediate rides the
+        // final batch only). poll_completed_transfer busy-polls until a transfer
+        // completes or the connection closes (None).
+        let id = match client.poll_completed_transfer().expect("poll_completed_transfer") {
+            Some(id) => id,
+            None => panic!("connection closed before the transfer completed"),
+        };
+        assert_eq!(id, TRANSFER_ID, "unexpected transfer ID");
+
+        // Every fragment must have landed contiguously and in order.
+        let mut got = vec![0u8; TOTAL];
+        buf.copy_out(0, &mut got);
+        for (i, &b) in got.iter().enumerate() {
+            assert_eq!(b, pattern_byte(i), "payload mismatch at byte {i}");
+        }
+
+        teardown.wait();
+        drop(buf);
+        drop(client);
+        server.join().expect("server thread panicked");
+    }
+
     fn read_line<S: Read>(s: &mut S) -> String {
         let mut out = Vec::new();
         let mut b = [0u8; 1];
@@ -3022,5 +3213,92 @@ mod plan_gather_tests {
         // A degenerate max_sge must clamp to 1 (no divide-by-zero, no 0-SGE WR).
         let wrs = plan(&[seg(0x1000, 10), seg(0x2000, 10)], 0);
         assert_eq!(wrs, vec![(0, vec![(0x1000, 10)]), (10, vec![(0x2000, 10)])]);
+    }
+
+    // ---- next_batch_len: the over-cap batch planner (deferral 1) ---------------
+
+    /// Step [`HordStream::next_batch_len`] across all segments, returning each
+    /// batch's segment count. Asserts every batch makes progress (>= 1 segment), its
+    /// reported byte count equals the batch's actual segment-length sum, the batches
+    /// tile the whole source (segment counts and bytes both sum to the total), and —
+    /// the load-bearing property — every multi-segment batch re-planned by
+    /// `plan_gather` produces at most `budget` WRs (so `begin_rdma_write_gather_inner`
+    /// admits it). A lone over-budget segment is exempt (it's returned alone to make
+    /// progress and surfaces its own over-cap error).
+    fn batches(segments: &[WriteSegment<'_>], max_sge: usize, budget: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let (mut start, mut seen_bytes) = (0usize, 0u64);
+        while start < segments.len() {
+            let (n, nb) = HordStream::next_batch_len(&segments[start..], max_sge, budget);
+            assert!(n >= 1, "a batch must consume at least one segment");
+            let batch = &segments[start..start + n];
+            let want: u64 = batch.iter().map(|s| s.len() as u64).sum();
+            assert_eq!(nb, want, "reported batch bytes must equal the segment-length sum");
+            let wrs = HordStream::plan_gather(batch, max_sge, |_, _| Ok(())).expect("plan");
+            if n > 1 {
+                assert!(wrs <= budget, "batch of {n} segs packs {wrs} WRs > budget {budget}");
+            }
+            out.push(n);
+            seen_bytes += nb;
+            start += n;
+        }
+        let total: u64 = segments.iter().map(|s| s.len() as u64).sum();
+        assert_eq!(seen_bytes, total, "batches must tile every byte exactly");
+        out
+    }
+
+    #[test]
+    fn batch_whole_gather_fits_in_one() {
+        // Four small segments, budget 16 WRs of 16 SGEs each: one batch, all of it.
+        let segs: Vec<_> = (0..4).map(|i| seg(0x1000 * (i + 1), 100)).collect();
+        assert_eq!(batches(&segs, 16, 16), vec![4]);
+    }
+
+    #[test]
+    fn batch_cuts_at_sge_count_boundary() {
+        // max_sge 2, budget 2 WRs => 4 SGEs per batch. 10 one-SGE segments tile as
+        // [4, 4, 2]; each full batch is exactly 2 WRs (== budget).
+        let segs: Vec<_> = (0..10).map(|i| seg(0x1000 * (i + 1), 50)).collect();
+        assert_eq!(batches(&segs, 2, 2), vec![4, 4, 2]);
+    }
+
+    #[test]
+    fn batch_one_wr_budget_is_one_wr_of_max_sge_segments() {
+        // budget 1 WR, max_sge 16 => 16 segments per batch. 17 segments => [16, 1].
+        let segs: Vec<_> = (0..17).map(|i| seg(0x1000 * (i + 1), 8)).collect();
+        assert_eq!(batches(&segs, 16, 1), vec![16, 1]);
+    }
+
+    #[test]
+    fn batch_byte_cap_splits_count_toward_budget() {
+        // Each segment is one full WR by the byte cap, so budget 2 packs 2 segments
+        // per batch regardless of max_sge. 5 such segments tile as [2, 2, 1].
+        let cap = WRITE_WR_MAX;
+        let segs: Vec<_> = (0..5).map(|i| seg(0x1_0000_0000 + i as u64 * cap as u64, cap)).collect();
+        assert_eq!(batches(&segs, 16, 2), vec![2, 2, 1]);
+    }
+
+    #[test]
+    fn batch_giant_single_segment_is_returned_alone() {
+        // A single segment needing more than `budget` WRs (here > 2 * WRITE_WR_MAX)
+        // can't be split at a segment boundary: it is returned alone so the caller
+        // advances and `begin` surfaces its own over-cap InvalidInput.
+        let giant = 2 * WRITE_WR_MAX + 1; // 3 WRs by the byte cap, budget is 2
+        let (n, nb) = HordStream::next_batch_len(&[seg(0x4000_0000, giant)], 16, 2);
+        assert_eq!((n, nb), (1, giant as u64));
+    }
+
+    #[test]
+    fn batch_all_zero_length_in_one_empty_batch() {
+        // Zero-length segments add no WRs, so any budget swallows them all at once.
+        let segs = [seg(0x1000, 0), seg(0x2000, 0), seg(0x3000, 0)];
+        assert_eq!(batches(&segs, 16, 1), vec![3]);
+    }
+
+    #[test]
+    fn batch_exactly_budget_wrs_is_one_batch() {
+        // 32 one-SGE segments, max_sge 16, budget 2 => exactly 2 WRs => one batch.
+        let segs: Vec<_> = (0..32).map(|i| seg(0x1000 * (i + 1), 10)).collect();
+        assert_eq!(batches(&segs, 16, 2), vec![32]);
     }
 }

@@ -113,11 +113,19 @@ supported path:
       `imm.to_be()` endianness encoding lives in exactly one place (the cross-referencing
       comments are gone). Verified by `hord-core/tests/rdma_write_smoke.rs` over `rxe0`.
 
-- [ ] **Batch a scatter-gather write that exceeds the send-pool cap.** A source
-      fragmented into more than `send_pool * max_send_sge` segments (defaults: 16 × ≤16
-      = 256) currently fails with a non-retryable `InvalidInput` rather than being
-      delivered in several drained batches. Documented on the gather entry points for
-      now; batching is the real fix when an MSE4 workload proves it necessary.
+- [x] **Batch a scatter-gather write that exceeds the send-pool cap.** Done. The
+      blocking `rdma_write_gather_all` and the async `rdma_write_gather` now split a
+      source whose WR count exceeds the send pool (more than `send_pool * max_send_sge`
+      fragments) into consecutive send-pool-sized batches, draining each before posting
+      the next, with the immediate riding the final WR of the *final* batch. A new
+      `next_batch_len` planner (device-free unit tests in `plan_gather_tests`) cuts each
+      batch at a segment boundary ≤ the pool's WR budget. The *non-blocking*
+      `begin_rdma_write_gather` still returns `InvalidInput` over-cap (it can't drain
+      without blocking), and a *single* segment over `send_pool * WRITE_WR_MAX` bytes
+      (~16 GiB) still can't be split across batches — both documented on the entry
+      points. Verified on rxe0: `over_cap_gather_batches_and_lands_contiguously`
+      (hord-stream, split-mode imm) and `over_cap_async_gather_batches_and_lands_contiguously`
+      (hord-async), both with `send_pool = 2`.
 
 - [x] **An imm-only (zero-SGE) write-with-immediate primitive.** Done. `post_write_gather`
       now accepts an empty `sg_list` when `imm` is `Some` (verbs permits `num_sge == 0`

@@ -384,3 +384,100 @@ fn gather_write_lands_fragments_contiguously() {
 
     server.join().expect("server thread panicked");
 }
+
+/// An **over-cap** async gather — more WRs than the send pool holds — is delivered
+/// in several drained batches by the async driver (deferral 1: the async
+/// counterpart of `HordStream::rdma_write_gather_all`'s batching), rather than
+/// rejected with `InvalidInput`. A small `send_pool` (2) forces batching for the
+/// 24-fragment source; the client verifies every fragment landed contiguously, so
+/// the per-batch post→drain→advance loop is exercised end to end.
+#[test]
+#[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+fn over_cap_async_gather_batches_and_lands_contiguously() {
+    const PORT_BATCH: u16 = 18824; // distinct from the plain gather test (18823)
+    const SEG: usize = 256 * 1024; // per-fragment size
+    // 40 fragments => >=3 WRs for any max_send_sge in 1..=16, comfortably above the
+    // send_pool of 2 below, so the gather always spans several drained batches.
+    const N: usize = 40;
+    const TOTAL: usize = SEG * N; // 10 MiB contiguous object
+    // send_pool below the gather's WR count -> forces batching.
+    let config = HordConfig { send_pool_size: 2, ..HordConfig::default() };
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+
+    let srv_config = config.clone();
+    let server = std::thread::spawn(move || {
+        let listener = Listener::bind(IP, PORT_BATCH).expect("bind");
+        ready_tx.send(()).expect("signal ready");
+        let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
+        current_thread_rt().block_on(async move {
+            let stream = AsyncHordStream::from_accepted(conn, &srv_config).expect("accept");
+            let mut shared = SharedAsyncStream::new(stream);
+            let n_wrs = N.div_ceil(shared.max_send_sge());
+            assert!(
+                n_wrs > srv_config.send_pool_size,
+                "gather of {n_wrs} WRs must exceed send_pool {} to exercise batching",
+                srv_config.send_pool_size,
+            );
+
+            // One caller-owned allocation sliced into N separate segments (each its
+            // own SGE) — the fragmentation that forces multi-WR, multi-batch packing.
+            // Kept alive until the gather drains every WR of every batch.
+            let mut whole = vec![0u8; TOTAL];
+            for (i, b) in whole.iter_mut().enumerate() {
+                *b = pattern_byte(i);
+            }
+            // SAFETY: `whole` stays live until after the gather completes below.
+            let mr = unsafe { shared.register_external(whole.as_mut_ptr(), whole.len()) }
+                .expect("reg ext");
+            let segments: Vec<WriteSegment> =
+                (0..N).map(|k| WriteSegment::from_mr(&mr, k * SEG, SEG)).collect();
+
+            let req = RdmaWriteReq::parse(&read_line(&mut shared).await).expect("parse request");
+            shared
+                .rdma_write_gather(&segments, req.addr, req.rkey)
+                .await
+                .expect("over-cap rdma_write_gather");
+            let status = RdmaWriteStatus::Complete { bytes_written: TOTAL as u64 };
+            write_line(&mut shared, &status.header_value()).await;
+            drop(segments);
+            drop(mr);
+            drop(whole);
+            shared.disconnect();
+        });
+    });
+
+    ready_rx.recv().expect("server ready");
+    current_thread_rt().block_on(async move {
+        let mut s = AsyncHordStream::connect(IP, PORT_BATCH, &config).expect("connect");
+        let buf = s.register_remote_writable(TOTAL).expect("register dest");
+        let req = RdmaWriteReq {
+            addr: buf.as_mut_ptr() as u64,
+            rkey: buf.rkey(),
+            len: buf.len() as u64,
+            id: None,
+        };
+        write_line(&mut s, &req.header_value()).await;
+
+        let status = tokio::time::timeout(Duration::from_secs(30), read_line(&mut s))
+            .await
+            .expect("status read timed out");
+        assert_eq!(
+            RdmaWriteStatus::parse(&status),
+            Some(RdmaWriteStatus::Complete { bytes_written: TOTAL as u64 }),
+        );
+
+        // Every fragment must have landed contiguously, in order.
+        let mut tmp = vec![0u8; 256 * 1024];
+        let mut off = 0;
+        while off < TOTAL {
+            let take = tmp.len().min(TOTAL - off);
+            buf.copy_out(off, &mut tmp[..take]);
+            for (i, &got) in tmp[..take].iter().enumerate() {
+                assert_eq!(got, pattern_byte(off + i), "payload mismatch at byte {}", off + i);
+            }
+            off += take;
+        }
+    });
+
+    server.join().expect("server thread panicked");
+}

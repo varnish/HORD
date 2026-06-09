@@ -801,12 +801,19 @@ impl SharedAsyncStream {
     }
 
     /// Shared driver behind the four `rdma_write*` entry points (and, through the
-    /// `serve_*` methods, the policy path): build the [`PendingWrite`], arm the
-    /// [`WriteCancelGuard`], drive it to completion on the shared stream, then
+    /// `serve_*` methods, the policy path): arm the [`WriteCancelGuard`], drive the
+    /// write to completion on the shared stream in send-pool-sized batches, then
     /// disarm. Centralising it keeps the borrow-per-poll discipline and the
     /// use-after-free cancellation guard in exactly one place. `segments` is the
     /// gather list (a 1-element slice for the single-buffer callers); `imm` rides the
     /// final WR in split mode (§7.7).
+    ///
+    /// **Batching.** A source whose WR count exceeds the send queue (a heavily
+    /// fragmented gather, > `send_pool * max_send_sge` fragments) is split into
+    /// consecutive batches, each drained before the next is posted, so it is
+    /// delivered in full rather than rejected — the async counterpart of the
+    /// blocking [`HordStream::rdma_write_gather_all`]. The common case is one batch
+    /// (the whole gather); the immediate rides the final WR of the *final* batch.
     async fn drive_write(
         &self,
         segments: &[WriteSegment<'_>],
@@ -814,19 +821,49 @@ impl SharedAsyncStream {
         peer_rkey: u32,
         imm: Option<u32>,
     ) -> io::Result<()> {
+        // One reused `PendingWrite`, declared *before* `guard` so on cancellation the
+        // guard (NIC teardown) drops first and `w` (holding the segments borrow) last
+        // — the use-after-free ordering. It is reconfigured for each batch below.
         let mut w = PendingWrite {
-            segments,
+            segments: &segments[0..0],
             peer_addr,
             peer_rkey,
-            imm,
+            imm: None,
             post_outcome: None,
         };
-        // Declared after `w` so it drops *before* `w` on cancellation: the guard
-        // quiesces the NIC, then the segments borrow is released.
         let mut guard = WriteCancelGuard { stream: self, armed: true };
-        let r = std::future::poll_fn(|cx| self.0.borrow_mut().poll_rdma_write(cx, &mut w)).await;
-        // Completed (Ok or Err): poll_rdma_write drained every posted WR, so the NIC
-        // is idle — no teardown needed.
+        let r = async {
+            let mut start = 0usize;
+            let mut base = 0u64; // remote byte offset of the current batch
+            loop {
+                // Plan this batch: the whole gather when it fits, else the next
+                // send-pool-sized prefix. An empty gather still runs one pass
+                // (imm-only WR if `imm` is Some, else a no-op).
+                let (n, n_bytes) = if segments.is_empty() {
+                    (0, 0)
+                } else {
+                    self.0.borrow().stream.next_gather_batch(segments, start)
+                };
+                let end = start + n;
+                let is_last = segments.is_empty() || end == segments.len();
+                w.segments = if segments.is_empty() { &segments[0..0] } else { &segments[start..end] };
+                w.peer_addr = peer_addr + base;
+                w.imm = if is_last { imm } else { None };
+                w.post_outcome = None;
+                // poll_rdma_write posts this batch and drains every posted WR before
+                // resolving (the UAF guard holds per batch as it did for one write).
+                std::future::poll_fn(|cx| self.0.borrow_mut().poll_rdma_write(cx, &mut w)).await?;
+                if is_last {
+                    break;
+                }
+                start = end;
+                base += n_bytes;
+            }
+            Ok(())
+        }
+        .await;
+        // Completed (Ok or Err): poll_rdma_write drained every posted WR of the final
+        // batch, so the NIC is idle — no teardown needed.
         guard.armed = false;
         r
     }
