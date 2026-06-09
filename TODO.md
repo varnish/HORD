@@ -119,10 +119,12 @@ supported path:
       delivered in several drained batches. Documented on the gather entry points for
       now; batching is the real fix when an MSE4 workload proves it necessary.
 
-- [ ] **An imm-only (zero-SGE) write-with-immediate primitive.** An all-empty gather
-      with an immediate currently borrows `segments.first()`'s `(addr, lkey)` for a
-      0-length SGE, and an *empty* segment list with an immediate is an `InvalidInput`
-      rather than delivering the bare transfer ID. Verbs permits `num_sge == 0` for a
-      write-with-imm; a dedicated imm-only WR would make the immediate-as-signal case
-      stop masquerading as a degenerate data write. Niche; the current behavior is safe
-      (a returned error, no UB).
+- [x] **An imm-only (zero-SGE) write-with-immediate primitive.** Done. `post_write_gather`
+      now accepts an empty `sg_list` when `imm` is `Some` (verbs permits `num_sge == 0`
+      for a write-with-imm), so the all-empty gather branch posts a true imm-only WR
+      instead of borrowing `segments.first()`'s `(addr, lkey)` for a fake 0-length SGE.
+      A literally empty `segments` slice with an immediate now delivers the bare transfer
+      ID (was `InvalidInput`). Verified on rxe0: `rdma_write_imm_only_zero_sge`
+      (hord-core, confirms rxe honours `num_sge == 0`, byte_len 0, imm delivered) and
+      `split_mode_zero_length_body_delivers_imm` (hord-stream, empty-slice gather +
+      `len == 0` single-buffer, both deliver the imm end to end).

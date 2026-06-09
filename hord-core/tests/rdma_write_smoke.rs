@@ -254,3 +254,101 @@ fn rdma_write_with_imm_round_trip() {
     drop(rx);
     server.join().expect("server thread panicked");
 }
+
+/// Smoke test for the **imm-only** (zero-SGE) write-with-immediate
+/// ([`Connection::post_write_gather`] with an empty `sg_list`). Verbs permits
+/// `num_sge == 0` for a write-with-immediate: it writes zero bytes at the remote
+/// address and delivers the immediate to the peer's CQ. This is the §7.7 "deliver
+/// a bare transfer ID" signal — no payload, no source span. The test exists to
+/// confirm the Soft-RoCE (rxe) transport actually honours `num_sge == 0` here, so
+/// the stream layer can rely on it for an empty/all-zero-length split write.
+#[test]
+#[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+fn rdma_write_imm_only_zero_sge() {
+    const PORT_IMM0: u16 = 18525; // distinct from the other hord-core device tests (18520-18523)
+    const TRANSFER_ID: u32 = 0x3C_A5_5A_C3; // all four octets distinct
+
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (target_tx, target_rx) = mpsc::channel::<(u64, u32)>();
+    let teardown = Arc::new(Barrier::new(2));
+
+    let srv_teardown = Arc::clone(&teardown);
+    let server = std::thread::spawn(move || {
+        let listener = Listener::bind(IP, PORT_IMM0).expect("bind");
+        ready_tx.send(()).expect("signal ready");
+        let conn = listener.accept(4, 4, CmParams::default()).expect("accept");
+        let conn = Arc::new(conn);
+        conn.accept_finish().expect("accept_finish"); // -> RTS
+
+        let (raddr, rkey) = target_rx.recv().expect("recv target");
+        // No source buffer: an empty SGE list. The write lands zero bytes at the
+        // peer's region and delivers the transfer ID.
+        unsafe {
+            conn.post_write_gather(1, &[], raddr, rkey, Some(TRANSFER_ID))
+                .expect("post_write_gather (imm-only)");
+        }
+        // The sender reaps an ordinary RdmaWrite completion.
+        let start = Instant::now();
+        let wc = loop {
+            if let Some(wc) = conn.poll().expect("poll") {
+                break wc;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "imm-only write never completed (sender)"
+            );
+            std::hint::spin_loop();
+        };
+        assert!(wc.is_success(), "sender completion status {}", wc.status);
+        assert_eq!(wc.opcode, Opcode::RdmaWrite, "sender opcode");
+        assert_eq!(wc.wr_id, 1, "sender wr_id");
+
+        srv_teardown.wait();
+        conn.shutdown();
+    });
+
+    ready_rx.recv().expect("server ready");
+    let conn = Connection::connect(IP, PORT_IMM0, 4, 4, CmParams::default()).expect("connect");
+    let conn = Arc::new(conn);
+    // A small remote-writable region: the 0-byte write targets it (writing nothing)
+    // and the immediate consumes the posted recv.
+    let dst = conn
+        .register_buffer(64, ACCESS_LOCAL_WRITE | ACCESS_REMOTE_WRITE)
+        .expect("register dst");
+    unsafe {
+        conn.post_recv(7, dst.as_mut_ptr(), dst.len() as u32, dst.lkey())
+            .expect("post_recv");
+    }
+    conn.connect_finish().expect("connect_finish"); // -> RTS
+
+    target_tx
+        .send((dst.as_mut_ptr() as u64, dst.rkey()))
+        .expect("send target");
+
+    // The immediate must arrive on our CQ even though no payload was written.
+    let start = Instant::now();
+    let wc = loop {
+        if let Some(wc) = conn.poll().expect("poll") {
+            break wc;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "imm-only completion never arrived (receiver)"
+        );
+        std::hint::spin_loop();
+    };
+    assert!(wc.is_success(), "receiver completion status {}", wc.status);
+    assert_eq!(
+        wc.opcode,
+        Opcode::RecvRdmaWithImm,
+        "receiver opcode (expected RECV_RDMA_WITH_IMM)"
+    );
+    assert_eq!(wc.wr_id, 7, "consumed our posted recv WR");
+    assert_eq!(wc.imm_data, TRANSFER_ID, "transfer ID corrupted (0-SGE path)");
+    assert_eq!(wc.byte_len, 0, "imm-only write should land zero bytes");
+
+    teardown.wait();
+    conn.shutdown();
+    drop(dst);
+    server.join().expect("server thread panicked");
+}

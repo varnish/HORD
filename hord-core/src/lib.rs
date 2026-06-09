@@ -978,10 +978,13 @@ impl Connection {
     /// (§7.7), consuming one of the peer's posted receives; the local completion is
     /// still [`Opcode::RdmaWrite`]. Only valid once established (RTS).
     ///
-    /// `sg_list.len()` must be in `1..=`[`MAX_WRITE_SGE`] (and `<=` the QP's
+    /// `sg_list.len()` must be in `0..=`[`MAX_WRITE_SGE`] (and `<=` the QP's
     /// [`max_send_sge`](Self::max_send_sge)); splitting a longer gather list across
-    /// WRs is the stream layer's job. A zero-`length` SGE is allowed — an imm-only
-    /// empty write carries one.
+    /// WRs is the stream layer's job. An **empty** `sg_list` is allowed *only* with
+    /// `imm` `Some`: verbs permits `num_sge == 0` for a write-with-immediate, so this
+    /// posts a true imm-only WR that writes zero bytes at `remote_addr` and delivers
+    /// the immediate — the §7.7 "deliver a bare transfer ID" signal, no source span
+    /// to borrow. A 0-SGE *plain* write (no imm) would be a no-op WR and is rejected.
     ///
     /// # Safety
     /// Every `(addr, length)` in `sg_list` must reference live, registered local
@@ -996,9 +999,16 @@ impl Connection {
         imm: Option<u32>,
     ) -> io::Result<()> {
         assert!(
-            (1..=MAX_WRITE_SGE).contains(&sg_list.len()),
-            "post_write_gather: sg_list len {} out of 1..={MAX_WRITE_SGE}",
+            sg_list.len() <= MAX_WRITE_SGE,
+            "post_write_gather: sg_list len {} exceeds MAX_WRITE_SGE {MAX_WRITE_SGE}",
             sg_list.len(),
+        );
+        // An empty SGE list is only meaningful as an imm-only signal (num_sge == 0
+        // write-with-immediate). A plain 0-SGE write would post a no-op WR — a caller
+        // error — so reject it rather than silently consuming a send slot.
+        assert!(
+            !sg_list.is_empty() || imm.is_some(),
+            "post_write_gather: a 0-SGE write requires an immediate (imm-only signal)",
         );
         // Build the verbs SGE array on the stack (bounded by `MAX_WRITE_SGE`), so
         // there is no per-write heap allocation and the rdma-sys type stays out of

@@ -1624,25 +1624,18 @@ impl HordStream {
         }
         self.check_write_capacity(n_wrs, imm.is_some())?;
 
-        // All-empty gather + imm: emit one 0-length imm-only WR. Forming the
-        // (zero-length) SGE needs a valid registered (addr, lkey) — use the first
-        // segment's; with no segment at all there is nothing to reference, so it is
-        // a caller error (the immediate would never be sent) rather than a no-op.
+        // All-empty gather + imm (§7.7.4 step 2): no data SGEs to post, so emit one
+        // true imm-only WR (`num_sge == 0`) that writes zero bytes at `peer_addr` and
+        // delivers the transfer ID. There is no source span to borrow, so an empty
+        // `segments` slice is valid here — it delivers a bare transfer ID (it was
+        // once rejected; verbs permits the 0-SGE write-with-immediate).
         if n_data_wrs == 0 {
-            let Some(seg) = segments.first() else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "empty scatter-gather write with an immediate needs at least one segment",
-                ));
-            };
             let id = imm.expect("n_wrs == 1 with no data implies imm is Some");
-            let sge = [Sge { addr: seg.local_addr as u64, length: 0, lkey: seg.lkey }];
-            // SAFETY: `seg` borrows a live registered region (its `'a`); a 0-length
-            // SGE reads nothing; a bad rkey fails the WR -> QP error -> peer_closed,
-            // handled on the completion.
+            // SAFETY: a 0-SGE write reads no local memory; a bad/stale rkey fails the
+            // WR -> QP error -> peer_closed, handled on the completion.
             let r = unsafe {
                 self.conn
-                    .post_write_gather(imm_write_wr_id(0), &sge, peer_addr, peer_rkey, Some(id))
+                    .post_write_gather(imm_write_wr_id(0), &[], peer_addr, peer_rkey, Some(id))
             };
             if let Err(e) = r {
                 self.peer_closed = true;
@@ -1717,8 +1710,10 @@ impl HordStream {
     }
 
     /// Like [`begin_rdma_write_gather`](Self::begin_rdma_write_gather), but the
-    /// final WR is a write-with-immediate carrying `transfer_id` (§7.7). An empty
-    /// gather still delivers the immediate via one empty WR.
+    /// final WR is a write-with-immediate carrying `transfer_id` (§7.7). An empty or
+    /// all-zero-length gather still delivers the immediate via one imm-only WR
+    /// (`num_sge == 0`) — even a literally empty `segments` slice (a bare transfer ID,
+    /// no source).
     pub fn begin_rdma_write_gather_with_imm(
         &mut self,
         segments: &[WriteSegment<'_>],
@@ -2466,6 +2461,76 @@ mod split_tests {
 
         teardown.wait();
         drop(bufs);
+        drop(client);
+        server.join().expect("server thread panicked");
+    }
+
+    /// A zero-length split-mode body still delivers its transfer ID via a
+    /// `num_sge == 0` imm-only WR (§7.7.4 step 2) — exercised two ways that both
+    /// route through the all-empty gather branch: a literally empty `segments` slice
+    /// (a bare transfer ID, no source), and a single-buffer write with `len == 0`.
+    /// Neither lands any payload; the client must still reap each immediate on its CQ.
+    #[test]
+    #[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+    fn split_mode_zero_length_body_delivers_imm() {
+        const PORT_ZL: u16 = 18527; // distinct from the other in-crate device tests
+        const ID_EMPTY: u32 = 0xE0; // delivered by the empty-slice gather
+        const ID_ZEROLEN: u32 = 0xE1; // delivered by the len==0 single-buffer write
+
+        let config = HordConfig::default();
+        let teardown = Arc::new(Barrier::new(2));
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (desc_tx, desc_rx) = mpsc::channel::<(u64, u32)>();
+
+        let srv_config = config.clone();
+        let srv_teardown = Arc::clone(&teardown);
+        let server = std::thread::spawn(move || {
+            let listener = Listener::bind(IP, PORT_ZL).expect("bind");
+            ready_tx.send(()).expect("signal ready");
+            let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
+            assert!(s.split_mode_negotiated(), "server: split mode should negotiate");
+
+            // A non-empty source the len==0 write reads zero bytes from.
+            let src = s.register_source(8).expect("register src");
+            let (addr, rkey) = desc_rx.recv().expect("recv descriptor");
+
+            // Empty gather + imm: a bare transfer ID, no source span at all.
+            s.rdma_write_gather_all_with_imm(&[], addr, rkey, ID_EMPTY)
+                .expect("empty-slice gather with imm");
+            // Single-buffer, len == 0: routes through the same 0-SGE branch.
+            s.rdma_write_all_with_imm(&src, 0, addr, rkey, 0, ID_ZEROLEN)
+                .expect("zero-length single-buffer write with imm");
+
+            srv_teardown.wait();
+            drop(src);
+        });
+
+        ready_rx.recv().expect("server ready");
+        let mut client = HordStream::connect(IP, PORT_ZL, &config).expect("connect");
+        assert!(client.split_mode_negotiated(), "client: split mode should negotiate");
+
+        // A small remote-writable target; the 0-byte writes land nothing in it.
+        let buf = client.register_remote_writable(64).expect("register dst");
+        desc_tx
+            .send((buf.as_mut_ptr() as u64, buf.rkey()))
+            .expect("send descriptor");
+
+        // Both immediates must arrive on our CQ even though no payload was written.
+        let mut seen = std::collections::HashSet::new();
+        let start = Instant::now();
+        while seen.len() < 2 {
+            match client.poll_completed_transfer().expect("poll_completed_transfer") {
+                Some(id) => {
+                    assert!(id == ID_EMPTY || id == ID_ZEROLEN, "unexpected transfer ID {id}");
+                    assert!(seen.insert(id), "transfer {id} completed twice");
+                }
+                None => panic!("connection closed before both transfers completed"),
+            }
+            assert!(start.elapsed() < STALL, "zero-length transfers stalled");
+        }
+
+        teardown.wait();
+        drop(buf);
         drop(client);
         server.join().expect("server thread panicked");
     }
