@@ -1493,106 +1493,15 @@ impl HordStream {
         len: usize,
         imm: Option<u32>,
     ) -> io::Result<()> {
-        if self.peer_closed {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
-        }
-        assert!(
-            src_off.checked_add(len).is_some_and(|end| end <= src.len()),
-            "rdma write source range out of bounds",
-        );
-        // Each WR carries up to WRITE_WR_MAX bytes and occupies one send-queue
-        // entry. The send queue holds `send_pool + CTRL_SEND_SLOTS` WRs; writes
-        // share the `send_pool` data portion with in-flight data sends and any
-        // earlier in-flight writes, leaving the control slot reserved for credit
-        // returns. Bound the write against the data slots actually free *now* —
-        // `send_free` tracks free data slots, of which `writes_outstanding` are
-        // already taken by posted writes (writes don't draw from `send_free`). A
-        // zero-length split write still needs one slot for its imm-only WR.
-        let n_wrs = {
-            let data = len.div_ceil(WRITE_WR_MAX);
-            if imm.is_some() {
-                data.max(1)
-            } else {
-                data
-            }
-        };
-        // Admission: enough send-queue slots, and (for an imm) a transfer credit.
-        // Shared with the scatter-gather core so the slot/credit accounting — the
-        // delicate part — lives in exactly one place and can't drift.
-        self.check_write_capacity(n_wrs, imm.is_some())?;
-        let base = src.as_mut_ptr();
-        let lkey = src.lkey();
-        let mut off = 0usize;
-        let mut chunk = 0u64;
-        while off < len {
-            let n = (len - off).min(WRITE_WR_MAX);
-            let is_last = off + n == len;
-            // SAFETY: `[base+src_off+off, +n)` lies within `src`, which the caller
-            // keeps alive until the completion is reaped; the destination is
-            // authorized by the peer-supplied rkey. A bad/stale rkey fails the WR,
-            // transitioning the QP to error → `peer_closed` (handled on the
-            // completion). The src pointer is stable (the storage is boxed).
-            // The immediate rides the last WR (§7.7.4 step 2); tag it so its
-            // completion frees a transfer credit (`imm_outstanding`).
-            let posted_imm = imm.is_some() && is_last;
-            let r = unsafe {
-                match imm {
-                    Some(id) if is_last => self.conn.post_write_with_imm(
-                        imm_write_wr_id(chunk),
-                        base.add(src_off + off),
-                        n as u32,
-                        lkey,
-                        peer_addr + off as u64,
-                        peer_rkey,
-                        id,
-                    ),
-                    _ => self.conn.post_write(
-                        write_wr_id(chunk),
-                        base.add(src_off + off),
-                        n as u32,
-                        lkey,
-                        peer_addr + off as u64,
-                        peer_rkey,
-                    ),
-                }
-            };
-            if let Err(e) = r {
-                self.peer_closed = true;
-                return Err(e);
-            }
-            self.writes_outstanding += 1;
-            if posted_imm {
-                self.imm_outstanding += 1;
-            }
-            off += n;
-            chunk += 1;
-        }
-        // Zero-length split write: the loop posted nothing, so emit one empty
-        // write-with-immediate purely to deliver the transfer ID.
-        if len == 0 {
-            if let Some(id) = imm {
-                // SAFETY: a 0-byte SGE reads nothing from `src`; `base` is a valid
-                // registered pointer and the rkey contract is as above.
-                let r = unsafe {
-                    self.conn.post_write_with_imm(
-                        imm_write_wr_id(chunk),
-                        base.add(src_off),
-                        0,
-                        lkey,
-                        peer_addr,
-                        peer_rkey,
-                        id,
-                    )
-                };
-                if let Err(e) = r {
-                    self.peer_closed = true;
-                    return Err(e);
-                }
-                self.writes_outstanding += 1;
-                self.imm_outstanding += 1;
-            }
-        }
-        Ok(())
+        // A single contiguous source is just a 1-segment scatter-gather write, so it
+        // routes through the same WR-posting core as the gather path — no separate
+        // chunking loop to keep in sync. The gather core owns the `peer_closed`
+        // check, the `check_write_capacity` admission, the `WRITE_WR_MAX` chunking
+        // (`plan_gather` emits one 1-SGE WR per chunk), and the zero-length-body
+        // imm-only WR (an all-empty 1-segment gather). `from_registered` is
+        // bounds-checked, subsuming the old manual `assert!` on the source range.
+        let seg = WriteSegment::from_registered(src, src_off, len);
+        self.begin_rdma_write_gather_inner(&[seg], peer_addr, peer_rkey, imm)
     }
 
     /// Shared admission check for a one-sided write of `n_wrs` work requests

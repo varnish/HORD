@@ -936,15 +936,10 @@ impl Connection {
         remote_addr: u64,
         rkey: u32,
     ) -> io::Result<()> {
-        self.with_qp(|qp| {
-            let mut guard = qp.start_post_send();
-            let handle = guard
-                .construct_wr(wr_id, WorkRequestFlags::Signaled)
-                .setup_write(rkey, remote_addr);
-            // SAFETY: caller guarantees the local buffer outlives the completion.
-            handle.setup_sge(lkey, addr as u64, length);
-            guard.post().map_err(to_io)
-        })
+        let sge = [Sge { addr: addr as u64, length, lkey }];
+        // SAFETY: the caller upholds `post_write_gather`'s contract for this one span
+        // (live registered local memory, a valid peer rkey) — see this method's docs.
+        unsafe { self.post_write_gather(wr_id, &sge, remote_addr, rkey, None) }
     }
 
     /// Post a one-sided RDMA write-with-immediate (§7.7 protocol splitting):
@@ -968,21 +963,10 @@ impl Connection {
         rkey: u32,
         imm: u32,
     ) -> io::Result<()> {
-        self.with_qp(|qp| {
-            let mut guard = qp.start_post_send();
-            let handle = guard
-                .construct_wr(wr_id, WorkRequestFlags::Signaled)
-                // The verbs `imm_data` field is `__be32` (network byte order); the
-                // API does no conversion, so we send the big-endian form of the
-                // caller's host-order value. `poll` reverses it with `from_be`.
-                // On a same-endian peer pair `to_be`∘`from_be` is the identity
-                // (loopback unaffected); on a mixed-endian pair the wire carries
-                // canonical network order so the peer reads the right value.
-                .setup_write_imm(rkey, remote_addr, imm.to_be());
-            // SAFETY: caller guarantees the local buffer outlives the completion.
-            handle.setup_sge(lkey, addr as u64, length);
-            guard.post().map_err(to_io)
-        })
+        let sge = [Sge { addr: addr as u64, length, lkey }];
+        // SAFETY: same single-span contract as `post_write`. The host-order→`__be32`
+        // imm conversion lives solely in `post_write_gather` now.
+        unsafe { self.post_write_gather(wr_id, &sge, remote_addr, rkey, Some(imm)) }
     }
 
     /// Post a signaled one-sided RDMA write that **gathers** from multiple local
@@ -1031,8 +1015,14 @@ impl Connection {
         self.with_qp(|qp| {
             let mut guard = qp.start_post_send();
             let wr = guard.construct_wr(wr_id, WorkRequestFlags::Signaled);
-            // The imm rides the WR via write-with-immediate (big-endian on the wire,
-            // as in `post_write_with_imm`); a plain write otherwise.
+            // The imm rides the WR as write-with-immediate; a plain write otherwise.
+            // The verbs `imm_data` field is `__be32` (network byte order) and the API
+            // does no conversion, so send the big-endian form of the caller's
+            // host-order value. `poll` reverses it with `from_be`. On a same-endian
+            // peer pair `to_be`∘`from_be` is the identity (loopback unaffected); on a
+            // mixed-endian pair the wire carries canonical network order so the peer
+            // reads the right value. This is the sole site of the conversion — the
+            // single-SGE `post_write_with_imm` delegates here.
             let handle = match imm {
                 Some(id) => wr.setup_write_imm(rkey, remote_addr, id.to_be()),
                 None => wr.setup_write(rkey, remote_addr),
@@ -1052,7 +1042,7 @@ impl Connection {
                     // `imm_data` is only meaningful (and only valid to read) for
                     // a write-with-immediate receive completion. It arrives as
                     // `__be32` (network byte order); convert back to host order to
-                    // mirror the `to_be` in `post_write_with_imm`.
+                    // mirror the `to_be` in `post_write_gather`.
                     let imm_data = if opcode == Opcode::RecvRdmaWithImm {
                         u32::from_be(wc.imm_data())
                     } else {

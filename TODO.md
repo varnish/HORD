@@ -102,21 +102,16 @@ findings worth fixing. The following were consciously **deferred** — each touc
 proven RDMA-semantic code or is a pure optimization, and none is a live bug on the
 supported path:
 
-- [ ] **Unify the *sync* single-buffer transport path into the gather core.** The
-      async path already routes single-buffer writes through the gather core (a
-      1-segment list), but `hord-stream` still keeps `begin_rdma_write_inner` (with its
-      own `WRITE_WR_MAX` chunking and zero-length-imm WR) alongside
-      `begin_rdma_write_gather_inner`. Making the single-buffer one a 1-segment shim and
-      deleting the duplicate would leave one WR-posting core. Deferred: it touches the
-      proven single-buffer path; the shared `check_write_capacity` already removes the
-      *accounting* drift, leaving only the posting loop duplicated.
+- [x] **Unify the *sync* single-buffer transport path into the gather core.** Done.
+      `begin_rdma_write_inner` is now a 1-segment shim (`WriteSegment::from_registered`
+      → `begin_rdma_write_gather_inner`); the duplicate `WRITE_WR_MAX` chunking loop and
+      the zero-length-imm special case are gone, leaving one WR-posting core in
+      `hord-stream`. Verified over `rxe0` (single-buffer + split-mode wire tests pass).
 
-- [ ] **Reroute `post_write` / `post_write_with_imm` through `post_write_gather`.**
-      The single-SGE primitives are now the 1-SGE special case of the gather primitive,
-      and each re-encodes the `imm.to_be()` byte order (the cross-referencing comments
-      admit the drift risk). Collapsing them onto `post_write_gather([one_sge])` would
-      put the WR-construction + endianness in one place. Deferred (touches hord-core's
-      verb-posting primitives).
+- [x] **Reroute `post_write` / `post_write_with_imm` through `post_write_gather`.** Done.
+      Both single-SGE primitives are now 1-SGE shims over `post_write_gather`; the
+      `imm.to_be()` endianness encoding lives in exactly one place (the cross-referencing
+      comments are gone). Verified by `hord-core/tests/rdma_write_smoke.rs` over `rxe0`.
 
 - [ ] **Batch a scatter-gather write that exceeds the send-pool cap.** A source
       fragmented into more than `send_pool * max_send_sge` segments (defaults: 16 × ≤16
