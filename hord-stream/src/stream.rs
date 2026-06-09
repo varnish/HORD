@@ -125,9 +125,11 @@ const HS_RECV_SLOTS: usize = 1;
 // Transfer-credit (spec §7.7.6) receive headroom: zero unless we advertise split
 // mode, otherwise `split_credits`. A write-with-immediate consumes one posted
 // recv WR; this slack keeps concurrent split transfers from cannibalising the
-// data receive window. We size for our *own* advertised intent at construction
-// (the peer's capability isn't known until the handshake completes); if the peer
-// turns out not to support split mode, the extra posted WRs are simply unused.
+// data receive window. We size for our *own* advertised intent (the peer's
+// capability isn't known until the handshake completes), but — unlike the data
+// pool — we no longer *register or post* it until `apply_peer` confirms split
+// mode negotiated, so a connection against a non-split peer never pins
+// `split_credits * max_message_size`. See `HordStream::post_split_recvs`.
 fn split_slack(config: &HordConfig) -> usize {
     if config.split_mode {
         config.split_credits
@@ -136,11 +138,24 @@ fn split_slack(config: &HordConfig) -> usize {
     }
 }
 
-// Total receive WRs the QP must hold and we keep posted: the data pool, the
-// control slack, and the split-mode transfer headroom. `cqe` in hord-core is
-// derived from send_wr + recv_wr, so growing this auto-sizes the CQ.
+// Receive WRs registered and posted *eagerly*, before the handshake: the data
+// pool plus the always-posted control slack. A data SEND can arrive the instant
+// the QP is live (before the handshake completes), so these must be pre-posted in
+// `new_common`. The split-mode transfer headroom is deliberately *not* part of
+// this — it is registered + posted lazily (see `recv_wr_count` /
+// `post_split_recvs`).
+fn recv_base_count(config: &HordConfig) -> usize {
+    config.recv_pool_size + CTRL_RECV_SLACK
+}
+
+// Total receive WRs the QP must be *sized* to hold: the eager base plus the
+// split-mode transfer headroom. The recv queue (and, since `cqe` in hord-core is
+// derived from send_wr + recv_wr, the CQ) is created at this depth so the
+// lazily-posted split WRs always have room. We do *not* keep all of these posted
+// from the start: the split headroom is registered and posted only once split
+// mode negotiates (`post_split_recvs`).
 fn recv_wr_count(config: &HordConfig) -> usize {
-    config.recv_pool_size + CTRL_RECV_SLACK + split_slack(config)
+    recv_base_count(config) + split_slack(config)
 }
 
 // wr_id encoding: top bit distinguishes sends from receives; the next bit marks
@@ -309,8 +324,11 @@ impl<'a> WriteSegment<'a> {
 #[derive(Debug, Clone, Copy)]
 struct ReadyMsg {
     slot: usize,
-    start: usize, // absolute offset into recv_buf of the next unread byte
-    end: usize,   // absolute offset into recv_buf one past the payload
+    // `start`/`end` are offsets within `slot`'s *backing MR* — `recv` or the
+    // split MR — resolved via `recv_slot(slot)`, not into a single buffer (the
+    // payload may sit in either pool, per the FIFO note on `recv_slot`).
+    start: usize, // offset of the next unread byte
+    end: usize,   // offset one past the payload
 }
 
 /// Per-connection metadata for host logging and multi-tenancy: a snapshot taken
@@ -352,6 +370,13 @@ pub struct HordStream {
     // order or a hand-rolled `Option` dance (see `Drop`). The NIC and we reach
     // them only by raw pointer; we never form a `&[u8]` over them.
     recv: RegisteredBuffer,
+    // The split-mode transfer headroom (spec §7.7.6), in its *own* MR so it can
+    // be registered lazily: `None` until `apply_peer` confirms split mode
+    // negotiated, then a `split_headroom * msg_size` region whose recv WRs occupy
+    // slots `[split_base, split_base + split_headroom)`. Kept out of `recv` so a
+    // connection that declines split never pins it — the whole point of the lazy
+    // path. Resolved alongside `recv` by `recv_slot`.
+    split_recv: Option<RegisteredBuffer>,
     send: RegisteredBuffer,
     // Small registered buffer for the first-message handshake exchange:
     // [0..HANDSHAKE_LEN) receives the peer's handshake, [HANDSHAKE_LEN..) holds
@@ -362,7 +387,14 @@ pub struct HordStream {
     msg_size: usize,    // bytes per buffer slot (our max_message_size)
     payload_cap: usize, // max payload per message = min(ours, peer) - ENVELOPE_LEN
     recv_pool: usize,
-    recv_total: usize, // recv WRs we keep posted: data pool + ctrl slack + split slack
+    // First recv slot index that lives in the split MR rather than in `recv`:
+    // `recv_pool + CTRL_RECV_SLACK`. Slots below it are in `recv`; slots at or
+    // above it are in `split_recv` (once posted). Drives `recv_slot`.
+    split_base: usize,
+    // How many split-mode recv WRs we post (= our advertised `split_credits`)
+    // once split negotiates; 0 when we don't advertise split. Held so `apply_peer`
+    // can size/register the headroom without the construction-time config.
+    split_headroom: usize,
     send_pool: usize,
 
     send_free: Vec<usize>, // free *data* send slot indices (the control slot is separate)
@@ -543,10 +575,13 @@ impl HordStream {
         let send_pool = config.send_pool_size;
         assert!(msg_size > ENVELOPE_LEN, "max_message_size too small");
 
-        // recv carries the data pool plus the always-posted control slack plus
-        // the split-mode transfer headroom; send carries the data pool plus the
-        // reserved control send slot (the highest index, `send_pool`).
-        let recv_slots = recv_wr_count(config);
+        // recv carries the eager base — the data pool plus the always-posted
+        // control slack; the split-mode transfer headroom is registered + posted
+        // lazily in `apply_peer` (only if split negotiates), so it is *not* part
+        // of this MR. send carries the data pool plus the reserved control send
+        // slot (the highest index, `send_pool`).
+        let recv_base = recv_base_count(config);
+        let split_headroom = split_slack(config);
         let send_slots = send_pool + CTRL_SEND_SLOTS;
 
         // `register_buffer` allocates the (UnsafeCell-backed) storage and ties
@@ -560,7 +595,7 @@ impl HordStream {
         // shim methods are not safe to call concurrently.
         #[allow(clippy::arc_with_non_send_sync)]
         let conn = Arc::new(conn);
-        let recv = conn.register_buffer(recv_slots * msg_size, ACCESS_LOCAL_WRITE)?;
+        let recv = conn.register_buffer(recv_base * msg_size, ACCESS_LOCAL_WRITE)?;
         let send = conn.register_buffer(send_slots * msg_size, ACCESS_LOCAL_WRITE)?;
         // Dedicated buffer for the first-message handshake: recv half + send half.
         let handshake = conn.register_buffer(2 * HANDSHAKE_LEN, ACCESS_LOCAL_WRITE)?;
@@ -568,12 +603,14 @@ impl HordStream {
         let mut s = HordStream {
             conn,
             recv,
+            split_recv: None,
             send,
             _handshake: handshake,
             msg_size,
             payload_cap: 0,
             recv_pool,
-            recv_total: recv_slots,
+            split_base: recv_base,
+            split_headroom,
             send_pool,
             send_free: (0..send_pool).rev().collect(),
             send_credits: 0,
@@ -608,19 +645,13 @@ impl HordStream {
     }
 
     fn post_all_recvs(&mut self) -> io::Result<()> {
-        let base = self.recv.as_mut_ptr();
-        let msg = self.msg_size;
-        let lkey = self.recv.lkey();
-        // Post the data pool, the control slack, *and* the split-mode transfer
-        // headroom; all are needed before the QP can carry traffic.
-        for slot in 0..self.recv_total {
-            // SAFETY: `base + slot*msg` lies within `recv` (a single MR with
-            // `lkey`), which holds an Arc<Connection> so it outlives the QP.
-            unsafe {
-                let addr = base.add(slot * msg);
-                self.conn
-                    .post_recv(recv_wr_id(slot), addr, msg as u32, lkey)?;
-            }
+        // Post the eager base — the data pool + the always-posted control slack
+        // (slots `[0, split_base)`, all in `recv`). These must be live before the
+        // QP carries traffic. The split-mode transfer headroom is *not* posted
+        // here — `apply_peer` registers and posts it lazily, and only if split mode
+        // negotiates (`post_split_recvs`).
+        for slot in 0..self.split_base {
+            self.post_recv_slot(slot)?;
         }
         Ok(())
     }
@@ -726,6 +757,19 @@ impl HordStream {
         // write-with-imm transfers the peer can receive concurrently. Only
         // meaningful when split negotiated, which guarantees it is >= 1.
         self.peer_split_credits = peer.split_credits as u32;
+        // Now — and only now — register + post our split-mode receive headroom, so
+        // a connection that declined split never pinned `split_credits *
+        // max_message_size` (a non-split peer leaves `split_mode` false here, so we
+        // skip it). `split_headroom == 0` means we never advertised split, so there
+        // is nothing to post. RNR-safe despite the QP having been live since before
+        // the handshake: the eager base pool is already posted, so any recv — incl.
+        // an early write-with-imm — always has a WR to land in, and a peer cannot
+        // legitimately send one until it has seen the `split_credits` we advertised
+        // in the handshake just exchanged. The split WRs are pure additional FIFO
+        // headroom appended behind the base pool.
+        if self.split_mode && self.split_headroom > 0 {
+            self.post_split_recvs()?;
+        }
         // Enable synchronous half-close detection: flip the CM channel non-blocking
         // so the busy-poll can notice a peer-initiated *graceful* disconnect. Unlike
         // a hard teardown, a graceful disconnect (peer `rdma_disconnect`) leaves our
@@ -946,7 +990,7 @@ impl HordStream {
                 return Ok(());
             }
             self.completed_transfers.push_back(wc.imm_data);
-            self.repost_recv(slot_of(wc.wr_id))?;
+            self.post_recv_slot(slot_of(wc.wr_id))?;
             return Ok(());
         }
 
@@ -993,7 +1037,12 @@ impl HordStream {
         // Receive completion.
         debug_assert_eq!(wc.opcode, Opcode::Recv);
         let slot = slot_of(wc.wr_id);
-        let off = slot * self.msg_size;
+        // Resolve the slot to its backing MR and the slot's offset within it: the
+        // recv queue is one FIFO, so a data SEND can land in either the data pool
+        // or the split headroom regardless of message type (see `recv_slot`). `off`
+        // is therefore relative to *that* MR, and `ReadyMsg` carries it forward so
+        // `read` copies the payload from the same MR.
+        let (buf, off) = self.recv_slot(slot);
         // A successful recv can never deliver more than the posted slot size, but
         // clamp defensively so all slot-relative slicing below stays in bounds
         // regardless of what the NIC reports.
@@ -1007,7 +1056,7 @@ impl HordStream {
         // Decode the envelope through a stack copy — never a slice reference
         // over registered (DMA-able) memory.
         let mut hdr = [0u8; ENVELOPE_LEN];
-        self.recv.copy_out(off, &mut hdr);
+        buf.copy_out(off, &mut hdr);
         let env = Envelope::decode(&hdr);
         // Credits the peer granted us.
         self.send_credits = self.send_credits.saturating_add(env.credits as u32);
@@ -1033,11 +1082,11 @@ impl HordStream {
             // topped up, but DON'T return a data credit — the peer self-clocks
             // its control lane on send completions and spent no data credit for
             // this, so granting one back would inflate its window.
-            self.repost_recv(slot)?;
+            self.post_recv_slot(slot)?;
         } else {
             // Zero-length data message: it did consume a data credit, so
             // re-post and return the credit now (no payload to hold).
-            self.repost_recv(slot)?;
+            self.post_recv_slot(slot)?;
             self.grant_pending += 1;
         }
         Ok(())
@@ -1053,22 +1102,73 @@ impl HordStream {
         }
     }
 
-    /// Re-post the receive WR for `slot`. Re-posting only fails on a dead QP;
-    /// on failure the connection is marked closed so reads/writes fail fast
-    /// instead of silently operating with a shrunken receive window.
-    fn repost_recv(&mut self, slot: usize) -> io::Result<()> {
-        let off = slot * self.msg_size;
-        let base = self.recv.as_mut_ptr();
-        // SAFETY: `base + off` is slot `slot` inside `recv` / the MR, which
-        // holds an Arc<Connection> and so outlives the QP.
+    /// Resolve a recv slot to its backing MR and the slot's byte offset within
+    /// that MR. Slots `[0, split_base)` live in the eager `recv` pool; slots at or
+    /// above `split_base` live in the lazily-registered `split_recv` MR.
+    ///
+    /// Both the header decode and the payload copy route through here rather than
+    /// assuming `recv`, because the QP consumes recv WRs FIFO *regardless of
+    /// message type*: a data SEND and a split write-with-imm draw from the same
+    /// queue, so once reposts have reordered the queue either slot index can come
+    /// back on either kind of completion. A data SEND can therefore legitimately
+    /// land in a split slot (and vice versa), and its bytes must be read from the
+    /// MR that slot actually lives in.
+    fn recv_slot(&self, slot: usize) -> (&RegisteredBuffer, usize) {
+        if slot < self.split_base {
+            (&self.recv, slot * self.msg_size)
+        } else {
+            // Present whenever a split slot can be in flight: it is posted in
+            // `apply_peer` before split mode is reported as negotiated, and a
+            // split-slot completion can only arrive after that post.
+            let buf = self
+                .split_recv
+                .as_ref()
+                .expect("recv on a split slot with no split MR registered");
+            (buf, (slot - self.split_base) * self.msg_size)
+        }
+    }
+
+    /// Post (or re-post) the receive WR for `slot` into its backing MR (`recv` or
+    /// `split_recv`, per [`recv_slot`](Self::recv_slot)). The single recv-posting
+    /// primitive: the initial fills ([`post_all_recvs`](Self::post_all_recvs),
+    /// [`post_split_recvs`](Self::post_split_recvs)) and the per-message re-post all
+    /// route through here, so the addr/lkey derivation and SAFETY reasoning live in
+    /// one place. Only fails on a dead QP; on failure the connection is marked
+    /// closed so reads/writes fail fast instead of silently operating with a
+    /// shrunken receive window.
+    fn post_recv_slot(&mut self, slot: usize) -> io::Result<()> {
+        let (buf, off) = self.recv_slot(slot);
+        // SAFETY: `buf` + `off` is slot `slot` inside its MR (`recv` or
+        // `split_recv`), each of which holds an Arc<Connection> and so outlives
+        // the QP.
         let repost = unsafe {
-            let addr = base.add(off);
+            let addr = buf.as_mut_ptr().add(off);
             self.conn
-                .post_recv(recv_wr_id(slot), addr, self.msg_size as u32, self.recv.lkey())
+                .post_recv(recv_wr_id(slot), addr, self.msg_size as u32, buf.lkey())
         };
         if let Err(e) = repost {
             self.peer_closed = true;
             return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Register the split-mode transfer headroom (spec §7.7.6) and post its recv
+    /// WRs. Called once, from `apply_peer`, and only when split mode negotiated —
+    /// so the `split_headroom * msg_size` region is never pinned on a connection
+    /// that declined split. The WRs take slots `[split_base, split_base +
+    /// split_headroom)` and append to the recv-queue tail behind the eager base.
+    fn post_split_recvs(&mut self) -> io::Result<()> {
+        debug_assert!(self.split_recv.is_none(), "split headroom posted twice");
+        let n = self.split_headroom;
+        let buf = self.conn.register_buffer(n * self.msg_size, ACCESS_LOCAL_WRITE)?;
+        // Store the MR *before* posting, for two reasons: `post_recv_slot` resolves
+        // a split slot through `recv_slot`, which reads `self.split_recv`; and a
+        // mid-loop post failure must not drop the MR while the WRs already posted
+        // reference it (teardown quiesces the NIC before any MR is released).
+        self.split_recv = Some(buf);
+        for slot in self.split_base..self.split_base + n {
+            self.post_recv_slot(slot)?;
         }
         Ok(())
     }
@@ -1301,11 +1401,15 @@ impl HordStream {
                 break;
             };
             let take = (end - start).min(out.len() - written);
-            self.recv.copy_out(start, &mut out[written..written + take]);
+            // `start` is relative to the slot's backing MR (`recv` or the split
+            // MR), so copy from the MR `recv_slot` resolves, not unconditionally
+            // from `recv`.
+            let (buf, _) = self.recv_slot(slot);
+            buf.copy_out(start, &mut out[written..written + take]);
             written += take;
             if start + take == end {
                 self.rx_ready.pop_front();
-                self.repost_recv(slot)?;
+                self.post_recv_slot(slot)?;
                 self.grant_pending += 1;
             } else {
                 self.rx_ready.front_mut().unwrap().start = start + take;

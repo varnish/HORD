@@ -31,15 +31,6 @@ future pass has what it needs.
       §7.7.5 "repost immediately" rule — any cap belongs to the data-plane consumer
       API, not the stream. Captured for awareness, likely WONTFIX at this layer.
 
-- [ ] **Split recv headroom is pinned before negotiation.** `recv_wr_count` sizes and
-      `post_all_recvs` posts `split_credits` extra recv WRs from the *local* config at
-      construction (before the handshake), so a connection that advertises split mode
-      pins `split_credits * max_message_size` (default 512 KiB) per connection even
-      against peers that never negotiate it. Can't be revised post-handshake because
-      receives must be pre-posted before the QP goes live (the two-phase RNR-avoidance
-      design). **Fix:** register the split headroom into a *separate* MR and post it
-      lazily in `apply_peer` only when split mode survives negotiation.
-
 - [ ] **Minor cleanup (low priority).** The `pattern()` LCG test helper still lives in
       three crates — `hord-core/tests/rdma_write_smoke.rs`,
       `hord-zerocopy/tests/split_http_smoke.rs`, and two `#[cfg(test)]` unit-test modules
