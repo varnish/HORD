@@ -13,22 +13,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # The whole point of this job is enforcement: it brings up Soft-RoCE and runs
-  # the suite with `--include-ignored`, so the 13 RDMA loopback tests (the actual
-  # data path) run on every push/PR instead of only on a dev host by hand.
+  # Device-free workspace tests. The 13 RDMA loopback tests (the actual data path)
+  # are `#[ignore]`d because they need a Soft-RoCE (`rxe0`) device, and GitHub's
+  # hosted-runner kernel no longer provides one: the `azure` flavour (as of
+  # 6.17.0-1015-azure) dropped `rdma_rxe` from its module set entirely — its
+  # `linux-modules-extra` ships `siw` but no `rxe`, and `siw` (iWARP) can't stand
+  # in because HORD's data path needs RDMA write-with-immediate, which iWARP lacks.
+  # So the loopback suite runs on the dev host (or a self-hosted runner) by hand:
+  #   cargo test --workspace -- --include-ignored --test-threads=1
+  # See `.github/actions/setup-soft-roce` (retained, no longer wired into CI).
   test:
-    name: test (incl. RDMA loopback)
+    name: test (device-free; RDMA loopback runs off-CI)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: ./.github/actions/setup-soft-roce
-      - name: cargo test --workspace (incl. ignored)
+      - name: Install RDMA build libraries (headers only — no device)
+        # hord-core/-stream/-async bind libibverbs/librdmacm through rdma-mummy-sys,
+        # which runs bindgen (-> needs clang/libclang). These are *build* deps only:
+        # no rxe device is required, since every data-path test is `#[ignore]`d.
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libibverbs-dev librdmacm-dev clang libclang-dev pkg-config
+      - name: cargo test --workspace (device-free; RDMA loopback tests are ignored)
         # --test-threads=1: a couple of in-binary tests reuse the same TCP/RDMA-CM
         # port, so serialize to avoid bind() races. The suite runs in seconds.
         # --locked: fail if Cargo.lock is stale rather than silently regenerating it.
-        run: cargo test --locked --workspace -- --include-ignored --test-threads=1
+        # No `--include-ignored`: the device-backed loopback tests stay skipped here.
+        run: cargo test --locked --workspace -- --test-threads=1
       - name: cargo check hord-async --no-default-features (lean adapter surface)
         # The `listener` feature (default-on) gates HordListener + the deps only it
         # needs (log, tokio sync/macros). This guards the feature's whole guarantee:
@@ -40,7 +55,7 @@ jobs:
         # `tokio::sync` in non-gated code would rot the lean build undetected.
         # `check`, not `build`: a type error is all we need to catch. Runs here (not
         # the device-free `codec` job) because hord-async always pulls hord-core, so
-        # it needs rdma-core's headers — present on this runner, no active device.
+        # it needs rdma-core's headers — installed above, no active device.
         run: cargo check --locked -p hord-async --no-default-features
 
   # Milestone-1 "device-free build" guarantee. The hord-zerocopy header codec
@@ -73,8 +88,12 @@ jobs:
         # rdma-core, no setup-soft-roce — proving the laptop story end to end.
         run: cargo test --locked -p hord-zerocopy
 
+  # Device-free coverage. Same caveat as the `test` job: the RDMA loopback tests
+  # are `#[ignore]`d here (no rxe device on hosted runners), so this measures the
+  # device-free logic only — the data-path lines show as uncovered. Run the full
+  # picture on the dev host with `--include-ignored`.
   coverage:
-    name: coverage (llvm-cov)
+    name: coverage (llvm-cov; device-free)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -83,20 +102,26 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: ./.github/actions/setup-soft-roce
-      - name: Collect coverage (incl. RDMA loopback tests)
+      - name: Install RDMA build libraries (headers only — no device)
+        # See the `test` job: build-time FFI/bindgen deps, no rxe device needed.
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libibverbs-dev librdmacm-dev clang libclang-dev pkg-config
+      - name: Collect coverage (device-free; RDMA loopback tests ignored)
         run: |
           set -euxo pipefail
           # --no-report runs the instrumented suite and stashes the raw profiles;
           # the two `report` calls then render from that data without recompiling.
-          cargo llvm-cov --locked --workspace --no-report -- --include-ignored --test-threads=1
+          cargo llvm-cov --locked --workspace --no-report -- --test-threads=1
           cargo llvm-cov report --lcov --output-path lcov.info
           cargo llvm-cov report --summary-only | tee coverage-summary.txt
       - name: Publish coverage summary
         if: always()
         run: |
           {
-            echo '### Coverage (line/region, incl. RDMA loopback tests)'
+            echo '### Coverage (line/region, device-free — RDMA loopback tests excluded)'
             echo '```'
             cat coverage-summary.txt
             echo '```'

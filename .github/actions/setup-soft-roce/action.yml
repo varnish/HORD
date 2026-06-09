@@ -1,3 +1,10 @@
+# NOTE: This action is RETAINED but no longer wired into `ci.yml`. GitHub's
+# hosted-runner kernel (the `azure` flavour, as of 6.17.0-1015-azure) dropped the
+# `rdma_rxe` module, so `modprobe rdma_rxe` here fails and Soft-RoCE can't come up
+# on hosted runners. CI now runs device-free and the RDMA loopback suite runs on a
+# host that has `rxe0` (the dev host, or a self-hosted runner). Re-add
+# `- uses: ./.github/actions/setup-soft-roce` to a job that runs on such a host to
+# bring the device up there.
 name: Set up Soft-RoCE
 description: >
   Install the rdma-core build/runtime packages and bring up an `rxe0` Soft-RoCE

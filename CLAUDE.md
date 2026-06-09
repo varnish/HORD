@@ -118,10 +118,21 @@ workspace *total* down to ~65% — read the per-file table, not the total. Add
 
 ### CI
 
-`.github/workflows/ci.yml` runs both of the above on every push/PR: a `test`
-job (full suite incl. ignored) and a `coverage` job (uploads `lcov.info`,
-prints the per-file table to the run summary). Both bring up Soft-RoCE via the
-`.github/actions/setup-soft-roce` composite action, which **fails the job** if
-`rxe0` cannot be made ACTIVE — so the RDMA suite can never silently skip in CI.
-If a hosted runner's kernel lacks `rdma_rxe`, the fix is the
-`linux-modules-extra-$(uname -r)` install the action already attempts.
+`.github/workflows/ci.yml` runs **device-free** on hosted runners (three jobs):
+a `test` job (`cargo test --workspace`, no `--include-ignored`), a `coverage`
+job (uploads `lcov.info`, prints the per-file table to the run summary), and the
+`codec` job (the Milestone-1 zero-dep build guarantee). The `test`/`coverage`
+jobs install only the RDMA *build* libraries (`libibverbs-dev librdmacm-dev` +
+`clang`/`libclang-dev` for bindgen) — enough to compile the FFI crates, no
+device.
+
+**The RDMA loopback suite does NOT run in CI.** GitHub's hosted-runner kernel
+(the `azure` flavour, as of `6.17.0-1015-azure`) dropped the `rdma_rxe` module —
+its `linux-modules-extra` ships `siw` but no `rxe`, so Soft-RoCE can't be brought
+up, and `siw`/iWARP can't substitute (HORD's data path needs RDMA
+write-with-immediate, which iWARP lacks). The 13 `#[ignore]`d data-path tests
+therefore run only where an `rxe0` device exists: **this dev host** (the full
+`--include-ignored` command at the top of this section), or a **self-hosted
+runner**. The bring-up recipe is preserved in `.github/actions/setup-soft-roce`
+(retained but no longer referenced by `ci.yml`); re-add it to a job that runs on
+an rxe-capable host to test the data path in CI again.
