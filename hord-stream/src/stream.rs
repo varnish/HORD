@@ -213,11 +213,13 @@ fn slot_of(wr_id: u64) -> usize {
 const HS_RECV_WR_ID: u64 = u64::MAX;
 const HS_SEND_WR_ID: u64 = u64::MAX - 1;
 
-// Deadline for the first-message handshake exchange. The handshake is one round
-// trip after the QP is established, so this only bounds the pathological case
-// where a peer reaches ESTABLISHED but never sends its handshake (crash, or a
-// non-HORD endpoint) — without it, `exchange_handshake` would spin forever.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for the first-message handshake exchange. The handshake is one round
+/// trip after the QP is established, so this only bounds the pathological case
+/// where a peer reaches ESTABLISHED but never sends its handshake (crash, or a
+/// non-HORD endpoint) — without it, `exchange_handshake` would spin forever.
+/// Exposed so the async server-handshake stage in `hord-async` bounds its
+/// non-blocking exchange (driven via [`HordStream::poll_handshake`]) by the same value.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // How many empty CQ polls the blocking busy-poll spins through before it checks
 // the CM channel for a peer half-close. A `get_cm_event` is a syscall, so we
@@ -458,6 +460,14 @@ pub struct HordStream {
     // and self-heals on the repost, so freeing the credit on the ack is safe.
     peer_split_credits: u32,
     imm_outstanding: u32,
+
+    // Transient progress of the first-message handshake exchange, tracked across
+    // the non-blocking `poll_handshake` steps (the async server-handshake driver
+    // parks on the CQ fd between them). Both start `false`/`0` and are meaningful
+    // only until `exchange_handshake` / `poll_handshake` completes once.
+    hs_got_send: bool,
+    hs_got_recv: bool,
+    hs_recv_len: usize,
 }
 
 /// Whether protocol splitting (spec §7.7) negotiates on this connection, given
@@ -532,6 +542,43 @@ impl HordStream {
         let peer = s.exchange_handshake(config)?;
         s.apply_peer(&peer)?;
         Ok(s)
+    }
+
+    /// Server side, async staging: build the **pre-handshake** stream — register
+    /// the buffer pools, post the receive WRs (incl. the handshake recv), and drive
+    /// the local establish transitions + `accept` — **without** waiting for
+    /// ESTABLISHED or exchanging the handshake. Those two are peer-dependent and are
+    /// driven asynchronously *off* the worker (see `hord-async`'s `accept_async`), so
+    /// a slow peer can't block the worker's other connections; this is the fast,
+    /// local part the worker runs synchronously, letting it take a
+    /// [`teardown_handle`](Self::teardown_handle) before the handshake parks. Drive
+    /// the returned stream to fully established with
+    /// [`poll_established`](Self::poll_established), then
+    /// [`begin_handshake_send`](Self::begin_handshake_send) + repeated
+    /// [`poll_handshake`](Self::poll_handshake), then
+    /// [`finish_handshake`](Self::finish_handshake). The synchronous
+    /// [`from_accepted`](Self::from_accepted) runs the same steps inline.
+    pub fn accept_prepare(conn: Connection, config: &HordConfig) -> io::Result<HordStream> {
+        let s = HordStream::new_common(conn, config)?;
+        s.conn.accept_establish_begin()?;
+        Ok(s)
+    }
+
+    /// Non-blocking step toward CM establishment after
+    /// [`accept_prepare`](Self::accept_prepare): `Ok(true)` once ESTABLISHED,
+    /// `Ok(false)` to park on [`cm_fd`](Self::cm_fd) and retry, `Err` on a
+    /// failed/wrong CM event.
+    pub fn poll_established(&self) -> io::Result<bool> {
+        self.conn.poll_established()
+    }
+
+    /// Apply the negotiated peer handshake (the value
+    /// [`poll_handshake`](Self::poll_handshake) returned) — the final staging step:
+    /// fix the effective message size / credits, resolve the zero-copy + split-mode
+    /// negotiation, and post the split-mode recv headroom if split negotiated. After
+    /// this the stream is fully established.
+    pub fn finish_handshake(&mut self, peer: &Handshake) -> io::Result<()> {
+        self.apply_peer(peer)
     }
 
     /// Client side: connect to `ip:port` and complete the HORD handshake.
@@ -632,6 +679,9 @@ impl HordStream {
             completed_transfers: VecDeque::new(),
             peer_split_credits: 0,
             imm_outstanding: 0,
+            hs_got_send: false,
+            hs_got_recv: false,
+            hs_recv_len: 0,
         };
         // Post the handshake recv FIRST: a QP consumes receive WRs in the order
         // they were posted, and the peer's handshake is its very first send, so
@@ -676,25 +726,51 @@ impl HordStream {
     /// here rather than returned from `accept`/`connect`. It runs once, before any
     /// data flows, reaping exactly the two reserved handshake completions; any
     /// other completion at this point is a protocol error.
-    fn exchange_handshake(&self, config: &HordConfig) -> io::Result<Handshake> {
+    /// Blocking driver, factored over [`begin_handshake_send`](Self::begin_handshake_send)
+    /// and [`poll_handshake`](Self::poll_handshake) — the non-blocking step the async
+    /// server-handshake stage drives on the CQ fd — so the two share the protocol
+    /// and can't drift. Bounded by [`HANDSHAKE_TIMEOUT`] (busy-polls the CQ).
+    fn exchange_handshake(&mut self, config: &HordConfig) -> io::Result<Handshake> {
+        self.begin_handshake_send(config)?;
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        loop {
+            if let Some(peer) = self.poll_handshake()? {
+                return Ok(peer);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "peer did not complete the HORD handshake in time",
+                ));
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Post our handshake send — the first half of the exchange. Our handshake
+    /// lives in the send half of the handshake MR (offset `HANDSHAKE_LEN`) and
+    /// lands in the recv WR the peer pre-posted. Pairs with
+    /// [`poll_handshake`](Self::poll_handshake).
+    pub fn begin_handshake_send(&self, config: &HordConfig) -> io::Result<()> {
         let my = HordStream::my_handshake(config).encode();
-        // Our handshake lives in the send half (offset HANDSHAKE_LEN).
         self._handshake.copy_in(HANDSHAKE_LEN, &my);
         let lkey = self._handshake.lkey();
         // SAFETY: the send region is within the handshake MR and stays live until
-        // its send completion is reaped in the loop below.
+        // its send completion is reaped by `poll_handshake`.
         let send_ptr = unsafe { self._handshake.as_mut_ptr().add(HANDSHAKE_LEN) };
-        unsafe {
-            self.conn
-                .post_send(HS_SEND_WR_ID, send_ptr, HANDSHAKE_LEN as u32, lkey)?;
-        }
+        unsafe { self.conn.post_send(HS_SEND_WR_ID, send_ptr, HANDSHAKE_LEN as u32, lkey) }
+    }
 
-        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-        let (mut got_recv, mut got_send) = (false, false);
-        // Bytes the peer actually sent in its handshake (from the recv
-        // completion); decode only these, never trailing buffer bytes.
-        let mut recv_len = 0usize;
-        while !(got_recv && got_send) {
+    /// Non-blocking step of the handshake exchange after
+    /// [`begin_handshake_send`](Self::begin_handshake_send): drain the ready CQ
+    /// completions, tracking our send and the peer's handshake recv (progress kept
+    /// in `self` across calls). Returns `Some(peer)` once both have completed
+    /// (decoding the peer's handshake), or `None` while still waiting — the caller
+    /// then parks on the CQ fd (async) or spins (the blocking
+    /// [`exchange_handshake`](Self::exchange_handshake)) and calls again. Any
+    /// completion other than the two reserved handshake WRs is a protocol error.
+    pub fn poll_handshake(&mut self) -> io::Result<Option<Handshake>> {
+        while !(self.hs_got_recv && self.hs_got_send) {
             match self.conn.poll()? {
                 Some(wc) => {
                     if !wc.is_success() {
@@ -705,10 +781,12 @@ impl HordStream {
                     }
                     match wc.wr_id {
                         HS_RECV_WR_ID => {
-                            got_recv = true;
-                            recv_len = wc.byte_len as usize;
+                            self.hs_got_recv = true;
+                            // Bytes the peer actually sent; decode only these, never
+                            // trailing buffer bytes.
+                            self.hs_recv_len = wc.byte_len as usize;
                         }
-                        HS_SEND_WR_ID => got_send = true,
+                        HS_SEND_WR_ID => self.hs_got_send = true,
                         other => {
                             return Err(io::Error::other(format!(
                                 "unexpected completion during handshake (wr_id {other:#x})"
@@ -716,25 +794,17 @@ impl HordStream {
                         }
                     }
                 }
-                None => {
-                    if Instant::now() >= deadline {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "peer did not complete the HORD handshake in time",
-                        ));
-                    }
-                    std::hint::spin_loop();
-                }
+                // CQ drained, handshake not yet complete: let the caller wait.
+                None => return Ok(None),
             }
         }
-
-        // Decode exactly the bytes received (capped at the buffer); a short first
-        // message must not be padded with stale buffer bytes. `Handshake::decode`
+        // Both complete: decode exactly the bytes received (capped at the buffer);
+        // a short first message must not be padded with stale bytes. `decode`
         // rejects anything under 14 bytes.
-        let n = recv_len.min(HANDSHAKE_LEN);
+        let n = self.hs_recv_len.min(HANDSHAKE_LEN);
         let mut buf = [0u8; HANDSHAKE_LEN];
         self._handshake.copy_out(0, &mut buf);
-        Handshake::decode(&buf[..n])
+        Handshake::decode(&buf[..n]).map(Some)
     }
 
     fn apply_peer(&mut self, peer: &Handshake) -> io::Result<()> {

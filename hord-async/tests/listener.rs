@@ -31,7 +31,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, watch};
 
 use hord_async::{AsyncHordStream, ConnMeta, HordListener, SharedAsyncStream};
-use hord_stream::HordConfig;
+use hord_stream::{Connection, HordConfig};
 use hord_zerocopy::RdmaWriteReq;
 
 const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
@@ -163,6 +163,95 @@ fn keep_alive_many_requests_one_qp() {
         served.expect("server never reported (no clean EOF?)"),
         REQUESTS,
         "server did not serve every keep-alive request",
+    );
+}
+
+#[test]
+#[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+fn slow_handshake_does_not_stall_the_worker() {
+    // A peer that establishes the QP but never sends its HORD handshake must not
+    // head-of-line block a worker's *other* connections. The handshake is an async
+    // stage off the worker (CM establish + the first-message exchange park on fds),
+    // so the server's task for the stalled peer parks while a well-behaved client on
+    // the SAME single worker is served promptly. On the old synchronous worker the
+    // stalled peer would pin the worker in its handshake busy-poll for the full
+    // HANDSHAKE_TIMEOUT (~10s), so a tight wall-clock bound is the regression guard.
+    // (It also exercises that the stalled connection fails only itself: its task
+    // times out at HANDSHAKE_TIMEOUT and is dropped while the listener keeps serving.)
+    const PORT: u16 = 18636;
+    const N: usize = 4096;
+
+    // Inline (not `spawn_listener`) for a short grace timeout: at shutdown the only
+    // in-flight task is the stalled peer's, which is parked in its handshake and
+    // would otherwise pay the full HANDSHAKE_TIMEOUT to drain. A 1 s grace force-tears
+    // its QP down and abandons it promptly — and exercises the in-handshake-task
+    // teardown (the use-after-free guard the worker takes the handle for pre-spawn).
+    let (shutdown, rx) = watch::channel(false);
+    let listener = HordListener::bind(IP, PORT, HordConfig::default())
+        .expect("bind listener")
+        .workers(1)
+        .grace_timeout(Duration::from_secs(1));
+    let listener_thread = std::thread::spawn(move || {
+        current_thread_rt().block_on(listener.serve(rx, move |mut stream, _peer, _shutdown| async move {
+            if let Some(n) = read_req(&mut stream).await.expect("read_req") {
+                stream.write_all(&pattern_vec(n)).await.expect("write body");
+                stream.flush().await.expect("flush body");
+            }
+        }));
+    });
+
+    // The stalling peer: drive the QP to ESTABLISHED with the raw connection
+    // primitives, then deliberately send no handshake. Run on its own thread (the
+    // connection API is blocking) and hold the connection open until released —
+    // dropping it would free the server's parked handshake task.
+    let (estab_tx, estab_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let staller = std::thread::spawn(move || {
+        let conn = Connection::connect(IP, PORT, 4, 4, HordConfig::default().cm)
+            .expect("stalling connect");
+        conn.connect_finish().expect("stalling connect_finish");
+        // Established but silent: never exchange the HORD handshake.
+        estab_tx.send(()).expect("signal established");
+        let _ = release_rx.recv();
+        drop(conn);
+    });
+    estab_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("stalling peer never established");
+
+    // A well-behaved client on the same single worker must complete well under
+    // HANDSHAKE_TIMEOUT. `connect` (the client-side handshake) is timed too, since on
+    // the old path the worker — stuck on the staller — would never `accept` it, so
+    // even connecting would block ~10s.
+    let started = Instant::now();
+    let client: Result<(), String> = current_thread_rt().block_on(async {
+        let mut s = AsyncHordStream::connect(IP, PORT, &HordConfig::default())
+            .map_err(|e| format!("connect: {e}"))?;
+        let body = tokio::time::timeout(Duration::from_secs(5), request(&mut s, N))
+            .await
+            .map_err(|_| "good client request timed out — worker stalled behind the slow handshake".to_string())?
+            .map_err(|e| format!("request: {e}"))?;
+        if body.len() != N || !body.iter().enumerate().all(|(i, &b)| b == pattern_byte(i)) {
+            return Err(format!("payload mismatch (len {})", body.len()));
+        }
+        s.shutdown().await.map_err(|e| format!("shutdown: {e}"))?;
+        Ok(())
+    });
+    let elapsed = started.elapsed();
+
+    // Cleanup runs unconditionally: release the staller, then wind the listener down.
+    let _ = release_tx.send(());
+    let _ = staller.join();
+    shutdown.send(true).expect("send shutdown");
+    listener_thread.join().expect("listener thread panicked");
+
+    client.expect("good client work failed");
+    // Headline assertion: the good client was served promptly despite the stalled
+    // handshake — generous 3s bound vs the ~10s HANDSHAKE_TIMEOUT a synchronous
+    // worker would impose.
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "good client took {elapsed:?} — the slow handshake head-of-line blocked the worker (regression)",
     );
 }
 

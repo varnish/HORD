@@ -98,16 +98,29 @@
 //!   streaming a cache body through a bounded channel cannot be made to pull an
 //!   arbitrarily large object fully into RAM.
 //!
-//! ## Caveat: synchronous handshake on the worker
+//! ## Handshake: an async stage, off the worker's critical path
 //!
-//! A worker completes the HORD handshake synchronously inside
-//! [`AsyncHordStream::from_accepted`] (a brief CQ busy-poll for one round trip),
-//! which momentarily pins that worker — and so its other connections — until it
-//! returns. Acceptable here because the handshake is one fast exchange; a
-//! latency-sensitive deployment would move it off the worker (a dedicated
-//! handshake stage, or an async handshake) so a slow-handshaking peer cannot
-//! stall a worker's other connections. The seam to do so is local to the worker
-//! loop.
+//! The worker does only the *fast, local, peer-independent* setup synchronously —
+//! [`HordStream::accept_prepare`]: register the buffer pools, post the receive WRs,
+//! and drive the local establish transitions + `accept`. It then takes the
+//! connection's [`ConnTeardown`] and `spawn_local`s a task that completes the
+//! *peer-dependent* part **asynchronously** via [`AsyncHordStream::accept_async`]:
+//! it parks on the CM fd for ESTABLISHED and on the CQ fd for the two handshake
+//! completions, yielding to the worker's reactor while it waits. So a peer that
+//! establishes (or connects) and then stalls mid-handshake no longer pins the
+//! worker — its other connections keep making progress — and a handshake that
+//! exceeds [`ESTABLISH_TIMEOUT`](hord_stream::ESTABLISH_TIMEOUT) /
+//! [`HANDSHAKE_TIMEOUT`](hord_stream::HANDSHAKE_TIMEOUT) fails just that one
+//! connection.
+//!
+//! Taking the teardown handle *before* spawning is load-bearing: an in-handshake
+//! task abandoned at the grace deadline still has its QP force-torn-down first, so
+//! the handshake's posted recv/send WRs can't be a use-after-free (the same guard
+//! the in-flight-`RDMA_WRITE` case relies on — see the worker-loop docs).
+//!
+//! The *client* handshake ([`AsyncHordStream::connect`]) stays synchronous: a
+//! client handshakes once and is not a worker fielding many connections, so it is
+//! not the head-of-line problem this stage solves.
 //!
 //! ## Trust model
 //!
@@ -168,13 +181,14 @@ const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 50;
 /// shutdown branch. The fd stays readable, so draining resumes on the next wakeup.
 const MAX_DRAIN_PER_WAKEUP: u32 = 64;
 
-/// Per-worker bound on accepted-but-not-yet-handshaked connections queued to one
-/// worker. Caps the live QP/CM-id backlog a single *wedged* worker (e.g. parked in
-/// its bounded handshake/establish wait, or monopolized by a long zero-copy write)
-/// can accumulate before the acceptor fails new connections over to other workers
-/// (see [`dispatch`]). Small on purpose: the handshake is normally sub-millisecond,
-/// so the queue should rarely hold more than a couple — the bound exists for the
-/// wedged / overloaded case, not the steady state.
+/// Per-worker bound on accepted connections queued to one worker awaiting pickup.
+/// Caps the live QP/CM-id backlog a single overloaded worker can accumulate before
+/// the acceptor fails new connections over to other workers (see [`dispatch`]). The
+/// worker now only does the fast, synchronous `accept_prepare` per connection before
+/// `spawn_local`ing the (async) handshake + service, so it drains this queue
+/// quickly; the bound exists for the genuinely overloaded case (a worker whose core
+/// is saturated by in-flight connections — e.g. long zero-copy writes), not the
+/// steady state where it rarely holds more than a couple.
 const WORKER_CHANNEL_CAP: usize = 32;
 
 /// One accepted connection plus the peer address to label it with (or `None` if the
@@ -543,7 +557,7 @@ fn run_worker<F, Fut>(
     grace: Duration,
     shutdown: watch::Receiver<bool>,
 ) where
-    F: FnMut(AsyncHordStream, Option<SocketAddr>, watch::Receiver<bool>) -> Fut,
+    F: FnMut(AsyncHordStream, Option<SocketAddr>, watch::Receiver<bool>) -> Fut + Clone + 'static,
     Fut: Future<Output = ()> + 'static,
 {
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -581,12 +595,12 @@ fn run_worker<F, Fut>(
 /// the aborted futures' buffer frees are sound.
 async fn worker_loop<F, Fut>(
     mut rx: mpsc::Receiver<Accepted>,
-    mut serve_fn: F,
+    serve_fn: F,
     config: HordConfig,
     grace: Duration,
     shutdown: watch::Receiver<bool>,
 ) where
-    F: FnMut(AsyncHordStream, Option<SocketAddr>, watch::Receiver<bool>) -> Fut,
+    F: FnMut(AsyncHordStream, Option<SocketAddr>, watch::Receiver<bool>) -> Fut + Clone + 'static,
     Fut: Future<Output = ()> + 'static,
 {
     // A JoinSet reaps finished connection tasks in O(1) per task (no per-accept
@@ -600,29 +614,46 @@ async fn worker_loop<F, Fut>(
     while let Some((conn, peer)) = rx.recv().await {
         // Reap any connection tasks that have finished since the last accept.
         reap_finished(&mut tasks, &mut teardowns);
-        // Build the !Send stream on this worker thread — the handshake runs here
-        // (see the type's "synchronous handshake" caveat). On failure, drop the
-        // connection and keep serving the rest.
-        match AsyncHordStream::from_accepted(conn, &config) {
-            Ok(stream) => {
-                // Grab the teardown handle *before* moving the stream into the
-                // service future, and key it by the spawned task's id. Each
-                // connection gets its own clone of the shutdown signal so it can
-                // drive a per-connection graceful drain (see the module docs).
-                let teardown = stream.teardown_handle();
-                // Hand the service the *post-handshake* peer address, not the
-                // accept-time `peer` read off the not-yet-established `conn`. The CM
-                // may only resolve the destination address at establishment, so the
-                // stream's value is the authoritative one and matches
-                // `conn_meta().peer_addr` exactly; on RoCEv2 the two are identical.
-                // (`peer` is still used below for the failure log, where no stream
-                // exists to query.)
-                let peer = stream.peer_addr();
-                let handle = tasks.spawn_local(serve_fn(stream, peer, shutdown.clone()));
-                teardowns.insert(handle.id(), teardown);
+        // Build the pre-handshake !Send stream synchronously on this worker thread —
+        // fast, local, peer-independent (register buffers + post recvs + the local
+        // establish transitions). The peer-dependent waits (CM ESTABLISHED + the
+        // handshake exchange) run *asynchronously* inside the spawned task via
+        // `accept_async`, so a slow/stalled peer parks on its own fds and never
+        // blocks this worker's other connections. On prep failure, drop and keep
+        // serving the rest.
+        let prepared = match HordStream::accept_prepare(conn, &config) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("hord: connection prepare failed for {}: {e}", peer_label(peer));
+                continue;
             }
-            Err(e) => log::warn!("hord: handshake failed for {}: {e}", peer_label(peer)),
-        }
+        };
+        // Grab the teardown handle NOW — before the handshake parks — so an
+        // in-handshake task abandoned at the grace deadline still has its QP
+        // force-torn-down first (the handshake's posted recv/send WRs reference the
+        // handshake MR; the use-after-free guard must cover them too). Key it by the
+        // spawned task's id, as for an established connection.
+        let teardown = prepared.teardown_handle();
+        let task_config = config.clone();
+        // Each connection gets its own clone of the shutdown signal (per-connection
+        // graceful drain) and of the service closure (it is invoked inside the task,
+        // after the async handshake, not here — the stream does not exist yet).
+        let task_shutdown = shutdown.clone();
+        let mut serve = serve_fn.clone();
+        let handle = tasks.spawn_local(async move {
+            match AsyncHordStream::accept_async(prepared, &task_config).await {
+                // Hand the service the *post-handshake* peer address (authoritative;
+                // the CM may only resolve it at establishment), matching
+                // `conn_meta().peer_addr` — on RoCEv2 identical to the accept-time one.
+                Ok(stream) => {
+                    let peer = stream.peer_addr();
+                    serve(stream, peer, task_shutdown).await;
+                }
+                // `peer` here is the accept-time address (no stream to query on failure).
+                Err(e) => log::warn!("hord: handshake failed for {}: {e}", peer_label(peer)),
+            }
+        });
+        teardowns.insert(handle.id(), teardown);
     }
 
     // Channel closed → shutdown. Let in-flight connections finish, bounded by

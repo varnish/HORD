@@ -64,13 +64,23 @@ Carapace-side verification on Milestone 1.
 The following remains consciously deferred — not a correctness bug on the supported
 single-host path.
 
-- [ ] **Synchronous handshake still pins the worker (now bounded, not unbounded).**
-      With `ESTABLISH_TIMEOUT` + the existing `HANDSHAKE_TIMEOUT`, a stalled peer can no
-      longer wedge a worker *forever*, but it can still stall that worker's other
-      connections for up to those bounds (head-of-line). The deeper fix is the
-      documented handshake **stage** — run establishment/handshake off the worker (or
-      async) so a slow peer never blocks a worker's reactor. Deferred (bigger; the
-      bound makes it non-urgent).
+- [x] **Synchronous handshake still pins the worker (now bounded, not unbounded).**
+      Done. The handshake is now an **async stage** off the worker's critical path. The
+      worker runs only the fast, local, peer-independent setup synchronously
+      (`HordStream::accept_prepare` = register buffers + post recvs + the local
+      establish transitions), takes the connection's `ConnTeardown`, then `spawn_local`s
+      a task that completes the peer-dependent part via `AsyncHordStream::accept_async`:
+      it parks on the CM fd for ESTABLISHED and on the CQ fd for the two handshake
+      completions (the new non-blocking `Connection::poll_established` /
+      `HordStream::poll_handshake` steps), yielding to the reactor while it waits. So a
+      peer that stalls mid-handshake no longer head-of-line blocks the worker's other
+      connections, and a handshake that exceeds `ESTABLISH_TIMEOUT` / `HANDSHAKE_TIMEOUT`
+      fails just its own connection. Taking the teardown handle pre-spawn keeps the
+      grace-timeout use-after-free guard covering in-handshake tasks. Client `connect`
+      stays synchronous (one handshake per client — not the head-of-line problem).
+      Verified on rxe0 by `slow_handshake_does_not_stall_the_worker` (a stalled peer +
+      a well-behaved client served in ~1 s on one worker), plus the existing
+      keep-alive / backpressure / cancellation listener tests.
 
 ### Milestone 1 — HTTP/1.1 over RDMA (byte-stream parity)
 

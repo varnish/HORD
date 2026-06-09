@@ -87,8 +87,13 @@ use std::time::SystemTime;
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::timeout;
 
-use hord_stream::{Connection, HordConfig, HordStream, Mr, RegisteredBuffer, WriteSegment};
+use hord_stream::handshake::Handshake;
+use hord_stream::{
+    Connection, HordConfig, HordStream, Mr, RegisteredBuffer, WriteSegment, ESTABLISH_TIMEOUT,
+    HANDSHAKE_TIMEOUT,
+};
 use hord_zerocopy::{RdmaWriteAction, RdmaWriteReq, RdmaWriteStatus, SourcePool};
 
 #[cfg(feature = "listener")]
@@ -139,6 +144,76 @@ impl AsyncHordStream {
     /// is `!Send`.
     pub fn from_accepted(conn: Connection, config: &HordConfig) -> io::Result<Self> {
         Self::wrap(HordStream::from_accepted(conn, config)?)
+    }
+
+    /// Server side, **off-worker** async handshake: finish a connection prepared by
+    /// [`HordStream::accept_prepare`] without blocking the worker. Registers the CQ
+    /// and CM fds, then drives CM establishment (parking on the CM fd) and the
+    /// first-message handshake exchange (parking on the CQ fd) **asynchronously**, so
+    /// a peer that stalls mid-handshake yields the worker to its other connections
+    /// instead of pinning it. Bounded by the same
+    /// [`ESTABLISH_TIMEOUT`](hord_stream::ESTABLISH_TIMEOUT) and
+    /// [`HANDSHAKE_TIMEOUT`](hord_stream::HANDSHAKE_TIMEOUT) as the synchronous
+    /// [`from_accepted`](Self::from_accepted) — but yielding rather than blocking, so
+    /// a timed-out handshake fails just its own connection. On success the stream is
+    /// fully established and wrapped for async I/O.
+    ///
+    /// `HordListener` calls this inside the spawned per-connection task; the worker
+    /// builds `prepared` (via `accept_prepare`) synchronously first, so it can take a
+    /// teardown handle before the handshake parks (see the listener docs).
+    pub async fn accept_async(prepared: HordStream, config: &HordConfig) -> io::Result<Self> {
+        // Register the CQ + CM fds up front so the handshake can park on them. The CM
+        // channel is already non-blocking (accept_prepare → accept_establish_begin);
+        // unlike `wrap`'s best-effort CM, the fd is *required* here — establishment is
+        // driven on it — so failures propagate (the worker drops the connection).
+        let cq = AsyncFd::new(ReactorFd(prepared.cq_fd()?))?;
+        prepared.set_cm_nonblock()?;
+        let cm = AsyncFd::new(ReactorFd(prepared.cm_fd()?))?;
+        let mut stream = prepared;
+
+        // Phase 1 — CM establishment: step `poll_established`, parking on the CM fd
+        // between tries, bounded so a peer that connects then never establishes can't
+        // leak this task.
+        let establish = async {
+            loop {
+                if stream.poll_established()? {
+                    return Ok::<(), io::Error>(());
+                }
+                let mut guard = cm.readable().await?;
+                guard.clear_ready();
+            }
+        };
+        timeout(ESTABLISH_TIMEOUT, establish).await.map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, "peer did not establish the connection in time")
+        })??;
+
+        // Phase 2 — first-message handshake: post ours, then step `poll_handshake`,
+        // parking on the CQ fd between completions. The arm-then-recheck closes the
+        // completion-channel race exactly as `poll_reactor` does for the data path.
+        stream.begin_handshake_send(config)?;
+        let exchange = async {
+            loop {
+                if let Some(peer) = stream.poll_handshake()? {
+                    return Ok::<Handshake, io::Error>(peer);
+                }
+                stream.arm_cq()?;
+                if let Some(peer) = stream.poll_handshake()? {
+                    return Ok(peer);
+                }
+                let mut guard = cq.readable().await?;
+                stream.consume_cq_events();
+                guard.clear_ready();
+            }
+        };
+        let peer = timeout(HANDSHAKE_TIMEOUT, exchange).await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "peer did not complete the HORD handshake in time",
+            )
+        })??;
+
+        stream.finish_handshake(&peer)?;
+        Ok(AsyncHordStream { cq, cm: Some(cm), stream })
     }
 
     /// Register a freshly-handshaked stream's fds with the reactor.

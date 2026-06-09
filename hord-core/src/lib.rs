@@ -769,6 +769,18 @@ impl Connection {
     /// worker — and its other connections — forever. On timeout this returns
     /// `TimedOut` and the caller drops the half-open connection.
     pub fn accept_finish(&self) -> io::Result<()> {
+        self.accept_establish_begin()?;
+        wait_event(&self.event_channel, EventType::Established, ESTABLISH_TIMEOUT)
+    }
+
+    /// Server side, establish **phase one**: drive RTR → RTS and `accept` (sending
+    /// our QP number), then flip the CM channel non-blocking — **without** waiting
+    /// for ESTABLISHED. Pairs with [`poll_established`](Self::poll_established) for a
+    /// non-blocking / async establish: a worker that must not block on a slow peer
+    /// drives this once, then parks on [`cm_fd`](Self::cm_fd) between `poll_established`
+    /// calls. The blocking [`accept_finish`](Self::accept_finish) is exactly this
+    /// followed by an inline [`wait_event`] for ESTABLISHED.
+    pub fn accept_establish_begin(&self) -> io::Result<()> {
         debug_assert_eq!(self.role, Role::Server);
         let qp_number = self.with_qp(|qp| Ok(qp.qp_number()))?;
 
@@ -778,8 +790,18 @@ impl Connection {
         let mut param = ConnectionParameter::default();
         param.setup_qp_number(qp_number);
         self.id.accept(param).map_err(to_io)?;
-        wait_event(&self.event_channel, EventType::Established, ESTABLISH_TIMEOUT)?;
+        // Non-blocking so `poll_established` never blocks the caller's thread.
+        self.event_channel.set_nonblocking(true).map_err(to_io)?;
         Ok(())
+    }
+
+    /// Non-blocking step toward ESTABLISHED after
+    /// [`accept_establish_begin`](Self::accept_establish_begin): `Ok(true)` once
+    /// ESTABLISHED is reaped, `Ok(false)` if nothing is pending yet (park on
+    /// [`cm_fd`](Self::cm_fd) and retry), `Err` on a wrong/failed CM event. Never
+    /// blocks (the channel was made non-blocking by `accept_establish_begin`).
+    pub fn poll_established(&self) -> io::Result<bool> {
+        try_wait_event(&self.event_channel, &EventType::Established)
     }
 
     /// Allocate `len` zeroed bytes and register them as a memory region with the
@@ -1230,8 +1252,10 @@ impl Drop for Connection {
 /// Upper bound on the server's wait for ESTABLISHED in
 /// [`accept_finish`](Connection::accept_finish). A peer that connects then never
 /// establishes must not pin the accepting worker forever; mirrors the spirit of
-/// the first-message handshake timeout in `hord-stream`.
-const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
+/// the first-message handshake timeout in `hord-stream`. Exposed so the async
+/// server-handshake stage in `hord-async` bounds its non-blocking establish wait
+/// (driven via [`poll_established`](Connection::poll_established)) by the same value.
+pub const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Wait for the next CM event on `channel`, require it to be `want`, and ack it
 /// either way — bounded by `timeout`.
@@ -1259,36 +1283,49 @@ fn wait_event(channel: &Arc<EventChannel>, want: EventType, timeout: Duration) -
     let fd = channel.as_raw_fd();
     let deadline = Instant::now() + timeout;
     loop {
-        match channel.get_cm_event() {
-            Ok(event) => {
-                let got = event.event_type();
-                let status = event.status();
-                event.ack().map_err(to_io)?;
-                return if got == want {
-                    Ok(())
-                } else {
-                    Err(io::Error::other(format!(
-                        "expected CM event {want:?}, got {got:?} (status {status})"
-                    )))
-                };
-            }
-            // Non-blocking channel with nothing pending: park on the fd until it
-            // is readable or the deadline passes, then loop to drain it.
-            // `GetEventError` is `#[non_exhaustive]`; reach its kind via `.0`.
-            Err(e) => match &e.0 {
-                GetEventErrorKind::NoEvent => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!("timed out waiting for CM event {want:?}"),
-                        ));
-                    }
-                    poll_readable(fd, remaining)?;
-                }
-                _ => return Err(to_io(e)),
-            },
+        if try_wait_event(channel, &want)? {
+            return Ok(());
         }
+        // Nothing pending: park on the fd until it is readable or the deadline
+        // passes, then loop to drain it.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out waiting for CM event {want:?}"),
+            ));
+        }
+        poll_readable(fd, remaining)?;
+    }
+}
+
+/// One **non-blocking** step toward a CM `want` event, the shared core of both
+/// [`wait_event`] (sync: loop this + [`poll_readable`]) and the async establish
+/// driver (loop this + a reactor `readable().await`). The channel must already be
+/// non-blocking ([`EventChannel::set_nonblocking`]); this never blocks.
+///
+/// Returns `Ok(true)` when `want` arrived and was acked, `Ok(false)` when nothing
+/// is pending right now (the caller parks on the channel fd and retries), and
+/// `Err` when a *different* or failed event arrived (acked first) or the channel
+/// errored. `GetEventError` is `#[non_exhaustive]`; reach its kind via `.0`.
+fn try_wait_event(channel: &Arc<EventChannel>, want: &EventType) -> io::Result<bool> {
+    match channel.get_cm_event() {
+        Ok(event) => {
+            let got = event.event_type();
+            let status = event.status();
+            event.ack().map_err(to_io)?;
+            if got == *want {
+                Ok(true)
+            } else {
+                Err(io::Error::other(format!(
+                    "expected CM event {want:?}, got {got:?} (status {status})"
+                )))
+            }
+        }
+        Err(e) => match &e.0 {
+            GetEventErrorKind::NoEvent => Ok(false),
+            _ => Err(to_io(e)),
+        },
     }
 }
 
