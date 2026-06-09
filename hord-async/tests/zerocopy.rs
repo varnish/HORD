@@ -28,16 +28,8 @@ const PORT_TOO_LARGE: u16 = 18822; // serve_rdma_write_too_large_writes_nothing
 const PORT_GATHER: u16 = 18823; // gather_write_lands_fragments_contiguously
 const OBJECT: usize = 4 * 1024 * 1024; // 4 MiB — many MTUs, dwarfs the credit window
 
-fn pattern_byte(i: usize) -> u8 {
-    (i % 251) as u8
-}
-
-fn current_thread_rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build runtime")
-}
+mod common;
+use common::{current_thread_rt, pattern_byte};
 
 async fn read_line<R: AsyncRead + Unpin>(s: &mut R) -> String {
     let mut out = Vec::new();

@@ -40,10 +40,15 @@ future pass has what it needs.
       design). **Fix:** register the split headroom into a *separate* MR and post it
       lazily in `apply_peer` only when split mode survives negotiation.
 
-- [ ] **Minor cleanup (low priority).** The `pattern()` LCG test helper is copy-pasted
-      across 5 test modules in 3 crates — a shared test-support location would prevent
-      cross-crate drift, but a dedicated crate for a 7-line fn is over-engineering for
-      now. (Left as-is by design: the `begin_rdma_write`/`rdma_write_all`
+- [ ] **Minor cleanup (low priority).** The `pattern()` LCG test helper still lives in
+      three crates — `hord-core/tests/rdma_write_smoke.rs`,
+      `hord-zerocopy/tests/split_http_smoke.rs`, and two `#[cfg(test)]` unit-test modules
+      in `hord-stream/src/stream.rs`. The `hord-async` copies are now consolidated in
+      `hord-async/tests/common` (a shared integration-test module). DRYing the rest is
+      genuinely cross-crate: integration tests can't share code across crates and the
+      `hord-stream` copies are in-`src` unit tests no `tests/common` can reach, so the
+      only fix is a shared dev-only crate — over-engineering for a 7-line fn, deferred.
+      (Left as-is by design: the `begin_rdma_write`/`rdma_write_all`
       `_with_imm`/`_inner` wrapper trios and the C `hord_post_write`/`_with_imm` pair —
       named methods read better at call sites than threading an `Option<u32>`.)
 
@@ -75,25 +80,6 @@ single-host path.
       documented handshake **stage** — run establishment/handshake off the worker (or
       async) so a slow peer never blocks a worker's reactor. Deferred (bigger; the
       bound makes it non-urgent).
-
-### Deferred from the second HordListener code review (recall pass, 2026-06-08)
-
-The following remain consciously deferred.
-
-- [ ] **`hord-async` carries server-only deps for embedders that want only the
-      adapter.** `HordListener` pulled `log` + tokio `sync`/`macros` into what was a
-      stream-adapter crate; a host that brings its own accept loop and wants only the
-      `AsyncRead`/`AsyncWrite` adapter still compiles the listener and its deps. **Fix:**
-      put the listener behind a `listener = ["dep:log", "tokio/sync", "tokio/macros"]`
-      feature so the adapter dependency surface stays minimal. (Low priority — `log` is
-      near-zero-cost; Carapace gates the whole `hord-async` dep behind its own feature.)
-
-- [ ] **Test-support duplication.** `tests/listener.rs` adds a 6th copy of the
-      `pattern_byte`/`pattern_vec` helpers (the `pattern()` LCG dup already tracked
-      above) and of `current_thread_rt` (identical in 5 other `hord-async` test
-      modules), and the acceptor/worker/demo each re-build a current-thread runtime
-      with the same boilerplate — all candidates for a shared `tests/common` module + a
-      `build_current_thread_rt()` helper.
 
 ### Milestone 1 — HTTP/1.1 over RDMA (byte-stream parity)
 

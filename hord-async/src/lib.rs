@@ -91,7 +91,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use hord_stream::{Connection, HordConfig, HordStream, Mr, RegisteredBuffer, WriteSegment};
 use hord_zerocopy::{RdmaWriteAction, RdmaWriteReq, RdmaWriteStatus, SourcePool};
 
+#[cfg(feature = "listener")]
 mod listener;
+#[cfg(feature = "listener")]
 pub use listener::HordListener;
 
 /// Re-export so embedders get the connection-metadata type from this crate.
@@ -166,7 +168,7 @@ impl AsyncHordStream {
 
     /// A handle that can force this connection's QP down out-of-band, making the
     /// NIC quiescent so source buffers can be freed safely. See
-    /// [`HordStream::teardown_handle`]. [`HordListener`] takes one per connection
+    /// [`HordStream::teardown_handle`]. `HordListener` takes one per connection
     /// so that, if it must *abort* a task parked mid-`RDMA_WRITE` at the grace
     /// deadline, it can quiesce the NIC before the aborted future frees a source
     /// buffer the QP still references — closing the use-after-free that task abort
@@ -178,7 +180,7 @@ impl AsyncHordStream {
     // ---- connection metadata (logging / multi-tenancy) ---------------------
 
     /// The peer's address, or `None` if the CM could not resolve one. See
-    /// [`HordStream::peer_addr`] (and the trust-model note on [`HordListener`])
+    /// [`HordStream::peer_addr`] (and the trust-model note on `HordListener`)
     /// before keying tenancy or trust on it.
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.stream.peer_addr()
@@ -596,7 +598,7 @@ struct PendingWrite<'a> {
 /// went away) would leave WRs posted with the NIC still DMA-reading a source the
 /// caller is about to free — a use-after-free / torn delivery. On such a drop this
 /// guard force-tears-down the QP, making the NIC quiescent *before* the source is
-/// released — the same `ConnTeardown` quiesce [`HordListener`] performs at its grace
+/// released — the same `ConnTeardown` quiesce `HordListener` performs at its grace
 /// deadline, extended to per-future cancellation. It is disarmed on normal
 /// completion, where the drain already idled the NIC.
 struct WriteCancelGuard<'a> {

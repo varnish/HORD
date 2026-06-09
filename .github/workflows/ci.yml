@@ -29,6 +29,19 @@ jobs:
         # port, so serialize to avoid bind() races. The suite runs in seconds.
         # --locked: fail if Cargo.lock is stale rather than silently regenerating it.
         run: cargo test --locked --workspace -- --include-ignored --test-threads=1
+      - name: cargo check hord-async --no-default-features (lean adapter surface)
+        # The `listener` feature (default-on) gates HordListener + the deps only it
+        # needs (log, tokio sync/macros). This guards the feature's whole guarantee:
+        # the adapter core (AsyncRead/AsyncWrite) must keep compiling *without* them,
+        # so an embedder that brings its own accept loop can drop them via
+        # `default-features = false`. Every workspace build unifies the feature ON
+        # (hord-demo enables it), so this explicit lean check is the only thing that
+        # exercises the minimal surface — without it, a stray `log::`/`select!`/
+        # `tokio::sync` in non-gated code would rot the lean build undetected.
+        # `check`, not `build`: a type error is all we need to catch. Runs here (not
+        # the device-free `codec` job) because hord-async always pulls hord-core, so
+        # it needs rdma-core's headers — present on this runner, no active device.
+        run: cargo check --locked -p hord-async --no-default-features
 
   # Milestone-1 "device-free build" guarantee. The hord-zerocopy header codec
   # (RdmaWriteReq / RdmaWriteStatus / RdmaWriteAction) must link and test with the

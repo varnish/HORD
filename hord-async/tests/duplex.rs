@@ -30,24 +30,8 @@ const PORT: u16 = 18920; // distinct from the demo (4791) and other loopback tes
 const BODY: usize = 16 * 1024 * 1024; // 16 MiB each way — dwarfs the credit window
 const WATCHDOG: Duration = Duration::from_secs(30); // a stall (deadlock) fails fast
 
-fn current_thread_rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build runtime")
-}
-
-/// Position-sensitive byte pattern, distinct per `seed`, so each side verifies
-/// exactly what the peer sent. Matches `full_duplex_bulk`'s LCG.
-fn pattern(len: usize, seed: u8) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len);
-    let mut x = seed as u32 | 1;
-    for _ in 0..len {
-        x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-        out.push((x >> 16) as u8);
-    }
-    out
-}
+mod common;
+use common::{current_thread_rt, pattern};
 
 /// Drive one already-handshaked endpoint: split it, write `send` from one task,
 /// `read_exact(BODY)` into another, and verify the received bytes equal `expect`.

@@ -23,17 +23,8 @@ const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
 const PORT: u16 = 18620; // distinct from the demo (4791) and full_duplex (18519)
 const BODY: usize = 4 * 1024 * 1024; // 4 MiB — many messages, dwarfs the window
 
-/// Deterministic, position-sensitive payload byte (matches the demo's pattern).
-fn pattern_byte(i: usize) -> u8 {
-    (i % 251) as u8
-}
-
-fn current_thread_rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build runtime")
-}
+mod common;
+use common::{current_thread_rt, pattern_byte};
 
 #[test]
 #[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]

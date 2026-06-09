@@ -38,12 +38,8 @@ fn thread_cpu() -> Duration {
     Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
 
-fn current_thread_rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build runtime")
-}
+mod common;
+use common::current_thread_rt;
 
 #[test]
 #[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]

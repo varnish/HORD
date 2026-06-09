@@ -7,6 +7,15 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+# `listener` (default) gates the server-side `HordListener` thread-per-core
+# topology and the deps it alone needs: `log` plus tokio's `sync` (watch/mpsc)
+# and `macros` (`select!`). An embedder that brings its own accept loop and wants
+# only the `AsyncRead`/`AsyncWrite` adapter sets `default-features = false` to drop
+# all three — the adapter core (lib.rs) uses none of them.
+[features]
+default = ["listener"]
+listener = ["dep:log", "tokio/sync", "tokio/macros"]
+
 # This is the one crate in the workspace that takes third-party dependencies:
 # the async milestone targets tokio + hyper, and isolating them here keeps
 # hord-core and hord-stream dependency-free (and buildable on an air-gapped RDMA
@@ -25,14 +34,16 @@ hord-zerocopy = { path = "../hord-zerocopy", features = ["rdma"] }
 # "rt": `spawn_local`/`spawn_blocking`/`LocalSet` + the current-thread runtimes
 #   the multi-waiter split (`AsyncHordStream::into_split`) and `HordListener`'s
 #   thread-per-core workers run on.
-# "sync": `watch` (graceful-shutdown signal) + `mpsc` (acceptor → worker handoff)
-#   for `HordListener`.
-# "macros": `tokio::select!` in the listener's accept loop (shutdown vs. accept).
-tokio = { version = "1", features = ["net", "io-util", "time", "rt", "sync", "macros"] }
+# "sync"/"macros" are pulled in only by the `listener` feature (see above):
+#   "sync" = `watch` (graceful-shutdown signal) + `mpsc` (acceptor → worker
+#   handoff); "macros" = `tokio::select!` in the accept loop. The adapter core
+#   needs neither, so they are not in this base set.
+tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }
 # Lightweight logging facade for the server loop (handshake/accept/drain
 # diagnostics). Near-zero cost with no logger installed; integrates with the
-# host's `log` setup (e.g. Carapace) when there is one.
-log = "0.4"
+# host's `log` setup (e.g. Carapace) when there is one. Only the `listener`
+# feature uses it, so it is optional and pulled in via `dep:log`.
+log = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros", "sync"] }

@@ -18,6 +18,11 @@
 //!   gone) and `conn_meta()` reports a matching peer, a stamped `established_at`,
 //!   and the negotiated capabilities.
 
+// The whole suite exercises `HordListener`, which only exists under the
+// `listener` feature (on by default); compile to nothing without it so a
+// `--no-default-features` test build stays clean.
+#![cfg(feature = "listener")]
+
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime};
@@ -31,21 +36,8 @@ use hord_zerocopy::RdmaWriteReq;
 
 const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
 
-/// Deterministic, position-sensitive payload byte (matches the other tests/demo).
-fn pattern_byte(i: usize) -> u8 {
-    (i % 251) as u8
-}
-
-fn pattern_vec(n: usize) -> Vec<u8> {
-    (0..n).map(pattern_byte).collect()
-}
-
-fn current_thread_rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build runtime")
-}
+mod common;
+use common::{current_thread_rt, pattern_byte, pattern_vec};
 
 /// Server-side: read one `REQ <n>\n` line; `Ok(None)` on a clean EOF (the peer
 /// half-closed before sending another request — the keep-alive boundary).

@@ -31,16 +31,8 @@ const OBJECT: usize = 4 * 1024 * 1024; // 4 MiB — many MTUs, dwarfs the credit
 const TRANSFER_ID: u32 = 0x00C0_FFEE; // the §7.7 id echoed back on the data plane
 const DEADLINE: Duration = Duration::from_secs(30);
 
-fn current_thread_rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build runtime")
-}
-
-fn pattern_byte(i: usize) -> u8 {
-    (i % 251) as u8
-}
+mod common;
+use common::{current_thread_rt, pattern_byte};
 
 async fn read_line<R: AsyncRead + Unpin>(s: &mut R) -> String {
     let mut out = Vec::new();
