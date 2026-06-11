@@ -32,17 +32,19 @@
 //! loop can instead wait on [`Connection::cq_fd`] after [`Connection::arm_cq`].
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sideway::ibverbs::completion::{
     CompletionChannel, CompletionQueue, ExtendedCompletionQueue, GenericCompletionQueue,
     PollCompletionQueueError,
 };
+use sideway::ibverbs::device_context::DeviceContext;
 use sideway::ibverbs::memory_region::MemoryRegion;
 use sideway::ibverbs::protection_domain::ProtectionDomain;
 use sideway::ibverbs::queue_pair::{
@@ -299,18 +301,94 @@ pub struct RegisteredBuffer {
     _conn: Arc<Connection>,
 }
 
+/// Shared protection-domain registry for a listener.
+///
+/// RDMA MRs are PD-scoped. A server that wants to register a long-lived arena once
+/// and serve it across many QPs must therefore build those QPs from the same PD.
+/// `SharedPd` owns one PD per resolved device context and is passed to accepted
+/// connections through [`Listener::bind_with_shared_pd`]. A listener bound to a
+/// concrete RDMA address usually resolves its device immediately; wildcard binds
+/// may populate the registry lazily on the first connection request.
+#[derive(Default)]
+pub struct SharedPd {
+    pds: Mutex<HashMap<usize, Arc<ProtectionDomain>>>,
+}
+
+impl SharedPd {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn for_context(&self, ctx: &Arc<DeviceContext>) -> io::Result<Arc<ProtectionDomain>> {
+        let key = Arc::as_ptr(ctx) as usize;
+        let mut pds = self.pds.lock().expect("shared PD mutex poisoned");
+        if let Some(pd) = pds.get(&key) {
+            return Ok(Arc::clone(pd));
+        }
+        let pd = ctx.alloc_pd().map_err(to_io)?;
+        pds.insert(key, Arc::clone(&pd));
+        Ok(pd)
+    }
+
+    /// Number of device PDs currently owned by this registry.
+    pub fn pd_count(&self) -> usize {
+        self.pds.lock().expect("shared PD mutex poisoned").len()
+    }
+
+    fn single_pd(&self) -> io::Result<Arc<ProtectionDomain>> {
+        let pds = self.pds.lock().expect("shared PD mutex poisoned");
+        match pds.len() {
+            1 => Ok(Arc::clone(pds.values().next().unwrap())),
+            0 => Err(io::Error::other(
+                "listener shared PD has no resolved RDMA device; bind to a concrete RDMA address or accept a connection first",
+            )),
+            _ => Err(io::Error::other(
+                "listener shared PD spans multiple devices; register against a specific device",
+            )),
+        }
+    }
+
+    /// Register caller-owned memory as a source MR on the listener-shared PD.
+    ///
+    /// This is the register-once path for server-side arenas. It requires the
+    /// listener registry to have exactly one resolved device PD; multi-device
+    /// wildcard listeners need a device-specific selection layer before a single
+    /// `Mr` can safely name an `lkey`.
+    ///
+    /// # Safety
+    /// Same storage lifetime and residency contract as
+    /// [`Connection::register_external`].
+    pub unsafe fn register_external(
+        &self,
+        ptr: *mut u8,
+        len: usize,
+        access: i32,
+    ) -> io::Result<Mr> {
+        let pd = self.single_pd()?;
+        unsafe { Mr::new(pd, ptr, len, access, MrOwner::SharedPd) }
+    }
+}
+
+enum MrOwner {
+    Connection { _conn: Arc<Connection> },
+    SharedPd,
+}
+
 /// A registered memory region over **caller-owned** storage (spec §7, Milestone 3:
 /// zero-copy straight from pages the caller already holds resident — e.g. an MSE4
-/// mmap'd store or its AIO buffers). Created by [`Connection::register_external`].
+/// mmap'd store or its AIO buffers). Created by [`Connection::register_external`]
+/// or [`SharedPd::register_external`].
 ///
-/// Unlike [`RegisteredBuffer`] it does **not** allocate or own the backing bytes —
-/// it holds only the registration and an `Arc<Connection>` (so the MR cannot
-/// outlive its PD). The caller owns the storage and guarantees it stays live,
-/// resident, and unmodified for the `Mr`'s whole life and across any in-flight
-/// transfer (see [`Connection::register_external`]'s safety contract). As for any
-/// registration the NIC must be quiesced (QP destroyed) before the `Mr` is
-/// dropped; its `Drop` then runs `ibv_dereg_mr` — `_mr` is declared first so it is
-/// deregistered while the PD (kept alive by `_conn`) is still alive.
+/// Unlike [`RegisteredBuffer`] it does **not** allocate or own the backing bytes.
+/// It holds the registration, which itself holds the PD; connection-local MRs
+/// additionally retain their `Arc<Connection>`. The caller owns the storage and
+/// guarantees it stays live, resident, and unmodified for the `Mr`'s whole life
+/// and across any in-flight transfer (see
+/// [`Connection::register_external`]'s safety contract). As for any registration
+/// the NIC must be quiesced before dropping an `Mr` that may still be referenced
+/// by posted WRs. For connection-local MRs the stream layer enforces that by
+/// tearing down the QP before buffers drop; shared-PD MRs are intended to be
+/// application-lifetime registrations.
 ///
 /// `!Send` (it carries a raw pointer into caller memory), like the rest of the
 /// zero-copy data path.
@@ -321,11 +399,35 @@ pub struct Mr {
     len: usize,
     lkey: u32,
     rkey: u32,
-    // Keeps the endpoint (hence the PD) alive for this MR's whole life.
-    _conn: Arc<Connection>,
+    // For connection-local registrations, keeps the endpoint alive for this MR's
+    // whole life. Shared-PD registrations need no extra owner because
+    // MemoryRegion already holds the PD.
+    _owner: MrOwner,
 }
 
 impl Mr {
+    unsafe fn new(
+        pd: Arc<ProtectionDomain>,
+        ptr: *mut u8,
+        len: usize,
+        access: i32,
+        owner: MrOwner,
+    ) -> io::Result<Self> {
+        // SAFETY: the caller's contract guarantees `[ptr, ptr+len)` is valid and
+        // stays resident for the MR's life.
+        let mr = unsafe { pd.reg_mr(ptr as usize, len, access_flags(access)) }.map_err(to_io)?;
+        let lkey = mr.lkey();
+        let rkey = mr.rkey();
+        Ok(Mr {
+            _mr: mr,
+            addr: ptr,
+            len,
+            lkey,
+            rkey,
+            _owner: owner,
+        })
+    }
+
     /// Base address the region was registered over (the caller's pointer).
     pub fn as_mut_ptr(&self) -> *mut u8 {
         self.addr
@@ -422,20 +524,65 @@ impl RegisteredBuffer {
 pub struct Listener {
     event_channel: Arc<EventChannel>,
     _listen_id: Arc<Identifier>,
+    shared_pd: Option<Arc<SharedPd>>,
 }
 
 impl Listener {
     /// Bind to `ip:port` and start listening.
     pub fn bind(ip: &str, port: u16) -> io::Result<Listener> {
+        Self::bind_inner(ip, port, None)
+    }
+
+    /// Bind to `ip:port` and accept all connections on a listener-shared
+    /// protection domain.
+    ///
+    /// Existing [`bind`](Self::bind) keeps the historical per-connection PD
+    /// behavior. This opt-in path is what higher-level listeners use when a
+    /// long-lived server arena must be registered once and then shared by many
+    /// accepted QPs.
+    pub fn bind_with_shared_pd(ip: &str, port: u16) -> io::Result<Listener> {
+        Self::bind_inner(ip, port, Some(Arc::new(SharedPd::new())))
+    }
+
+    fn bind_inner(ip: &str, port: u16, shared_pd: Option<Arc<SharedPd>>) -> io::Result<Listener> {
         let addr = parse_addr(ip, port)?;
         let event_channel = EventChannel::new().map_err(to_io)?;
         let id = event_channel.create_id(PortSpace::Tcp).map_err(to_io)?;
         id.bind_addr(addr).map_err(to_io)?;
+        if let Some(shared) = &shared_pd {
+            if let Some(ctx) = id.get_device_context() {
+                let _ = shared.for_context(&ctx)?;
+            }
+        }
         id.listen(LISTEN_BACKLOG).map_err(to_io)?;
         Ok(Listener {
             event_channel,
             _listen_id: id,
+            shared_pd,
         })
+    }
+
+    /// Listener-shared PD registry, if this listener was created with
+    /// [`bind_with_shared_pd`](Self::bind_with_shared_pd).
+    pub fn shared_pd(&self) -> Option<Arc<SharedPd>> {
+        self.shared_pd.as_ref().map(Arc::clone)
+    }
+
+    /// Register caller-owned source memory on this listener's shared PD.
+    ///
+    /// The returned [`Mr`] can be used with connections accepted by this listener
+    /// because those QPs are built on the same PD. This is unavailable on a
+    /// per-connection-PD listener created by [`bind`](Self::bind).
+    ///
+    /// # Safety
+    /// Same storage lifetime and residency contract as
+    /// [`Connection::register_external`].
+    pub unsafe fn register_external(&self, ptr: *mut u8, len: usize) -> io::Result<Mr> {
+        let shared = self
+            .shared_pd
+            .as_ref()
+            .ok_or_else(|| io::Error::other("listener was not bound with a shared PD"))?;
+        unsafe { shared.register_external(ptr, len, ACCESS_LOCAL_WRITE) }
     }
 
     /// Block until a peer requests a connection, returning a not-yet-established
@@ -523,7 +670,7 @@ impl Listener {
                 let setup = (|| -> io::Result<Connection> {
                     let conn_channel = EventChannel::new().map_err(to_io)?;
                     id.migrate(&conn_channel).map_err(to_io)?;
-                    let ep = Endpoint::build(&id, send_wr, recv_wr)?;
+                    let ep = Endpoint::build(&id, send_wr, recv_wr, self.shared_pd.as_deref())?;
                     let conn = Connection::new(conn_channel, Arc::clone(&id), ep, Role::Server, cm);
                     conn.modify_qp(QueuePairState::Init)?;
                     Ok(conn)
@@ -594,11 +741,19 @@ struct Endpoint {
 impl Endpoint {
     /// Create PD / completion-channel / CQ / QP on the device the (resolved)
     /// `id` is bound to. The QP is left in RESET; the caller drives it to INIT.
-    fn build(id: &Identifier, send_wr: usize, recv_wr: usize) -> io::Result<Endpoint> {
+    fn build(
+        id: &Identifier,
+        send_wr: usize,
+        recv_wr: usize,
+        shared_pd: Option<&SharedPd>,
+    ) -> io::Result<Endpoint> {
         let ctx = id
             .get_device_context()
             .ok_or_else(|| io::Error::other("cm id is not bound to a device yet"))?;
-        let pd = ctx.alloc_pd().map_err(to_io)?;
+        let pd = match shared_pd {
+            Some(shared) => shared.for_context(&ctx)?,
+            None => ctx.alloc_pd().map_err(to_io)?,
+        };
 
         let comp_channel = CompletionChannel::new(&ctx).map_err(to_io)?;
         // Non-blocking so an event loop can drain it (and so the sync busy-poll
@@ -732,7 +887,7 @@ impl Connection {
         id.resolve_route(timeout).map_err(to_io)?;
         wait_event(&event_channel, EventType::RouteResolved, resolve_wait)?;
 
-        let ep = Endpoint::build(&id, send_wr, recv_wr)?;
+        let ep = Endpoint::build(&id, send_wr, recv_wr, None)?;
         let conn = Connection::new(event_channel, id, ep, Role::Client, cm);
         conn.modify_qp(QueuePairState::Init)?;
         Ok(conn)
@@ -873,19 +1028,17 @@ impl Connection {
         len: usize,
         access: i32,
     ) -> io::Result<Mr> {
-        // SAFETY: the caller's contract (above) guarantees `[ptr, ptr+len)` is
-        // valid and stays resident for the MR's life.
-        let mr = unsafe { self._pd.reg_mr(ptr as usize, len, access_flags(access)) }.map_err(to_io)?;
-        let lkey = mr.lkey();
-        let rkey = mr.rkey();
-        Ok(Mr {
-            _mr: mr,
-            addr: ptr,
-            len,
-            lkey,
-            rkey,
-            _conn: Arc::clone(self),
-        })
+        unsafe {
+            Mr::new(
+                Arc::clone(&self._pd),
+                ptr,
+                len,
+                access,
+                MrOwner::Connection {
+                    _conn: Arc::clone(self),
+                },
+            )
+        }
     }
 
     /// The QP's `max_send_sge`: the most scatter/gather entries one one-sided write

@@ -23,15 +23,15 @@
 // `--no-default-features` test build stays clean.
 #![cfg(feature = "listener")]
 
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{oneshot, watch};
 
 use hord_async::{AsyncHordStream, ConnMeta, HordListener, SharedAsyncStream};
-use hord_stream::{Connection, HordConfig};
+use hord_stream::{Connection, HordConfig, WriteSegment};
 use hord_zerocopy::RdmaWriteReq;
 
 const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
@@ -72,6 +72,12 @@ async fn request(stream: &mut AsyncHordStream, n: usize) -> std::io::Result<Vec<
     let mut buf = vec![0u8; n];
     stream.read_exact(&mut buf).await?;
     Ok(buf)
+}
+
+async fn write_line<W: AsyncWrite + Unpin>(s: &mut W, line: &str) -> std::io::Result<()> {
+    s.write_all(line.as_bytes()).await?;
+    s.write_all(b"\n").await?;
+    s.flush().await
 }
 
 /// Spawn a `HordListener` on its own thread (own runtime) running `serve_fn`.
@@ -164,6 +170,89 @@ fn keep_alive_many_requests_one_qp() {
         REQUESTS,
         "server did not serve every keep-alive request",
     );
+}
+
+#[test]
+#[ignore = "requires the Soft-RoCE device (rxe0); run with --ignored"]
+fn shared_listener_pd_mr_serves_two_connections() {
+    const PORT: u16 = 18636;
+    const OBJECT: usize = 256 * 1024;
+
+    let expected = pattern_vec(OBJECT);
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+
+    let server_expected = expected.clone();
+    let server = std::thread::spawn(move || {
+        let mut src = server_expected;
+        let listener = HordListener::bind(IP, PORT, HordConfig::default())
+            .expect("bind listener")
+            .workers(1)
+            .grace_timeout(Duration::from_secs(10));
+        let mr = unsafe { listener.register_external(src.as_mut_ptr(), src.len()) }
+            .expect("register listener-shared source MR");
+        let src_addr = mr.as_mut_ptr() as usize;
+        let lkey = mr.lkey();
+        let served = Arc::new(AtomicUsize::new(0));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        ready_tx.send(()).expect("signal listener ready");
+        current_thread_rt().block_on(listener.serve(shutdown_rx, move |stream, _peer, _sd| {
+            let served = Arc::clone(&served);
+            let shutdown_tx = shutdown_tx.clone();
+            async move {
+                let mut shared = SharedAsyncStream::new(stream);
+                let line = read_line(&mut shared).await.expect("read RDMA request");
+                let req = RdmaWriteReq::parse(&line).expect("parse RDMA request");
+                let seg = unsafe {
+                    WriteSegment::from_raw(src_addr as *const u8, lkey, OBJECT)
+                };
+                shared
+                    .rdma_write_gather(&[seg], req.addr, req.rkey)
+                    .await
+                    .expect("shared-PD gather write");
+                write_line(&mut shared, "DONE").await.expect("write done");
+                shared.disconnect();
+                if served.fetch_add(1, SeqCst) + 1 == 2 {
+                    let _ = shutdown_tx.send(true);
+                }
+            }
+        }));
+
+        drop(mr);
+        drop(src);
+    });
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("listener never became ready");
+
+    let run_client = || {
+        current_thread_rt().block_on(async {
+            let mut s = AsyncHordStream::connect(IP, PORT, &HordConfig::default())
+                .expect("connect client");
+            let dst = s
+                .register_remote_writable(OBJECT)
+                .expect("register destination");
+            let req = RdmaWriteReq {
+                addr: dst.as_mut_ptr() as u64,
+                rkey: dst.rkey(),
+                len: dst.len() as u64,
+                id: None,
+            };
+            write_line(&mut s, &req.header_value())
+                .await
+                .expect("send request");
+            let status = read_line(&mut s).await.expect("read done");
+            assert_eq!(status, "DONE");
+            let mut got = vec![0u8; OBJECT];
+            dst.copy_out(0, &mut got);
+            got
+        })
+    };
+
+    assert_eq!(run_client(), expected, "first client payload mismatch");
+    assert_eq!(run_client(), expected, "second client payload mismatch");
+    server.join().expect("server thread panicked");
 }
 
 #[test]

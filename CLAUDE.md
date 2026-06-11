@@ -136,3 +136,18 @@ therefore run only where an `rxe0` device exists: **this dev host** (the full
 runner**. The bring-up recipe is preserved in `.github/actions/setup-soft-roce`
 (retained but no longer referenced by `ci.yml`); re-add it to a job that runs on
 an rxe-capable host to test the data path in CI again.
+
+## Shared listener PD
+
+`hord-async::HordListener` binds its underlying core listener with
+`Listener::bind_with_shared_pd`, so every accepted QP on the same resolved RDMA
+device is built from the same protection domain. That is the register-once path
+for long-lived server arenas: call `HordListener::register_external` before
+`serve`, keep the returned `Mr` alive for the arena lifetime, and use its
+`lkey`/address with `WriteSegment::from_raw` or `WriteSegment::from_mr`.
+
+Low-level `hord_core::Listener::bind` intentionally preserves the historical
+per-connection-PD behavior. Use `bind_with_shared_pd` when a listener-shared MR
+must be valid across multiple accepted connections. A wildcard bind may not have
+a resolved device at bind time; listener-level registration then requires either
+a concrete RDMA bind address or a future device-selection layer.

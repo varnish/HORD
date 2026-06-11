@@ -155,7 +155,7 @@ use tokio::task::{Id, JoinError, JoinSet};
 
 use hord_stream::{
     is_connection_setup_failure, is_device_removed, ConnTeardown, Connection, HordConfig,
-    HordStream, Listener,
+    HordStream, Listener, Mr,
 };
 
 // `ReactorFd` (crate root) is the shared "raw fd owned elsewhere; drop deregisters
@@ -225,11 +225,23 @@ impl HordListener {
     /// [`grace_timeout`](Self::grace_timeout).
     pub fn bind(ip: &str, port: u16, config: HordConfig) -> io::Result<Self> {
         Ok(HordListener {
-            listener: Listener::bind(ip, port)?,
+            listener: Listener::bind_with_shared_pd(ip, port)?,
             config,
             workers: default_workers(),
             grace: DEFAULT_GRACE,
         })
+    }
+
+    /// Register caller-owned source memory on the listener-shared PD.
+    ///
+    /// The returned MR can be used by any connection accepted by this listener.
+    /// Keep it alive until no in-flight RDMA write can reference it.
+    ///
+    /// # Safety
+    /// `[ptr, ptr+len)` must stay live, resident, and unmodified until the
+    /// returned [`Mr`] is dropped and across every in-flight write that names it.
+    pub unsafe fn register_external(&self, ptr: *mut u8, len: usize) -> io::Result<Mr> {
+        unsafe { self.listener.register_external(ptr, len) }
     }
 
     /// Set the number of worker threads (clamped to at least 1). Default: the
