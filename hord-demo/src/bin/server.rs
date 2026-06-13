@@ -29,7 +29,7 @@ use hord_demo::{
 use hord_stream::{HordConfig, HordStream, Listener};
 use hord_zerocopy::{serve_rdma_write_pooled, RdmaWriteReq, RdmaWriteStatus, SourcePool, HEADER};
 
-const DEFAULT_BIND: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+const DEFAULT_BIND: &str = "192.0.2.1"; // rxe device IP fallback; override via $HORD_TEST_IP or --bind (see CLAUDE.md)
 const DEFAULT_PORT: u16 = 4791;
 const MAX_BODY: usize = 1usize << 30; // 1 GiB guard on /size/<n>
 // Per-connection zero-copy source pool (§8.3): up to this many reusable source
@@ -43,7 +43,7 @@ const SOURCE_POOL_CAP: usize = 4;
 const SOURCE_POOL_BUF_SIZE: usize = 4 << 20; // 4 MiB
 
 fn main() -> ExitCode {
-    let mut bind = DEFAULT_BIND.to_string();
+    let mut bind = std::env::var("HORD_TEST_IP").unwrap_or_else(|_| DEFAULT_BIND.to_string());
     let mut port = DEFAULT_PORT;
 
     let mut args = std::env::args().skip(1);

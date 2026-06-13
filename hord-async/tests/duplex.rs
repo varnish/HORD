@@ -25,7 +25,7 @@ use tokio::task::LocalSet;
 use hord_async::{AsyncHordStream, SplitParts};
 use hord_stream::{HordConfig, HordStream, Listener};
 
-const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const PORT: u16 = 18920; // distinct from the demo (4791) and other loopback tests
 const BODY: usize = 16 * 1024 * 1024; // 16 MiB each way — dwarfs the credit window
 const WATCHDOG: Duration = Duration::from_secs(30); // a stall (deadlock) fails fast
@@ -96,7 +96,7 @@ fn async_full_duplex_split() {
     let srv_config = config.clone();
     let srv_teardown = Arc::clone(&teardown);
     let server = std::thread::spawn(move || {
-        let listener = Listener::bind(IP, PORT).expect("bind");
+        let listener = Listener::bind(&IP, PORT).expect("bind");
         ready_tx.send(()).expect("signal ready");
         let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
         let rt = current_thread_rt();
@@ -111,7 +111,7 @@ fn async_full_duplex_split() {
     let rt = current_thread_rt();
     let local = LocalSet::new();
     rt.block_on(local.run_until(async move {
-        let stream = AsyncHordStream::connect(IP, PORT, &config).expect("connect");
+        let stream = AsyncHordStream::connect(&IP, PORT, &config).expect("connect");
         run_endpoint(stream, 0x5A, 0xA5, teardown).await;
     }));
 

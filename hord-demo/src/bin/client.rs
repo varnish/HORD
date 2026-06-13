@@ -32,12 +32,12 @@ use hord_demo::{
 use hord_stream::{HordConfig, HordStream};
 use hord_zerocopy::{RdmaWriteStatus, ZeroCopyRequest, HEADER};
 
-const DEFAULT_SERVER: &str = "77.40.251.67";
+const DEFAULT_SERVER: &str = "192.0.2.1"; // rxe device IP fallback; override via $HORD_TEST_IP or --server
 const DEFAULT_PORT: u16 = 4791;
 const DEFAULT_ZC_BUF: usize = 1 << 20; // 1 MiB, when the size isn't in the path
 
 fn main() -> ExitCode {
-    let mut server = DEFAULT_SERVER.to_string();
+    let mut server = std::env::var("HORD_TEST_IP").unwrap_or_else(|_| DEFAULT_SERVER.to_string());
     let mut port = DEFAULT_PORT;
     let mut path = "/".to_string();
     let mut quiet = false;

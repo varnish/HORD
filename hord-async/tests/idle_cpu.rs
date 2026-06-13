@@ -23,7 +23,7 @@ use tokio::io::AsyncReadExt;
 use hord_async::AsyncHordStream;
 use hord_stream::{HordConfig, HordStream, Listener};
 
-const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 
 /// CPU time consumed by the *calling thread* so far.
 fn thread_cpu() -> Duration {
@@ -53,7 +53,7 @@ fn async_idle_read_parks() {
     // Server: accept, then hold the connection open and idle (send nothing).
     let srv_config = config.clone();
     let server = std::thread::spawn(move || {
-        let listener = Listener::bind(IP, PORT).expect("bind");
+        let listener = Listener::bind(&IP, PORT).expect("bind");
         ready_tx.send(()).expect("ready");
         let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
         current_thread_rt().block_on(async move {
@@ -65,7 +65,7 @@ fn async_idle_read_parks() {
 
     ready_rx.recv().expect("server ready");
     current_thread_rt().block_on(async move {
-        let mut s = AsyncHordStream::connect(IP, PORT, &config).expect("connect");
+        let mut s = AsyncHordStream::connect(&IP, PORT, &config).expect("connect");
         // Block a read on the idle peer for IDLE. With no data and no close, the
         // task parks on the CQ fd; this thread should sit in epoll_wait.
         let cpu0 = thread_cpu();
@@ -105,7 +105,7 @@ fn sync_idle_read_busy_polls() {
     // busy-polled wait that precedes the byte.)
     let srv_config = config.clone();
     let server = std::thread::spawn(move || {
-        let listener = Listener::bind(IP, PORT).expect("bind");
+        let listener = Listener::bind(&IP, PORT).expect("bind");
         ready_tx.send(()).expect("ready");
         let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
         std::thread::sleep(HOLD);
@@ -114,7 +114,7 @@ fn sync_idle_read_busy_polls() {
     });
 
     ready_rx.recv().expect("server ready");
-    let mut s = HordStream::connect(IP, PORT, &config).expect("connect");
+    let mut s = HordStream::connect(&IP, PORT, &config).expect("connect");
     let cpu0 = thread_cpu();
     let wall0 = Instant::now();
     let mut buf = [0u8; 64];

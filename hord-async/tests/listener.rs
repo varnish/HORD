@@ -34,7 +34,7 @@ use hord_async::{AsyncHordStream, ConnMeta, HordListener, SharedAsyncStream};
 use hord_stream::{Connection, HordConfig, WriteSegment};
 use hord_zerocopy::RdmaWriteReq;
 
-const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 
 mod common;
 use common::{current_thread_rt, pattern_byte, pattern_vec};
@@ -99,7 +99,7 @@ where
     Fut: std::future::Future<Output = ()> + 'static,
 {
     let (tx, rx) = watch::channel(false);
-    let listener = HordListener::bind(IP, port, HordConfig::default())
+    let listener = HordListener::bind(&IP, port, HordConfig::default())
         .expect("bind listener")
         // One worker is plenty for these tests and keeps them deterministic.
         .workers(1)
@@ -139,7 +139,7 @@ fn keep_alive_many_requests_one_qp() {
     // count, fire shutdown, join) ALWAYS runs — a failure can't leak the listener
     // thread. Asserts come after cleanup.
     let client: Result<(), String> = current_thread_rt().block_on(async {
-        let mut s = AsyncHordStream::connect(IP, PORT, &HordConfig::default())
+        let mut s = AsyncHordStream::connect(&IP, PORT, &HordConfig::default())
             .map_err(|e| format!("connect: {e}"))?;
         for k in 0..REQUESTS {
             // A stall here (the server wrongly seeing EOF between requests) would
@@ -184,7 +184,7 @@ fn shared_listener_pd_mr_serves_two_connections() {
     let server_expected = expected.clone();
     let server = std::thread::spawn(move || {
         let mut src = server_expected;
-        let listener = HordListener::bind(IP, PORT, HordConfig::default())
+        let listener = HordListener::bind(&IP, PORT, HordConfig::default())
             .expect("bind listener")
             .workers(1)
             .grace_timeout(Duration::from_secs(10));
@@ -228,7 +228,7 @@ fn shared_listener_pd_mr_serves_two_connections() {
 
     let run_client = || {
         current_thread_rt().block_on(async {
-            let mut s = AsyncHordStream::connect(IP, PORT, &HordConfig::default())
+            let mut s = AsyncHordStream::connect(&IP, PORT, &HordConfig::default())
                 .expect("connect client");
             let dst = s
                 .register_remote_writable(OBJECT)
@@ -276,7 +276,7 @@ fn slow_handshake_does_not_stall_the_worker() {
     // its QP down and abandons it promptly — and exercises the in-handshake-task
     // teardown (the use-after-free guard the worker takes the handle for pre-spawn).
     let (shutdown, rx) = watch::channel(false);
-    let listener = HordListener::bind(IP, PORT, HordConfig::default())
+    let listener = HordListener::bind(&IP, PORT, HordConfig::default())
         .expect("bind listener")
         .workers(1)
         .grace_timeout(Duration::from_secs(1));
@@ -296,7 +296,7 @@ fn slow_handshake_does_not_stall_the_worker() {
     let (estab_tx, estab_rx) = mpsc::channel::<()>();
     let (release_tx, release_rx) = mpsc::channel::<()>();
     let staller = std::thread::spawn(move || {
-        let conn = Connection::connect(IP, PORT, 4, 4, HordConfig::default().cm)
+        let conn = Connection::connect(&IP, PORT, 4, 4, HordConfig::default().cm)
             .expect("stalling connect");
         conn.connect_finish().expect("stalling connect_finish");
         // Established but silent: never exchange the HORD handshake.
@@ -314,7 +314,7 @@ fn slow_handshake_does_not_stall_the_worker() {
     // even connecting would block ~10s.
     let started = Instant::now();
     let client: Result<(), String> = current_thread_rt().block_on(async {
-        let mut s = AsyncHordStream::connect(IP, PORT, &HordConfig::default())
+        let mut s = AsyncHordStream::connect(&IP, PORT, &HordConfig::default())
             .map_err(|e| format!("connect: {e}"))?;
         let body = tokio::time::timeout(Duration::from_secs(5), request(&mut s, N))
             .await
@@ -369,7 +369,7 @@ fn conn_meta_surfaces_peer_addr_and_caps() {
     });
 
     let client: Result<(), String> = current_thread_rt().block_on(async {
-        let mut s = AsyncHordStream::connect(IP, PORT, &HordConfig::default())
+        let mut s = AsyncHordStream::connect(&IP, PORT, &HordConfig::default())
             .map_err(|e| format!("connect: {e}"))?;
         let body = tokio::time::timeout(Duration::from_secs(10), request(&mut s, N))
             .await
@@ -452,7 +452,7 @@ fn poll_write_backpressures_slow_reader() {
     });
 
     let (blocked_observed, got) = current_thread_rt().block_on(async move {
-        let mut s = AsyncHordStream::connect(IP, PORT, &HordConfig::default()).expect("connect");
+        let mut s = AsyncHordStream::connect(&IP, PORT, &HordConfig::default()).expect("connect");
         s.write_all(format!("REQ {PAYLOAD}\n").as_bytes())
             .await
             .expect("write request");
@@ -517,7 +517,7 @@ fn serve_cancellation_winds_down_threads() {
         let marker = std::sync::Arc::new(());
         let m = marker.clone();
 
-        let listener = HordListener::bind(IP, PORT, HordConfig::default())
+        let listener = HordListener::bind(&IP, PORT, HordConfig::default())
             .expect("bind")
             .workers(1)
             .grace_timeout(Duration::from_secs(2));
@@ -577,7 +577,7 @@ fn shutdown_already_set_returns_promptly() {
     // initial `*shutdown.borrow()` check it would park on the CM fd forever.
     // (Regression for the "already-true shutdown ignored until a later toggle" bug.)
     let (_keep_sender_alive, rx) = watch::channel(true);
-    let listener = HordListener::bind(IP, PORT, HordConfig::default())
+    let listener = HordListener::bind(&IP, PORT, HordConfig::default())
         .expect("bind")
         .workers(1)
         .grace_timeout(Duration::from_secs(5));
@@ -649,7 +649,7 @@ fn shutdown_mid_backpressured_rdma_write_is_safe() {
     let (writing_tx, writing_rx) = mpsc::channel::<()>();
     let (shutdown, listener_thread) = {
         let (tx, rx) = watch::channel(false);
-        let listener = HordListener::bind(IP, PORT, HordConfig::default())
+        let listener = HordListener::bind(&IP, PORT, HordConfig::default())
             .expect("bind listener")
             .workers(1)
             .grace_timeout(GRACE);
@@ -697,7 +697,7 @@ fn shutdown_mid_backpressured_rdma_write_is_safe() {
     let (release_tx, release_rx) = oneshot::channel::<()>();
     let client_thread = std::thread::spawn(move || {
         current_thread_rt().block_on(async move {
-            let mut s = AsyncHordStream::connect(IP, PORT, &HordConfig::default()).expect("connect");
+            let mut s = AsyncHordStream::connect(&IP, PORT, &HordConfig::default()).expect("connect");
             assert!(s.split_mode_negotiated(), "client: split mode not negotiated");
             let buf = s.register_remote_writable(CHUNK).expect("register dest");
             let req = RdmaWriteReq {
@@ -801,7 +801,7 @@ fn idle_keep_alive_drains_promptly_on_shutdown() {
     let (release_tx, release_rx) = oneshot::channel::<()>();
     let client_thread = std::thread::spawn(move || {
         current_thread_rt().block_on(async move {
-            let mut s = AsyncHordStream::connect(IP, PORT, &HordConfig::default()).expect("connect");
+            let mut s = AsyncHordStream::connect(&IP, PORT, &HordConfig::default()).expect("connect");
             let body = request(&mut s, N).await.expect("request");
             assert_eq!(body.len(), N, "wrong payload length");
             let _ = ready_tx.send(()); // one request done; now idle on keep-alive

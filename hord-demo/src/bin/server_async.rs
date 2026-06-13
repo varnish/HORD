@@ -24,8 +24,9 @@
 //! runtime + `LocalSet`; it round-robins each accepted connection to a worker,
 //! which builds and `spawn_local`s the `!Send` async stream. One worker thus
 //! drives *many* connections concurrently on one core via its reactor (each with
-//! its own CQ completion-channel fd — the 1:1 model; the N:1 demux in 113.md is a
-//! later fd-economy optimization). The demo supplies only the per-connection
+//! its own CQ completion-channel fd — the 1:1 model; an N:1 demux (many CQs
+//! sharing one completion channel) is a later fd-economy optimization). The demo
+//! supplies only the per-connection
 //! service — a closure `(AsyncHordStream, Option<SocketAddr>, watch::Receiver<bool>)
 //! -> impl Future` — which is exactly the seam a host like Carapace plugs into. Ctrl-C
 //! fires the listener's graceful-shutdown signal, which stops accepting and drains
@@ -58,7 +59,7 @@ use hord_demo::{
 use hord_stream::HordConfig;
 use hord_zerocopy::{RdmaWriteReq, RdmaWriteStatus, SourcePool, HEADER};
 
-const DEFAULT_BIND: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+const DEFAULT_BIND: &str = "192.0.2.1"; // rxe device IP fallback; override via $HORD_TEST_IP or --bind (see CLAUDE.md)
 const DEFAULT_PORT: u16 = 4791;
 const MAX_BODY: usize = 1usize << 30; // 1 GiB guard on /size/<n>
 const CHUNK: usize = 256 * 1024; // streamed body chunk size
@@ -409,7 +410,7 @@ fn main() -> ExitCode {
     // one they would be silently dropped. RUST_LOG overrides the default level.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let mut bind = DEFAULT_BIND.to_string();
+    let mut bind = std::env::var("HORD_TEST_IP").unwrap_or_else(|_| DEFAULT_BIND.to_string());
     let mut port = DEFAULT_PORT;
     let mut workers: Option<usize> = None;
 

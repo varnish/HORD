@@ -25,7 +25,7 @@ use std::sync::{mpsc, Arc, Barrier};
 use hord_stream::{HordConfig, HordStream, Listener, RegisteredBuffer};
 use hord_zerocopy::{serve_rdma_write, RdmaWriteReq, RdmaWriteStatus, ZeroCopyRequest};
 
-const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const OBJECT: usize = 4 * 1024 * 1024; // 4 MiB — many MTUs, dwarfs the credit window
 
 /// Deterministic, position-sensitive payload byte (matches the demo's pattern).
@@ -80,7 +80,7 @@ fn run_case(port: u16, client_cap: usize) -> RdmaWriteStatus {
     let srv_config = config.clone();
     let srv_teardown = Arc::clone(&teardown);
     let server = std::thread::spawn(move || {
-        let listener = Listener::bind(IP, port).expect("bind");
+        let listener = Listener::bind(&IP, port).expect("bind");
         ready_tx.send(()).expect("signal ready");
         let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
         assert!(s.zero_copy_negotiated(), "server: zero-copy not negotiated");
@@ -95,7 +95,7 @@ fn run_case(port: u16, client_cap: usize) -> RdmaWriteStatus {
     });
 
     ready_rx.recv().expect("server ready");
-    let mut s = HordStream::connect(IP, port, &config).expect("connect");
+    let mut s = HordStream::connect(&IP, port, &config).expect("connect");
     assert!(s.zero_copy_negotiated(), "client: zero-copy not negotiated");
 
     let zc = ZeroCopyRequest::new(&s, client_cap).expect("register dest");

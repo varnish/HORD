@@ -28,7 +28,7 @@ use hord_core::{
     CmParams, Connection, Listener, Opcode, ACCESS_LOCAL_WRITE, ACCESS_REMOTE_WRITE,
 };
 
-const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const PORT: u16 = 18520; // distinct from the demo (4791) and full_duplex_bulk (18519)
 const LEN: usize = 16 * 1024 * 1024; // 16 MiB — many MTUs in one WR
 
@@ -59,7 +59,7 @@ fn rdma_write_round_trip() {
 
     let srv_teardown = Arc::clone(&teardown);
     let server = std::thread::spawn(move || {
-        let listener = Listener::bind(IP, PORT).expect("bind");
+        let listener = Listener::bind(&IP, PORT).expect("bind");
         ready_tx.send(()).expect("signal ready");
         let conn = listener
             .accept(4, 4, CmParams::default())
@@ -101,7 +101,7 @@ fn rdma_write_round_trip() {
     });
 
     ready_rx.recv().expect("server ready");
-    let conn = Connection::connect(IP, PORT, 4, 4, CmParams::default()).expect("connect");
+    let conn = Connection::connect(&IP, PORT, 4, 4, CmParams::default()).expect("connect");
     let conn = Arc::new(conn);
     // Destination region: zeroed, registered for remote write (local+remote).
     let dst = conn
@@ -147,7 +147,7 @@ fn rdma_write_with_imm_round_trip() {
 
     let srv_teardown = Arc::clone(&teardown);
     let server = std::thread::spawn(move || {
-        let listener = Listener::bind(IP, PORT_IMM).expect("bind");
+        let listener = Listener::bind(&IP, PORT_IMM).expect("bind");
         ready_tx.send(()).expect("signal ready");
         let conn = listener
             .accept(4, 4, CmParams::default())
@@ -195,7 +195,7 @@ fn rdma_write_with_imm_round_trip() {
     });
 
     ready_rx.recv().expect("server ready");
-    let conn = Connection::connect(IP, PORT_IMM, 4, 4, CmParams::default()).expect("connect");
+    let conn = Connection::connect(&IP, PORT_IMM, 4, 4, CmParams::default()).expect("connect");
     let conn = Arc::new(conn);
     // Destination for the payload (remote-writable), plus a small receive buffer
     // that the immediate will consume — the payload itself goes to `dst` via the
@@ -274,7 +274,7 @@ fn rdma_write_imm_only_zero_sge() {
 
     let srv_teardown = Arc::clone(&teardown);
     let server = std::thread::spawn(move || {
-        let listener = Listener::bind(IP, PORT_IMM0).expect("bind");
+        let listener = Listener::bind(&IP, PORT_IMM0).expect("bind");
         ready_tx.send(()).expect("signal ready");
         let conn = listener.accept(4, 4, CmParams::default()).expect("accept");
         let conn = Arc::new(conn);
@@ -308,7 +308,7 @@ fn rdma_write_imm_only_zero_sge() {
     });
 
     ready_rx.recv().expect("server ready");
-    let conn = Connection::connect(IP, PORT_IMM0, 4, 4, CmParams::default()).expect("connect");
+    let conn = Connection::connect(&IP, PORT_IMM0, 4, 4, CmParams::default()).expect("connect");
     let conn = Arc::new(conn);
     // A small remote-writable region: the 0-byte write targets it (writing nothing)
     // and the immediate consumes the posted recv.

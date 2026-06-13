@@ -21,7 +21,7 @@ use hord_async::{AsyncHordStream, SharedAsyncStream};
 use hord_stream::{HordConfig, HordStream, Listener, Mr, RegisteredBuffer, WriteSegment};
 use hord_zerocopy::{RdmaWriteReq, RdmaWriteStatus, SourcePool};
 
-const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const PORT: u16 = 18820; // distinct from the demo (4791) and other loopback tests
 const PORT_POOLED: u16 = 18821; // serve_rdma_write_pooled_reports_bytes_written
 const PORT_TOO_LARGE: u16 = 18822; // serve_rdma_write_too_large_writes_nothing
@@ -75,7 +75,7 @@ fn zero_copy_async_round_trip() {
     // the client's buffer, and relays the status.
     let srv_config = config.clone();
     let server = std::thread::spawn(move || {
-        let listener = Listener::bind(IP, PORT).expect("bind");
+        let listener = Listener::bind(&IP, PORT).expect("bind");
         ready_tx.send(()).expect("signal ready");
         let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
         current_thread_rt().block_on(async move {
@@ -99,7 +99,7 @@ fn zero_copy_async_round_trip() {
 
     ready_rx.recv().expect("server ready");
     current_thread_rt().block_on(async move {
-        let mut s = AsyncHordStream::connect(IP, PORT, &config).expect("connect");
+        let mut s = AsyncHordStream::connect(&IP, PORT, &config).expect("connect");
         assert!(s.zero_copy_negotiated(), "client: zero-copy not negotiated");
         let buf = s.register_remote_writable(OBJECT).expect("register dest");
         let req = RdmaWriteReq {
@@ -151,7 +151,7 @@ fn serve_rdma_write_pooled_reports_bytes_written() {
 
     let srv_config = config.clone();
     let server = std::thread::spawn(move || {
-        let listener = Listener::bind(IP, PORT_POOLED).expect("bind");
+        let listener = Listener::bind(&IP, PORT_POOLED).expect("bind");
         ready_tx.send(()).expect("signal ready");
         let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
         current_thread_rt().block_on(async move {
@@ -178,7 +178,7 @@ fn serve_rdma_write_pooled_reports_bytes_written() {
 
     ready_rx.recv().expect("server ready");
     current_thread_rt().block_on(async move {
-        let mut s = AsyncHordStream::connect(IP, PORT_POOLED, &config).expect("connect");
+        let mut s = AsyncHordStream::connect(&IP, PORT_POOLED, &config).expect("connect");
         assert!(s.zero_copy_negotiated(), "client: zero-copy not negotiated");
         let buf = s.register_remote_writable(OBJECT).expect("register dest");
         let req = RdmaWriteReq {
@@ -228,7 +228,7 @@ fn serve_rdma_write_too_large_writes_nothing() {
 
     let srv_config = config.clone();
     let server = std::thread::spawn(move || {
-        let listener = Listener::bind(IP, PORT_TOO_LARGE).expect("bind");
+        let listener = Listener::bind(&IP, PORT_TOO_LARGE).expect("bind");
         ready_tx.send(()).expect("signal ready");
         let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
         current_thread_rt().block_on(async move {
@@ -250,7 +250,7 @@ fn serve_rdma_write_too_large_writes_nothing() {
 
     ready_rx.recv().expect("server ready");
     current_thread_rt().block_on(async move {
-        let mut s = AsyncHordStream::connect(IP, PORT_TOO_LARGE, &config).expect("connect");
+        let mut s = AsyncHordStream::connect(&IP, PORT_TOO_LARGE, &config).expect("connect");
         assert!(s.zero_copy_negotiated(), "client: zero-copy not negotiated");
         let buf = s.register_remote_writable(SMALL).expect("register dest");
         // Seed the buffer so we can prove the server wrote nothing into it.
@@ -300,7 +300,7 @@ fn gather_write_lands_fragments_contiguously() {
 
     let srv_config = config.clone();
     let server = std::thread::spawn(move || {
-        let listener = Listener::bind(IP, PORT_GATHER).expect("bind");
+        let listener = Listener::bind(&IP, PORT_GATHER).expect("bind");
         ready_tx.send(()).expect("signal ready");
         let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
         current_thread_rt().block_on(async move {
@@ -351,7 +351,7 @@ fn gather_write_lands_fragments_contiguously() {
 
     ready_rx.recv().expect("server ready");
     current_thread_rt().block_on(async move {
-        let mut s = AsyncHordStream::connect(IP, PORT_GATHER, &config).expect("connect");
+        let mut s = AsyncHordStream::connect(&IP, PORT_GATHER, &config).expect("connect");
         let buf = s.register_remote_writable(TOTAL).expect("register dest");
         let req = RdmaWriteReq {
             addr: buf.as_mut_ptr() as u64,
@@ -406,7 +406,7 @@ fn over_cap_async_gather_batches_and_lands_contiguously() {
 
     let srv_config = config.clone();
     let server = std::thread::spawn(move || {
-        let listener = Listener::bind(IP, PORT_BATCH).expect("bind");
+        let listener = Listener::bind(&IP, PORT_BATCH).expect("bind");
         ready_tx.send(()).expect("signal ready");
         let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
         current_thread_rt().block_on(async move {
@@ -448,7 +448,7 @@ fn over_cap_async_gather_batches_and_lands_contiguously() {
 
     ready_rx.recv().expect("server ready");
     current_thread_rt().block_on(async move {
-        let mut s = AsyncHordStream::connect(IP, PORT_BATCH, &config).expect("connect");
+        let mut s = AsyncHordStream::connect(&IP, PORT_BATCH, &config).expect("connect");
         let buf = s.register_remote_writable(TOTAL).expect("register dest");
         let req = RdmaWriteReq {
             addr: buf.as_mut_ptr() as u64,

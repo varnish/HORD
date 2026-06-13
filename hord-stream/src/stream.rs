@@ -2259,7 +2259,7 @@ mod fullduplex_tests {
     use std::sync::{mpsc, Arc, Barrier};
     use std::time::{Duration, Instant};
 
-    const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+    static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
     const PORT: u16 = 18519; // a free port distinct from the demo's 4791
     const BODY: usize = 16 * 1024 * 1024; // 16 MiB each way — far exceeds the pipe
     const STALL: Duration = Duration::from_secs(15); // no-progress watchdog
@@ -2381,7 +2381,7 @@ mod fullduplex_tests {
         let srv_standoff = Arc::clone(&standoff);
         let srv_teardown = Arc::clone(&teardown);
         let server = std::thread::spawn(move || {
-            let listener = Listener::bind(IP, PORT).expect("bind");
+            let listener = Listener::bind(&IP, PORT).expect("bind");
             ready_tx.send(()).expect("signal ready");
             let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
             let got = drive(&mut s, &pattern(BODY, 0xA5), BODY, &srv_standoff);
@@ -2391,7 +2391,7 @@ mod fullduplex_tests {
         });
 
         ready_rx.recv().expect("server ready");
-        let mut client = HordStream::connect(IP, PORT, &config).expect("connect");
+        let mut client = HordStream::connect(&IP, PORT, &config).expect("connect");
         let got = drive(&mut client, &pattern(BODY, 0x5A), BODY, &standoff);
         assert_eq!(got, pattern(BODY, 0xA5), "client received corrupt data");
         teardown.wait();
@@ -2425,7 +2425,7 @@ mod half_close_tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+    static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
     const PORT: u16 = 18526; // distinct from the other in-crate loopback tests
     const DEADLINE: Duration = Duration::from_secs(15);
 
@@ -2441,7 +2441,7 @@ mod half_close_tests {
 
         let srv_config = config.clone();
         let server = std::thread::spawn(move || {
-            let listener = Listener::bind(IP, PORT).expect("bind");
+            let listener = Listener::bind(&IP, PORT).expect("bind");
             ready_tx.send(()).expect("signal ready");
             let s = HordStream::accept(&listener, &srv_config).expect("accept");
             s.disconnect(); // graceful half-close: DREQ → client's CM DISCONNECTED
@@ -2455,7 +2455,7 @@ mod half_close_tests {
         let (eof_tx, eof_rx) = mpsc::channel::<io::Result<usize>>();
         let cfg = config.clone();
         let reader = std::thread::spawn(move || {
-            let mut c = HordStream::connect(IP, PORT, &cfg).expect("connect");
+            let mut c = HordStream::connect(&IP, PORT, &cfg).expect("connect");
             let mut buf = [0u8; 64];
             eof_tx.send(c.read(&mut buf)).ok();
         });
@@ -2503,7 +2503,7 @@ mod split_tests {
     use std::sync::{mpsc, Arc, Barrier};
     use std::time::{Duration, Instant};
 
-    const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+    static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
     const PORT: u16 = 18522; // distinct from full_duplex_bulk (18519) and the smokes
     const PORT_BP: u16 = 18523; // split_credit_backpressure
     const PORT_BPF: u16 = 18524; // split_credit_backpressure_facade
@@ -2546,7 +2546,7 @@ mod split_tests {
         let srv_config = config.clone();
         let srv_teardown = Arc::clone(&teardown);
         let server = std::thread::spawn(move || {
-            let listener = Listener::bind(IP, PORT).expect("bind");
+            let listener = Listener::bind(&IP, PORT).expect("bind");
             ready_tx.send(()).expect("signal ready");
             let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
             assert!(
@@ -2581,7 +2581,7 @@ mod split_tests {
         });
 
         ready_rx.recv().expect("server ready");
-        let mut client = HordStream::connect(IP, PORT, &config).expect("connect");
+        let mut client = HordStream::connect(&IP, PORT, &config).expect("connect");
         assert!(
             client.split_mode_negotiated(),
             "client: split mode should have negotiated"
@@ -2660,7 +2660,7 @@ mod split_tests {
         let srv_config = config.clone();
         let srv_teardown = Arc::clone(&teardown);
         let server = std::thread::spawn(move || {
-            let listener = Listener::bind(IP, PORT_ZL).expect("bind");
+            let listener = Listener::bind(&IP, PORT_ZL).expect("bind");
             ready_tx.send(()).expect("signal ready");
             let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
             assert!(s.split_mode_negotiated(), "server: split mode should negotiate");
@@ -2681,7 +2681,7 @@ mod split_tests {
         });
 
         ready_rx.recv().expect("server ready");
-        let mut client = HordStream::connect(IP, PORT_ZL, &config).expect("connect");
+        let mut client = HordStream::connect(&IP, PORT_ZL, &config).expect("connect");
         assert!(client.split_mode_negotiated(), "client: split mode should negotiate");
 
         // A small remote-writable target; the 0-byte writes land nothing in it.
@@ -2730,7 +2730,7 @@ mod split_tests {
         let srv_config = config.clone();
         let srv_teardown = Arc::clone(&teardown);
         let server = std::thread::spawn(move || {
-            let listener = Listener::bind(IP, PORT_FAIL).expect("bind");
+            let listener = Listener::bind(&IP, PORT_FAIL).expect("bind");
             ready_tx.send(()).expect("signal ready");
             let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
             assert!(s.split_mode_negotiated());
@@ -2751,7 +2751,7 @@ mod split_tests {
         });
 
         ready_rx.recv().expect("server ready");
-        let mut client = HordStream::connect(IP, PORT_FAIL, &config).expect("connect");
+        let mut client = HordStream::connect(&IP, PORT_FAIL, &config).expect("connect");
         assert!(client.split_mode_negotiated());
         let buf = client.register_remote_writable(CLIENT_CAP).expect("register dst");
         target_tx
@@ -2813,7 +2813,7 @@ mod split_tests {
         let srv_config = config.clone();
         let srv_teardown = Arc::clone(&teardown);
         let server = std::thread::spawn(move || {
-            let listener = Listener::bind(IP, PORT_BP).expect("bind");
+            let listener = Listener::bind(&IP, PORT_BP).expect("bind");
             ready_tx.send(()).expect("signal ready");
             let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
             assert!(s.split_mode_negotiated(), "server: split mode should negotiate");
@@ -2867,7 +2867,7 @@ mod split_tests {
         });
 
         ready_rx.recv().expect("server ready");
-        let mut client = HordStream::connect(IP, PORT_BP, &config).expect("connect");
+        let mut client = HordStream::connect(&IP, PORT_BP, &config).expect("connect");
         assert!(client.split_mode_negotiated(), "client: split mode should negotiate");
 
         let bufs: Vec<RegisteredBuffer> = (0..N)
@@ -2926,7 +2926,7 @@ mod split_tests {
         let srv_config = config.clone();
         let srv_teardown = Arc::clone(&teardown);
         let server = std::thread::spawn(move || {
-            let listener = Listener::bind(IP, PORT_BPF).expect("bind");
+            let listener = Listener::bind(&IP, PORT_BPF).expect("bind");
             ready_tx.send(()).expect("signal ready");
             let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
             assert!(s.split_mode_negotiated(), "server: split mode should negotiate");
@@ -2958,7 +2958,7 @@ mod split_tests {
         });
 
         ready_rx.recv().expect("server ready");
-        let mut client = HordStream::connect(IP, PORT_BPF, &config).expect("connect");
+        let mut client = HordStream::connect(&IP, PORT_BPF, &config).expect("connect");
         assert!(client.split_mode_negotiated(), "client: split mode should negotiate");
 
         let bufs: Vec<RegisteredBuffer> = (0..N)
@@ -3011,7 +3011,7 @@ mod gather_tests {
     use std::io::{Read, Write};
     use std::sync::mpsc;
 
-    const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+    static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
     const PORT: u16 = 18530; // distinct from the other in-crate loopback tests
     const SEG_LEN: usize = 64 * 1024; // per-allocation (per-segment) size
     const N_SEG: usize = 40; // > MAX_WRITE_SGE (16) -> the gather spans several WRs
@@ -3030,7 +3030,7 @@ mod gather_tests {
 
         let srv_config = config.clone();
         let server = std::thread::spawn(move || {
-            let listener = Listener::bind(IP, PORT).expect("bind");
+            let listener = Listener::bind(&IP, PORT).expect("bind");
             ready_tx.send(()).expect("ready");
             let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
             // The whole point of the test is multi-WR packing; the QP cap (<= 16)
@@ -3077,7 +3077,7 @@ mod gather_tests {
         });
 
         ready_rx.recv().expect("ready");
-        let mut c = HordStream::connect(IP, PORT, &config).expect("connect");
+        let mut c = HordStream::connect(&IP, PORT, &config).expect("connect");
         let buf = c.register_remote_writable(TOTAL).expect("reg dst");
         write_line(&mut c, &format!("{} {}", buf.as_mut_ptr() as u64, buf.rkey()));
         assert_eq!(read_line(&mut c), "done");
@@ -3115,7 +3115,7 @@ mod gather_tests {
         let srv_config = config.clone();
         let srv_teardown = Arc::clone(&teardown);
         let server = std::thread::spawn(move || {
-            let listener = Listener::bind(IP, PORT_BATCH).expect("bind");
+            let listener = Listener::bind(&IP, PORT_BATCH).expect("bind");
             ready_tx.send(()).expect("ready");
             let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
             assert!(s.split_mode_negotiated(), "server: split mode should negotiate");
@@ -3148,7 +3148,7 @@ mod gather_tests {
         });
 
         ready_rx.recv().expect("server ready");
-        let mut client = HordStream::connect(IP, PORT_BATCH, &config).expect("connect");
+        let mut client = HordStream::connect(&IP, PORT_BATCH, &config).expect("connect");
         assert!(client.split_mode_negotiated(), "client: split mode should negotiate");
         let buf = client.register_remote_writable(TOTAL).expect("register dst");
         desc_tx

@@ -37,12 +37,13 @@ runs:
         NETDEV=$(ip -o -4 route show default | awk '{print $5}' | head -1)
         echo "Backing netdev: ${NETDEV}"
 
-        # The RDMA loopback tests hardcode 77.40.251.67 (this is the dev host's
-        # rxe0 address — see CLAUDE.md). Give the runner's NIC that same address
-        # as a host-local /32: traffic to it is delivered locally and loops back
-        # through the rxe device, exactly as localhost does on the dev host. This
-        # keeps the test sources identical across the dev host and CI.
-        sudo ip addr add 77.40.251.67/32 dev "${NETDEV}" || true
+        # The RDMA loopback tests default to 192.0.2.1 (a reserved RFC 5737
+        # documentation address), overridable with $HORD_TEST_IP — see CLAUDE.md.
+        # Give the runner's NIC that address as a host-local /32: traffic to it is
+        # delivered locally and loops back through the rxe device, exactly as
+        # localhost does. This keeps the test sources identical across hosts.
+        TEST_IP="${HORD_TEST_IP:-192.0.2.1}"
+        sudo ip addr add "${TEST_IP}/32" dev "${NETDEV}" || true
         sudo rdma link add rxe0 type rxe netdev "${NETDEV}"
         sudo ip link set "${NETDEV}" up
 

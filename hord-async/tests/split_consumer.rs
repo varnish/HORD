@@ -25,7 +25,7 @@ use hord_async::{AsyncHordStream, SharedAsyncStream, SplitParts};
 use hord_stream::{HordConfig, HordStream, Listener, RegisteredBuffer};
 use hord_zerocopy::{RdmaWriteReq, RdmaWriteStatus};
 
-const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const PORT: u16 = 18921; // distinct from the demo (4791) and other loopback tests
 const OBJECT: usize = 4 * 1024 * 1024; // 4 MiB — many MTUs, dwarfs the credit window
 const TRANSFER_ID: u32 = 0x00C0_FFEE; // the §7.7 id echoed back on the data plane
@@ -80,7 +80,7 @@ fn split_data_plane_separate_task() {
     let srv_config = config.clone();
     let srv_teardown = Arc::clone(&teardown);
     let server = std::thread::spawn(move || {
-        let listener = Listener::bind(IP, PORT).expect("bind");
+        let listener = Listener::bind(&IP, PORT).expect("bind");
         ready_tx.send(()).expect("signal ready");
         let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
         current_thread_rt().block_on(async move {
@@ -107,7 +107,7 @@ fn split_data_plane_separate_task() {
     let rt = current_thread_rt();
     let local = LocalSet::new();
     rt.block_on(local.run_until(async move {
-        let stream = AsyncHordStream::connect(IP, PORT, &config).expect("connect");
+        let stream = AsyncHordStream::connect(&IP, PORT, &config).expect("connect");
         let SplitParts { read, write, data } = stream.into_split();
         assert!(data.split_mode_negotiated(), "client: split mode not negotiated");
 

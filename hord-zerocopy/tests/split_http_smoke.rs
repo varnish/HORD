@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use hord_stream::{HordConfig, HordStream, Listener};
 use hord_zerocopy::{serve_rdma_write, RdmaWriteReq, RdmaWriteStatus, SplitReceiver, ZeroCopyRequest};
 
-const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const PORT: u16 = 18523; // distinct from the stream/core tests and the demo
 const STALL: Duration = Duration::from_secs(15);
 
@@ -67,7 +67,7 @@ fn split_http_round_trip() {
     let srv_config = config.clone();
     let srv_teardown = Arc::clone(&teardown);
     let server = std::thread::spawn(move || {
-        let listener = Listener::bind(IP, PORT).expect("bind");
+        let listener = Listener::bind(&IP, PORT).expect("bind");
         ready_tx.send(()).expect("signal ready");
         let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
         assert!(s.zero_copy_negotiated() && s.split_mode_negotiated());
@@ -96,7 +96,7 @@ fn split_http_round_trip() {
     });
 
     ready_rx.recv().expect("server ready");
-    let mut client = HordStream::connect(IP, PORT, &config).expect("connect");
+    let mut client = HordStream::connect(&IP, PORT, &config).expect("connect");
     assert!(client.zero_copy_negotiated() && client.split_mode_negotiated());
 
     // Control plane: register a destination per transfer and advertise it with a

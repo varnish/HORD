@@ -19,14 +19,18 @@ verbs/RDMA-CM device that emulates RoCE over a regular Ethernet NIC.
 | Item            | Value                                            |
 | --------------- | ------------------------------------------------ |
 | RDMA device     | `rxe0`                                            |
-| Backing netdev  | `enp14s0`                                         |
+| Backing netdev  | `<NETDEV>`                                         |
 | Protocol        | RoCE v2 (RDMA over UDP, dst port **4791**)        |
-| RoCEv2 GID      | `::ffff:77.40.251.67` (GID index 1)              |
+| RoCEv2 GID      | `::ffff:<HOST_IP>` (GID index 1)                  |
 | Kernel module   | `rdma_rxe` (in-tree)                             |
 
+`<NETDEV>` and `<HOST_IP>` are host-specific — substitute your machine's
+RoCE-backing Ethernet interface and its RoCEv2 IP (from `ip addr` /
+`rdma link show`).
+
 Point HORD's RDMA connection setup at device `rxe0` / GID index 1, or connect
-to IP `77.40.251.67`. For single-host tests, run both endpoints against `rxe0`
-and connect over `localhost` — the data path loops back internally.
+to the host's RoCEv2 IP (`<HOST_IP>`). For single-host tests, run both endpoints
+against `rxe0` and connect over `localhost` — the data path loops back internally.
 
 ### Persistence (survives reboot)
 
@@ -34,28 +38,28 @@ Two pieces, both installed system-wide:
 
 - `/etc/modules-load.d/rdma_rxe.conf` — loads the `rdma_rxe` module at boot.
 - `/etc/systemd/system/soft-roce.service` — oneshot unit that recreates the
-  `rxe0` link on `enp14s0` after `network-online.target`. Enabled.
+  `rxe0` link on `<NETDEV>` after `network-online.target`. Enabled.
 
 The unit is idempotent (it deletes any existing `rxe0` before re-adding), so
 `systemctl restart soft-roce` is safe.
 
 ### Firewall
 
-`enp14s0` carries a public IP and RoCEv2 has no authentication, so inbound
+`<NETDEV>` carries a public IP and RoCEv2 has no authentication, so inbound
 RoCE from the internet is blocked:
 
 - ufw default incoming policy is `DROP` (blocks 4791 already), **plus**
-- an explicit `ufw deny in on enp14s0 ... port 4791 proto udp` rule (v4 + v6).
+- an explicit `ufw deny in on <NETDEV> ... port 4791 proto udp` rule (v4 + v6).
 
 Local loopback testing is unaffected (looped traffic traverses `lo`, not the
-`enp14s0` ingress path). If you later want **multi-host** RoCE over `enp14s0`,
+`<NETDEV>` ingress path). If you later want **multi-host** RoCE over `<NETDEV>`,
 you must replace the blanket deny with an `allow ... from <peer>` rule.
 
 ### Operating it
 
 ```sh
 # Status / inspect
-rdma link show                       # expect: rxe0/1 state ACTIVE ... netdev enp14s0
+rdma link show                       # expect: rxe0/1 state ACTIVE ... netdev <NETDEV>
 ibv_devices                          # rxe0 should be listed
 ibv_devinfo -d rxe0                  # PORT_ACTIVE, link_layer Ethernet, RoCE v2
 systemctl status soft-roce.service
@@ -71,7 +75,7 @@ sudo systemctl stop soft-roce        # tear down rxe0 (keeps it gone until start
 # Full teardown (also disable persistence)
 sudo systemctl disable --now soft-roce.service
 sudo rm /etc/modules-load.d/rdma_rxe.conf /etc/systemd/system/soft-roce.service
-sudo ufw delete deny in on enp14s0 to any port 4791 proto udp
+sudo ufw delete deny in on <NETDEV> to any port 4791 proto udp
 sudo modprobe -r rdma_rxe
 ```
 
@@ -89,6 +93,22 @@ sudo modprobe -r rdma_rxe
 Most of the meaningful tests (the actual RDMA data path) are `#[ignore]`d
 because they need the `rxe0` device above. They do **not** run under a bare
 `cargo test`. Always include them when `rxe0` is up:
+
+The loopback tests and demos connect over the rxe device's RoCEv2 IP, read from
+the `HORD_TEST_IP` environment variable and defaulting to `192.0.2.1` (a reserved
+RFC 5737 documentation address — no real host IP is baked into the tree). So
+either point the tests at this host's device IP:
+
+```sh
+HORD_TEST_IP=<HOST_IP> cargo test --workspace -- --include-ignored --test-threads=1
+```
+
+or assign the default address to `<NETDEV>` once so the bare command resolves to a
+GID (`rdma link show` then lists `::ffff:192.0.2.1`):
+
+```sh
+sudo ip addr add 192.0.2.1/32 dev <NETDEV>   # then HORD_TEST_IP is unnecessary
+```
 
 ```sh
 # Full suite incl. the RDMA loopback tests. --test-threads=1 because a few

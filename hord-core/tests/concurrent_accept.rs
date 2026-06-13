@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use hord_core::{CmParams, Connection, Listener};
 
-const IP: &str = "77.40.251.67"; // rxe0 / enp14s0 (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const PORT: u16 = 18522; // distinct from the write smoke tests (18520/18521)
 const N: usize = 4; // concurrent connections
 const WATCHDOG: Duration = Duration::from_secs(30); // generous; loopback is ~instant
@@ -69,7 +69,7 @@ fn run_concurrent_accept() {
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     let server = thread::spawn(move || {
-        let listener = Listener::bind(IP, PORT).expect("bind");
+        let listener = Listener::bind(&IP, PORT).expect("bind");
         ready_tx.send(()).expect("signal ready");
 
         let mut workers = Vec::with_capacity(N);
@@ -96,7 +96,7 @@ fn run_concurrent_accept() {
     let mut clients = Vec::with_capacity(N);
     for _ in 0..N {
         clients.push(thread::spawn(|| {
-            let conn = Connection::connect(IP, PORT, 2, 2, CmParams::default()).expect("connect");
+            let conn = Connection::connect(&IP, PORT, 2, 2, CmParams::default()).expect("connect");
             conn.connect_finish().expect("connect_finish");
             conn.shutdown();
         }));
