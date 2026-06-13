@@ -89,8 +89,7 @@ cargo test -p hord-zerocopy
 | [PROTOTYPE.md](PROTOTYPE.md)    | What this implementation does, design notes, prototype limits. |
 | [testing.md](testing.md)        | Hardware / GPUDirect (§7.5) test plan.                         |
 | [TODO.md](TODO.md)              | Remaining work and deferred review items.                      |
-| [CLAUDE.md](CLAUDE.md)          | The Soft-RoCE dev environment on this host.                    |
-| [SIDEWAY-PORT.md](SIDEWAY-PORT.md) | The C-shim → `sideway` transport port.                      |
+| [CLAUDE.md](CLAUDE.md)          | The Soft-RoCE dev environment (host-specific setup notes).     |
 
 ## License
 

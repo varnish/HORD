@@ -58,7 +58,7 @@ so it should work unchanged on capable hardware).
   peer's recv WRs; an immediate returns no stream data credit. The `--split`
   flag on the async/hyper demo exercises it end to end.
 
-Verified on this host's Soft-RoCE device (`rxe0`, loopback over `enp14s0`):
+Verified on a Soft-RoCE device (`rxe0`, looped back over a local Ethernet NIC):
 ~0.7–0.75 GiB/s for bodies from 1 MiB to 1 GiB, flat with size, byte-pattern
 integrity checked end to end.
 
@@ -77,11 +77,12 @@ copies through a staging buffer. There is plenty of headroom — see
 ## Layout
 
 ```
-hord-core/     RDMA transport. Safe Rust wrappers over a small C shim
-               (csrc/shim.c) that drives librdmacm + libibverbs. The shim
-               exists because the verbs data-path calls (ibv_post_send,
-               ibv_poll_cq, ...) are `static inline` in the rdma-core headers
-               and therefore not linkable symbols.
+hord-core/     RDMA transport. Safe Rust over librdmacm + libibverbs through
+               the `sideway` crate (a safe rdma-core wrapper), plus
+               `rdma-mummy-sys` for the few CQ-event-channel calls sideway does
+               not yet wrap. (Earlier revisions drove rdma-core through a
+               hand-written C shim; the sideway port replaced it — see git
+               history.)
 hord-stream/   HORD wire protocol: handshake, envelope, credit flow control,
                and the HordStream byte stream (Read + Write), factored over a
                non-blocking core that both the sync facade and the async wrapper
@@ -116,23 +117,26 @@ NIC and no rdma-core (`cargo test -p hord-zerocopy`). Its `rdma` feature pulls i
 
 ## Building
 
-Needs a C compiler and the RDMA dev packages:
+Needs the RDMA dev packages plus clang/libclang (sideway's `rdma-mummy-sys`
+runs bindgen against the rdma-core headers):
 
 ```sh
-sudo apt-get install -y libibverbs-dev librdmacm-dev   # provides headers + .so symlinks
+sudo apt-get install -y libibverbs-dev librdmacm-dev clang libclang-dev pkg-config
 cargo build --release
 ```
 
 ## Running (Soft-RoCE loopback)
 
-The defaults target this host's `rxe0` device (IP `77.40.251.67`, see
-`CLAUDE.md`). `rdma_cm` resolves that IP to the RoCEv2 GID and the rxe transport
-loops it back internally. (Note: `127.0.0.1` does **not** work — it routes via
-`lo`, which has no RDMA device.)
+The defaults target an `rxe0` device over the RoCEv2 IP `192.0.2.1` (a reserved
+RFC 5737 documentation address). Assign that address to your rxe-backing NIC, or
+point the demos elsewhere with `$HORD_TEST_IP` (or `--bind`/`--server`); see
+`CLAUDE.md` for the device setup. `rdma_cm` resolves the IP to the RoCEv2 GID and
+the rxe transport loops it back internally. (Note: `127.0.0.1` does **not** work
+— it routes via `lo`, which has no RDMA device.)
 
 ```sh
 # Terminal 1
-./target/release/hord-server                 # listens on 77.40.251.67:4791
+./target/release/hord-server                 # listens on 192.0.2.1:4791
 
 # Terminal 2
 ./target/release/hord-client --path /                       # small greeting
@@ -323,8 +327,10 @@ Both of the remaining design-level items were then closed by the **async pass**:
   host byte order ... the verbs implementation handles conversion." In practice
   the verbs `imm_data` field is `__be32` and *no* automatic conversion happens —
   the application must `htonl` on send and `ntohl` on receive (this prototype
-  does so in the C shim, so Rust sees a host-order `u32`). Same-endian peers round
-  trip either way; the conversion only matters cross-endian. Recommend §12 say
+  does so in `hord-core` — `id.to_be()` on post, `u32::from_be` on the
+  completion — so the rest of the code sees a host-order `u32`). Same-endian
+  peers round trip either way; the conversion only matters cross-endian.
+  Recommend §12 say
   the immediate travels big-endian on the wire and the application is responsible
   for the conversion (rather than implying the library does it).
 - **The recv buffer a write-with-imm consumes carries no data (spec §7.7.5).**

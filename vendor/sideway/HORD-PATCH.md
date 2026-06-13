@@ -9,8 +9,7 @@ This is an unmodified vendored copy of [`sideway`](https://crates.io/crates/side
 **1. `Identifier::migrate(&self, &Arc<EventChannel>)`** wrapping `rdma_migrate_id`,
 so an accepted connection can be moved to its own event channel (the listener's
 channel only carries connect requests). Without it, a threaded/looping acceptor
-races each worker's establish-wait on the shared channel. See `SIDEWAY-PORT.md`
-and the upstream issue.
+races each worker's establish-wait on the shared channel. See the upstream issue.
 
 **2. `Identifier::peer_addr(&self) -> Option<SocketAddr>`** wrapping
 `rdma_get_peer_addr`, so the HORD listener (`hord-async::HordListener`) can label
