@@ -35,7 +35,7 @@ This document is an early draft intended to seed discussion and guide implementa
 
 Hyperscaler object storage (S3, GCS, Azure Blob) is increasingly consumed by GPU compute nodes connected via InfiniBand or RoCE. The kernel TCP/IP stack introduces unnecessary overhead: context switches, buffer copies, and interrupt processing that add latency and consume CPU cycles needed for compute.
 
-RDMA eliminates these costs through kernel bypass and zero-copy transfers, but has historically required application-specific protocols. Rather than replacing HTTP with a custom RDMA protocol, HORD keeps HTTP as the application protocol and replaces only the transport. This preserves the entire HTTP ecosystem — caching semantics, content negotiation, range requests, authentication — while delivering RDMA-class performance.
+RDMA eliminates these costs through kernel bypass and zero-copy transfers, but has historically required application-specific protocols. Rather than replacing HTTP with a custom RDMA protocol, HORD keeps HTTP as the application protocol and replaces only the transport. This preserves the entire HTTP ecosystem; caching semantics, content negotiation, range requests, authentication, while delivering RDMA-class performance.
 
 ### 1.1 Target Environments
 
@@ -119,33 +119,33 @@ HORD specifies a narrow subset of HTTP/1.1, sufficient for bulk object reads and
 
 #### 4.1.1 Required
 
-- **Methods:** GET, HEAD.
-- **Status codes:** the full 1xx–5xx range as defined by RFC 9110.
-- **Framing:** `Content-Length`, `Content-Type`, `Content-Range`. Every HORD response carries a known length; see [Section 4.1.2](#412-out-of-scope) on chunked.
-- **Range:** single-range `Range` requests and `Content-Range` in 206 responses. Multipart byteranges are not supported.
-- **Conditional requests:** `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `ETag`, `Last-Modified`.
-- **Caching:** `Cache-Control`, `Age`, `Expires`, `Date`.
-- **Authorization:** the `Authorization` header is forwarded opaquely (bearer tokens).
-- **Connection control:** `Connection: close`. Persistent connections are the default per HTTP/1.1.
-- **Identification:** `Server`, `User-Agent` permitted; not interpreted by HORD.
-- **HORD extensions:** `X-HORD-*` (see [Section 7](#7-zero-copy-extension) and [Section 12](#12-wire-format-reference)).
-- **Pipelining:** Multiple in-flight requests on a single connection are supported and expected — prefetch controllers issue many GETs concurrently. Control-plane responses are returned in request order. Data-plane completions in split mode ([Section 7.7](#77-protocol-splitting)) MAY arrive in any order relative to one another and to the control-plane responses; clients demultiplex by transfer `id`.
+- Methods: GET, HEAD.
+- Status codes: the full 1xx–5xx range as defined by RFC 9110.
+- Framing: `Content-Length`, `Content-Type`, `Content-Range`. Every HORD response carries a known length; see [Section 4.1.2](#412-out-of-scope) on chunked.
+- Range: single-range `Range` requests and `Content-Range` in 206 responses. Multipart byteranges are not supported.
+- Conditional requests: `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `ETag`, `Last-Modified`.
+- Caching: `Cache-Control`, `Age`, `Expires`, `Date`.
+- Authorization: the `Authorization` header is forwarded opaquely (bearer tokens).
+- Connection control: `Connection: close`. Persistent connections are the default per HTTP/1.1.
+- Identification: `Server`, `User-Agent` permitted; not interpreted by HORD.
+- HORD extensions: `X-HORD-*` (see [Section 7](#7-zero-copy-extension) and [Section 12](#12-wire-format-reference)).
+- Pipelining: Multiple in-flight requests on a single connection are supported and expected — prefetch controllers issue many GETs concurrently. Control-plane responses are returned in request order. Data-plane completions in split mode ([Section 7.7](#77-protocol-splitting)) MAY arrive in any order relative to one another and to the control-plane responses; clients demultiplex by transfer `id`.
 
 #### 4.1.2 Out of scope
 
 Clients SHOULD NOT send and servers MAY reject (with 400 or 501) or ignore the following:
 
-- **Write methods:** PUT, POST, DELETE, PATCH.
-- **Other methods:** CONNECT, OPTIONS, TRACE.
-- **Content negotiation:** `Accept`, `Accept-Language`, `Accept-Charset`, `Vary`. HORD assumes the client knows the object's representation by key.
-- **Compression:** `Content-Encoding`, `Accept-Encoding`. Trading CPU for bandwidth runs counter to HORD's purpose; objects are served as stored.
-- **Transfer-Encoding:** `chunked` and other transfer codings. HORD always knows response length, and zero-copy ([Section 7](#7-zero-copy-extension)) requires it.
-- **Trailers:** `TE`, `Trailer`.
-- **Continuation:** `Expect: 100-continue`.
-- **Protocol upgrade:** `Upgrade`, `Connection: upgrade`. There is no upgrade path on a HORD connection.
-- **Authentication challenges:** 401/407 with `WWW-Authenticate` / `Proxy-Authenticate` flows. Bearer tokens via `Authorization` only.
-- **State:** `Cookie`, `Set-Cookie`.
-- **Multipart ranges:** `multipart/byteranges`.
+- Write methods: PUT, POST, DELETE, PATCH.
+- Other methods: CONNECT, OPTIONS, TRACE.
+- Content negotiation: `Accept`, `Accept-Language`, `Accept-Charset`, `Vary`. HORD assumes the client knows the object's representation by key.
+- Compression: `Content-Encoding`, `Accept-Encoding`. Trading CPU for bandwidth runs counter to HORD's purpose; objects are served as stored.
+- Transfer-Encoding: `chunked` and other transfer codings. HORD always knows response length, and zero-copy ([Section 7](#7-zero-copy-extension)) requires it.
+- Trailers: `TE`, `Trailer`.
+- Continuation: `Expect: 100-continue`.
+- Protocol upgrade: `Upgrade`, `Connection: upgrade`. There is no upgrade path on a HORD connection.
+- Authentication challenges: 401/407 with `WWW-Authenticate` / `Proxy-Authenticate` flows. Bearer tokens via `Authorization` only.
+- State: `Cookie`, `Set-Cookie`.
+- Multipart ranges: `multipart/byteranges`.
 
 #### 4.1.3 Normalizing upstream content
 
@@ -376,7 +376,7 @@ If `id` is omitted, the server uses plain RDMA write (Section 7.3). If present a
 2. Post a final write-with-immediate with `imm_data` set to the client's transfer ID (may carry the last payload portion or be zero-length).
 3. Send the HTTP response on the stream as in Section 7.3.
 
-**Ordering:** The CQ completion will typically arrive _before_ the HTTP response. Implementations MUST NOT assume a specific ordering between them.
+Ordering: The CQ completion will typically arrive _before_ the HTTP response. Implementations MUST NOT assume a specific ordering between them.
 
 #### 7.7.5 Completion Semantics
 
@@ -439,8 +439,8 @@ On-Demand Paging (optional): If the NIC supports ODP, regions can be registered 
 
 ### 8.4 Large Object Handling
 
-- **Stream path:** Segmented across multiple RDMA sends automatically.
-- **Zero-copy path:** Single large RDMA write (or multiple if constrained by max WR size). The RDMA layer handles MTU segmentation.
+- Stream path: Segmented across multiple RDMA sends automatically.
+- Zero-copy path: Single large RDMA write (or multiple if constrained by max WR size). The RDMA layer handles MTU segmentation.
 
 ---
 
@@ -513,13 +513,13 @@ Implementations SHOULD enforce:
 
 ### 11.4 Peer Identity and Trust Model
 
-RDMA queue pairs carry no transport authentication: there is no TLS handshake, and a connection's only attestable identity is the peer's source address as resolved by the connection manager — for RoCEv2, the peer's GID in IP-address form. An implementation MAY surface this per connection so a multi-tenant host can attach a tenant dimension (cache-key namespace, log/metric labels, PURGE authority) keyed on the peer, but doing so rests on a **last-hop trusted-fabric** assumption: the address is only as trustworthy as the fabric, since a peer able to place packets on the fabric can spoof a source GID. Hosts requiring isolation stronger than the fabric provides MUST enforce it below HORD — dedicated fabrics, RoCEv2 VLANs, or InfiniBand partitions per tenant (see [Transport Security](#111-transport-security)). HORD does not authenticate peers.
+RDMA queue pairs carry no transport authentication: there is no TLS handshake, and a connection's only attestable identity is the peer's source address as resolved by the connection manager — for RoCEv2, the peer's GID in IP-address form. An implementation MAY surface this per connection so a multi-tenant host can attach a tenant dimension (cache-key namespace, log/metric labels, PURGE authority) keyed on the peer, but doing so rests on a *last-hop trusted-fabric* assumption: the address is only as trustworthy as the fabric, since a peer able to place packets on the fabric can spoof a source GID. Hosts requiring isolation stronger than the fabric provides MUST enforce it below HORD — dedicated fabrics, RoCEv2 VLANs, or InfiniBand partitions per tenant (see [Transport Security](#111-transport-security)). HORD does not authenticate peers.
 
 ---
 
 ## 12. Wire Format Reference
 
-All multi-byte integer fields in HORD wire formats are transmitted in network byte order (big-endian). The handshake magic value `0x484F5244` is the ASCII sequence `H`, `O`, `R`, `D` (bytes `0x48 0x4F 0x52 0x44`) and appears verbatim in packet captures. The `imm_data` field used by RDMA write-with-immediate ([Section 7.7](#77-protocol-splitting)) is likewise transmitted in network byte order: the verbs API types it as `__be32` and performs **no** conversion, so the application MUST convert between host and network byte order itself (`htonl` on send, `ntohl` on receive, or `u32::to_be`/`from_be`). A `transfer ID` whose four octets differ will be corrupted on a mixed-endian peer pair if this conversion is omitted.
+All multi-byte integer fields in HORD wire formats are transmitted in network byte order (big-endian). The handshake magic value `0x484F5244` is the ASCII sequence `H`, `O`, `R`, `D` (bytes `0x48 0x4F 0x52 0x44`) and appears verbatim in packet captures. The `imm_data` field used by RDMA write-with-immediate ([Section 7.7](#77-protocol-splitting)) is likewise transmitted in network byte order: the verbs API types it as `__be32` and performs *no* conversion, so the application MUST convert between host and network byte order itself (`htonl` on send, `ntohl` on receive, or `u32::to_be`/`from_be`). A `transfer ID` whose four octets differ will be corrupted on a mixed-endian peer pair if this conversion is omitted.
 
 ### 12.1 Handshake (CM Private Data)
 
@@ -591,7 +591,7 @@ hord/
 
 ### 13.2 Rust API Surface
 
-**Server:**
+Server:
 
 ```rust
 let config = HordConfig {
@@ -614,7 +614,7 @@ loop {
 }
 ```
 
-**Client:**
+Client:
 
 ```rust
 let connector = HordConnector::new(HordClientConfig::default());
@@ -622,7 +622,7 @@ let client = Client::builder(TokioExecutor::new()).build(connector);
 let resp = client.get("hord://edge-cache:4791/dataset/shard-042.tar".parse()?).await?;
 ```
 
-**Zero-copy with GPU buffer:**
+Zero-copy with GPU buffer:
 
 ```rust
 let buf = RdmaBuffer::alloc(16 * 1024 * 1024, &connector)?;
@@ -635,7 +635,7 @@ let resp = client.request(
 // If response has X-HORD-RDMA-Write: status=complete, data is in buf
 ```
 
-**Split-mode:**
+Split-mode:
 
 ```rust
 let receiver = SplitReceiver::new(&connector)?;
@@ -687,7 +687,7 @@ for batch in loader:
 
 HORD uses the `hord://` URI scheme. Implementations SHOULD also support transparent upgrade from `http://` via a mechanism TBD (DNS SRV, Alt-Svc, or out-of-band configuration).
 
-Default port: **4791** (provisional, subject to change before 1.0).
+Default port: 4791 (provisional, subject to change before 1.0).
 
 ### 13.5 Testing
 
@@ -699,10 +699,9 @@ Implementations SHOULD support loopback mode using software RDMA (`rxe` or `siw`
 
 | Standard                | Relationship                                                                                                                            |
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| **iSER, SRP, NFS/RDMA** | Existing RDMA protocols for other application layers (SCSI, NFS). HORD is the HTTP analog.                                              |
-| **SMB Direct**          | Closest precedent — byte-stream over RDMA with optional direct data placement for SMB. HORD follows a similar pattern adapted for HTTP. |
-| **HTTP/3 / QUIC**       | Complementary. HTTP/3 targets internet-scale; HORD targets data center fabrics. An edge cache _could_ speak both.                       |
-| **UCX**                 | Could serve as HORD's transport layer instead of raw `libibverbs`. Valid implementation strategy, not required.                         |
+| iSER, SRP, NFS/RDMA | Existing RDMA protocols for other application layers (SCSI, NFS). HORD is the HTTP analog.                                              |
+| SMB Direct          | Closest precedent; byte-stream over RDMA with optional direct data placement for SMB. HORD follows a similar pattern adapted for HTTP. |
+| UCX                 | Could serve as HORD's transport layer instead of raw `libibverbs`. Valid implementation strategy, not required.                         |
 
 ---
 
@@ -712,8 +711,8 @@ This specification is released under the Apache License 2.0.
 
 ## Authors
 
-Per Buer, Varnish Software
+Per Buer, Varnish Software AS
 
 ## Changelog
 
-- **v0.1.0** — Initial draft. Stream abstraction, zero-copy extension, buffer management, flow control.
+- v0.1.0 — Initial draft. Stream abstraction, zero-copy extension, buffer management, flow control.
