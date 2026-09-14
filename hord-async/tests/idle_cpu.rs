@@ -23,9 +23,7 @@ use tokio::io::AsyncReadExt;
 use hord_async::AsyncHordStream;
 use hord_stream::{HordConfig, HordStream, Listener};
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
-}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+use common::TEST_IP as IP;
 
 /// CPU time consumed by the *calling thread* so far.
 fn thread_cpu() -> Duration {

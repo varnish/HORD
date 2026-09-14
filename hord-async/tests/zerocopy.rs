@@ -21,9 +21,7 @@ use hord_async::{AsyncHordStream, SharedAsyncStream};
 use hord_stream::{HordConfig, HordStream, Listener, Mr, RegisteredBuffer, WriteSegment};
 use hord_zerocopy::{RdmaWriteReq, RdmaWriteStatus, SourcePool};
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
-}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+use common::TEST_IP as IP;
 const PORT: u16 = 18820; // distinct from the demo (4791) and other loopback tests
 const PORT_POOLED: u16 = 18821; // serve_rdma_write_pooled_reports_bytes_written
 const PORT_TOO_LARGE: u16 = 18822; // serve_rdma_write_too_large_writes_nothing

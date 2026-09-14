@@ -2280,6 +2280,15 @@ mod negotiate_tests {
     }
 }
 
+/// The RDMA device IP the in-crate loopback tests dial: `$HORD_TEST_IP`, falling
+/// back to the RFC 5737 documentation address so that no host IP is baked into
+/// the tree. See CLAUDE.md for pointing this at the dev host's `rxe0`. Shared by
+/// the four `#[cfg(test)]` modules below, each of which imports it as `IP`.
+#[cfg(test)]
+static TEST_IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+});
+
 #[cfg(test)]
 mod fullduplex_tests {
     //! Full-duplex bulk transfer over a real RC connection.
@@ -2304,9 +2313,7 @@ mod fullduplex_tests {
     use std::sync::{mpsc, Arc, Barrier};
     use std::time::{Duration, Instant};
 
-    static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
-    }); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+    use super::TEST_IP as IP;
     const PORT: u16 = 18519; // a free port distinct from the demo's 4791
     const BODY: usize = 16 * 1024 * 1024; // 16 MiB each way — far exceeds the pipe
     const STALL: Duration = Duration::from_secs(15); // no-progress watchdog
@@ -2474,9 +2481,7 @@ mod half_close_tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
-    }); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+    use super::TEST_IP as IP;
     const PORT: u16 = 18526; // distinct from the other in-crate loopback tests
     const DEADLINE: Duration = Duration::from_secs(15);
 
@@ -2554,9 +2559,7 @@ mod split_tests {
     use std::sync::{mpsc, Arc, Barrier};
     use std::time::{Duration, Instant};
 
-    static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
-    }); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+    use super::TEST_IP as IP;
     const PORT: u16 = 18522; // distinct from full_duplex_bulk (18519) and the smokes
     const PORT_BP: u16 = 18523; // split_credit_backpressure
     const PORT_BPF: u16 = 18524; // split_credit_backpressure_facade
@@ -3120,9 +3123,7 @@ mod gather_tests {
     use std::io::{Read, Write};
     use std::sync::mpsc;
 
-    static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
-    }); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+    use super::TEST_IP as IP;
     const PORT: u16 = 18530; // distinct from the other in-crate loopback tests
     const SEG_LEN: usize = 64 * 1024; // per-allocation (per-segment) size
     const N_SEG: usize = 40; // > MAX_WRITE_SGE (16) -> the gather spans several WRs

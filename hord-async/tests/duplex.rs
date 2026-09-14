@@ -25,9 +25,7 @@ use tokio::task::LocalSet;
 use hord_async::{AsyncHordStream, SplitParts};
 use hord_stream::{HordConfig, HordStream, Listener};
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
-}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+use common::TEST_IP as IP;
 const PORT: u16 = 18920; // distinct from the demo (4791) and other loopback tests
 const BODY: usize = 16 * 1024 * 1024; // 16 MiB each way — dwarfs the credit window
 const WATCHDOG: Duration = Duration::from_secs(30); // a stall (deadlock) fails fast

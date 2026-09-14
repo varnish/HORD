@@ -28,9 +28,8 @@ use std::time::Duration;
 
 use hord_core::{is_connection_setup_failure, CmParams, Connection, Listener};
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
-}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+mod common;
+use common::TEST_IP as IP;
 const PORT: u16 = 18523; // distinct from the other device tests (18520-18522)
 const WATCHDOG: Duration = Duration::from_secs(30); // generous; loopback is ~instant
 

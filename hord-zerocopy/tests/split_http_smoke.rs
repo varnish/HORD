@@ -29,9 +29,8 @@ use hord_zerocopy::{
     serve_rdma_write, RdmaWriteReq, RdmaWriteStatus, SplitReceiver, ZeroCopyRequest,
 };
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
-}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+mod common;
+use common::TEST_IP as IP;
 const PORT: u16 = 18523; // distinct from the stream/core tests and the demo
 const STALL: Duration = Duration::from_secs(15);
 

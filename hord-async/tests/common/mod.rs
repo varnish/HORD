@@ -41,3 +41,10 @@ pub fn pattern(len: usize, seed: u8) -> Vec<u8> {
     }
     out
 }
+
+/// The RDMA device IP the loopback tests dial: `$HORD_TEST_IP`, falling back to
+/// the RFC 5737 documentation address so that no host IP is baked into the tree.
+/// See CLAUDE.md for pointing this at the dev host's `rxe0`.
+pub static TEST_IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+});

@@ -24,9 +24,8 @@ use hord_demo::{
 use hord_stream::{HordConfig, HordStream, Listener};
 use hord_zerocopy::{serve_rdma_write, RdmaWriteReq, RdmaWriteStatus, ZeroCopyRequest};
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
-}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+mod common;
+use common::TEST_IP as IP;
 const OBJECT: usize = 4 * 1024 * 1024; // 4 MiB object the range carves into
 
 /// Read one `\n`-terminated line (the lines here are tiny header values).

@@ -34,9 +34,7 @@ use hord_async::{AsyncHordStream, ConnMeta, HordListener, SharedAsyncStream};
 use hord_stream::{Connection, HordConfig, WriteSegment};
 use hord_zerocopy::RdmaWriteReq;
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
-}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+use common::TEST_IP as IP;
 
 mod common;
 use common::{current_thread_rt, pattern_byte, pattern_vec};

@@ -26,9 +26,8 @@ use std::time::{Duration, Instant};
 
 use hord_core::{CmParams, Connection, Listener, Opcode, ACCESS_LOCAL_WRITE, ACCESS_REMOTE_WRITE};
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
-}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+mod common;
+use common::TEST_IP as IP;
 const PORT: u16 = 18520; // distinct from the demo (4791) and full_duplex_bulk (18519)
 const LEN: usize = 16 * 1024 * 1024; // 16 MiB — many MTUs in one WR
 

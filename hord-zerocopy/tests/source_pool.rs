@@ -30,9 +30,8 @@ use hord_zerocopy::{
     serve_rdma_write_pooled, RdmaWriteReq, RdmaWriteStatus, SourcePool, ZeroCopyRequest,
 };
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
-}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+mod common;
+use common::TEST_IP as IP;
 const OBJECT: usize = 2 * 1024 * 1024; // 2 MiB — many MTUs, dwarfs the credit window
 
 /// Deterministic, position-sensitive payload byte (matches the demo's pattern).
