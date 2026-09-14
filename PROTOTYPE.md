@@ -42,8 +42,8 @@ so it should work unchanged on capable hardware).
   offset. A range past the end of the object returns `416` + `Content-Range: bytes
   */total` with no write (and, being bodiless, no `X-HORD-RDMA-Write` per §7.4); a
   multi-range request is served as a full `200` (no `multipart/byteranges`). The
-  sync demo's `--range` exercises it (stream and zero-copy); the async bins are a
-  follow-up.
+  `--range` flag exercises it (stream and zero-copy) on both the sync and the
+  async/hyper bins.
 - **Protocol splitting (spec §7.7).** When both peers also advertise
   `SPLIT_MODE_CAPABLE`, a request carrying `;id=<n>` is served with
   `IBV_WR_RDMA_WRITE_WITH_IMM`: the write lands the payload and delivers the
@@ -269,9 +269,6 @@ What remains:
   a source MR per zero-copy *or split-mode* response; a real server would
   amortize this with a pool (spec §8.3). §7.5 GPUDirect remains unbuilt
   (untestable on this host — see above).
-- **Range requests are sync-demo only.** §7.6 is wired into `hord-server` /
-  `hord-client`; the async/hyper bins are a fast-follow — the range logic belongs
-  in the forked `serve_zero_copy` (see TODO.md).
 
 ## Open issues from code review (deferred, by design)
 
@@ -410,6 +407,5 @@ Both of the remaining design-level items were then closed by the **async pass**:
   HTTP edges it currently leaves implicit: an unsatisfiable range → `416` +
   `Content-Range: bytes */total` (a bodiless response, so per §7.4 it omits
   `X-HORD-RDMA-Write`), and a multi-range request → served as a full `200` (HORD
-  has no `multipart/byteranges`, §4.1.2). This prototype implements the sync demo
-  that way; the same offset-agnostic mechanism would cover split mode (§7.7)
-  unchanged.
+  has no `multipart/byteranges`, §4.1.2). Both demos implement it that way; the
+  same offset-agnostic mechanism would cover split mode (§7.7) unchanged.
