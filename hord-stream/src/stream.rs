@@ -556,7 +556,7 @@ impl HordStream {
     /// driven asynchronously *off* the worker (see `hord-async`'s `accept_async`), so
     /// a slow peer can't block the worker's other connections; this is the fast,
     /// local part the worker runs synchronously, letting it take a
-    /// [`teardown_handle`](Self::teardown_handle) before the handshake parks. Drive
+    /// [`teardown_handle`](Reactor::teardown_handle) before the handshake parks. Drive
     /// the returned stream to fully established with
     /// [`poll_established`](Self::poll_established), then
     /// [`begin_handshake_send`](Self::begin_handshake_send) + repeated
@@ -571,7 +571,7 @@ impl HordStream {
 
     /// Non-blocking step toward CM establishment after
     /// [`accept_prepare`](Self::accept_prepare): `Ok(true)` once ESTABLISHED,
-    /// `Ok(false)` to park on [`cm_fd`](Self::cm_fd) and retry, `Err` on a
+    /// `Ok(false)` to park on [`cm_fd`](Reactor::cm_fd) and retry, `Err` on a
     /// failed/wrong CM event.
     pub fn poll_established(&self) -> io::Result<bool> {
         self.conn.poll_established()
@@ -2114,39 +2114,71 @@ impl HordStream {
 ///
 /// These exist for `hord-async`'s reactor, and for any embedder bringing its own
 /// accept/poll loop. An application driving the stream through [`Read`]/[`Write`]
-/// never needs them.
+/// never needs them. Everything but [`mark_closed`](Self::mark_closed) lives one
+/// step away, on the [`Reactor`] view.
 impl HordStream {
+    /// The event-loop view of this stream: the fds a reactor registers, the
+    /// arm/drain pass-throughs it steps them with, and the out-of-band teardown
+    /// handle. One entry point rather than seven methods on the stream's own
+    /// surface — see [`Reactor`].
+    pub fn reactor(&self) -> Reactor<'_> {
+        Reactor { stream: self }
+    }
+
     /// Mark the stream closed — e.g. when the async layer observes a CM
     /// `DISCONNECTED` event (half-close). Subsequent reads see EOF.
+    ///
+    /// The one piece of reactor plumbing that is *not* on [`Reactor`]: it mutates
+    /// the stream, and the view is a shared borrow so a caller holding only a
+    /// `Ref<'_, _>` (the write-cancel guard in `hord-async`) can still reach
+    /// [`Reactor::teardown_handle`].
     pub fn mark_closed(&mut self) {
         self.peer_closed = true;
     }
+}
 
-    // ---- async-reactor accessors (pass-throughs to the connection) ---------
+/// The reactor-facing view of a [`HordStream`], returned by
+/// [`HordStream::reactor`].
+///
+/// It gathers the plumbing an event loop needs — the completion-queue and
+/// connection-manager fds, the arm/drain steps that pair with them, and the
+/// out-of-band [`teardown_handle`](Self::teardown_handle) — so those methods do
+/// not sit in the same API listing as [`read`](HordStream::read) /
+/// [`write`](HordStream::write) / [`connect`](HordStream::connect). An
+/// application driving the stream as a byte stream never constructs one;
+/// `hord-async`'s reactor, and any embedder bringing its own accept/poll loop,
+/// go through here.
+///
+/// Borrowed, zero-cost, and freely re-created — call `stream.reactor()` at each
+/// use rather than holding one across a step that needs the stream mutably.
+pub struct Reactor<'a> {
+    stream: &'a HordStream,
+}
 
+impl Reactor<'_> {
     /// CQ completion-channel fd to register with a reactor. See [`Connection::cq_fd`].
     pub fn cq_fd(&self) -> io::Result<RawFd> {
-        self.conn.cq_fd()
+        self.stream.conn.cq_fd()
     }
     /// Arm the CQ before waiting on [`cq_fd`](Self::cq_fd). See [`Connection::arm_cq`].
     pub fn arm_cq(&self) -> io::Result<()> {
-        self.conn.arm_cq()
+        self.stream.conn.arm_cq()
     }
     /// Drain + ack completion-channel notifications after the fd signals.
     pub fn consume_cq_events(&self) -> usize {
-        self.conn.consume_cq_events()
+        self.stream.conn.consume_cq_events()
     }
     /// CM event-channel fd, for half-close detection. See [`Connection::cm_fd`].
     pub fn cm_fd(&self) -> io::Result<RawFd> {
-        self.conn.cm_fd()
+        self.stream.conn.cm_fd()
     }
     /// Flip the CM channel non-blocking (call once, after the handshake).
     pub fn set_cm_nonblock(&self) -> io::Result<()> {
-        self.conn.set_cm_nonblock()
+        self.stream.conn.set_cm_nonblock()
     }
     /// Non-blocking check for a peer-initiated disconnect. See [`Connection::check_disconnect`].
     pub fn check_disconnect(&self) -> io::Result<bool> {
-        self.conn.check_disconnect()
+        self.stream.conn.check_disconnect()
     }
 
     /// A detached handle that can force this connection's NIC resources down
@@ -2154,7 +2186,7 @@ impl HordStream {
     ///
     /// It exists for one purpose: a server runtime that may **abandon** (abort) a
     /// connection task while it is parked mid-`RDMA_WRITE`. On the normal path the
-    /// write driver ([`rdma_write_all`](Self::rdma_write_all) /
+    /// write driver ([`rdma_write_all`](HordStream::rdma_write_all) /
     /// `poll_rdma_write`) drains every posted write before returning, so by the
     /// time a caller drops a source [`RegisteredBuffer`] no work request still
     /// references it. Aborting the task bypasses that drain: the future is dropped
@@ -2166,13 +2198,13 @@ impl HordStream {
     /// externally-registered MRs (caller-owned pages) for the same reason.
     pub fn teardown_handle(&self) -> ConnTeardown {
         ConnTeardown {
-            conn: Arc::clone(&self.conn),
+            conn: Arc::clone(&self.stream.conn),
         }
     }
 }
 
 /// A cheap, owned handle to force a connection's QP teardown out-of-band — see
-/// [`HordStream::teardown_handle`] for why it exists. Holds an `Arc<Connection>`
+/// [`Reactor::teardown_handle`] for why it exists. Holds an `Arc<Connection>`
 /// so the connection (and its CQ/PD, needed to deregister MRs afterward) stays
 /// alive until the handle is dropped; it does **not** keep the QP itself alive
 /// (the QP lives behind the connection's own `RefCell<Option<_>>` and is taken on

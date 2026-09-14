@@ -651,7 +651,7 @@ async fn worker_loop<F, Fut>(
         // force-torn-down first (the handshake's posted recv/send WRs reference the
         // handshake MR; the use-after-free guard must cover them too). Key it by the
         // spawned task's id, as for an established connection.
-        let teardown = prepared.teardown_handle();
+        let teardown = prepared.reactor().teardown_handle();
         let task_config = config.clone();
         // Each connection gets its own clone of the shutdown signal (per-connection
         // graceful drain) and of the service closure (it is invoked inside the task,
