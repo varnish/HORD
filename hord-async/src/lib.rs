@@ -166,9 +166,9 @@ impl AsyncHordStream {
         // channel is already non-blocking (accept_prepare → accept_establish_begin);
         // unlike `wrap`'s best-effort CM, the fd is *required* here — establishment is
         // driven on it — so failures propagate (the worker drops the connection).
-        let cq = AsyncFd::new(ReactorFd(prepared.cq_fd()?))?;
-        prepared.set_cm_nonblock()?;
-        let cm = AsyncFd::new(ReactorFd(prepared.cm_fd()?))?;
+        let cq = AsyncFd::new(ReactorFd(prepared.reactor().cq_fd()?))?;
+        prepared.reactor().set_cm_nonblock()?;
+        let cm = AsyncFd::new(ReactorFd(prepared.reactor().cm_fd()?))?;
         let mut stream = prepared;
 
         // Phase 1 — CM establishment: step `poll_established`, parking on the CM fd
@@ -199,12 +199,12 @@ impl AsyncHordStream {
                 if let Some(peer) = stream.poll_handshake()? {
                     return Ok::<Handshake, io::Error>(peer);
                 }
-                stream.arm_cq()?;
+                stream.reactor().arm_cq()?;
                 if let Some(peer) = stream.poll_handshake()? {
                     return Ok(peer);
                 }
                 let mut guard = cq.readable().await?;
-                stream.consume_cq_events();
+                stream.reactor().consume_cq_events();
                 guard.clear_ready();
             }
         };
@@ -225,14 +225,15 @@ impl AsyncHordStream {
 
     /// Register a freshly-handshaked stream's fds with the reactor.
     fn wrap(stream: HordStream) -> io::Result<Self> {
-        let cq = AsyncFd::new(ReactorFd(stream.cq_fd()?))?;
+        let cq = AsyncFd::new(ReactorFd(stream.reactor().cq_fd()?))?;
         // Half-close detection is best-effort: flip the CM channel non-blocking
         // and register it. If that fails we simply run without it — the data
         // path is unaffected; we just won't notice a peer disconnect as promptly
         // (the next failed completion still closes the stream).
         let cm = stream
+            .reactor()
             .set_cm_nonblock()
-            .and_then(|()| stream.cm_fd())
+            .and_then(|()| stream.reactor().cm_fd())
             .ok()
             .and_then(|fd| AsyncFd::new(ReactorFd(fd)).ok());
         Ok(AsyncHordStream { cq, cm, stream })
@@ -250,13 +251,13 @@ impl AsyncHordStream {
 
     /// A handle that can force this connection's QP down out-of-band, making the
     /// NIC quiescent so source buffers can be freed safely. See
-    /// [`HordStream::teardown_handle`]. `HordListener` takes one per connection
+    /// [`hord_stream::Reactor::teardown_handle`]. `HordListener` takes one per connection
     /// so that, if it must *abort* a task parked mid-`RDMA_WRITE` at the grace
     /// deadline, it can quiesce the NIC before the aborted future frees a source
     /// buffer the QP still references — closing the use-after-free that task abort
     /// would otherwise open.
     pub fn teardown_handle(&self) -> hord_stream::ConnTeardown {
-        self.stream.teardown_handle()
+        self.stream.reactor().teardown_handle()
     }
 
     // ---- connection metadata (logging / multi-tenancy) ---------------------
@@ -467,7 +468,7 @@ fn poll_reactor(
         return Poll::Ready(Ok(()));
     }
     // 3. Arm, then drain again to close the arm race.
-    stream.arm_cq()?;
+    stream.reactor().arm_cq()?;
     if stream.drain_completions()? > 0 {
         return Poll::Ready(Ok(()));
     }
@@ -476,8 +477,8 @@ fn poll_reactor(
         let mut guard = std::task::ready!(cq.poll_read_ready(cx))?;
         // The fd signalled: consume the notification (drains the fd so it is no
         // longer readable), re-arm for the next one, and drain the CQ.
-        stream.consume_cq_events();
-        stream.arm_cq()?;
+        stream.reactor().consume_cq_events();
+        stream.reactor().arm_cq()?;
         let drained = stream.drain_completions()?;
         guard.clear_ready();
         if drained > 0 {
@@ -509,7 +510,7 @@ fn poll_cm_event(
     loop {
         match cm.poll_read_ready(cx) {
             Poll::Ready(Ok(mut guard)) => {
-                let disconnected = stream.check_disconnect()?;
+                let disconnected = stream.reactor().check_disconnect()?;
                 guard.clear_ready();
                 if disconnected {
                     stream.mark_closed();
