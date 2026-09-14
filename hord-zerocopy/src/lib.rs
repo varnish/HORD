@@ -104,7 +104,10 @@ impl RdmaWriteReq {
 
     /// The header value: `addr=0x..;rkey=0x..;len=N[;id=N]`.
     pub fn header_value(&self) -> String {
-        let mut s = format!("addr=0x{:x};rkey=0x{:x};len={}", self.addr, self.rkey, self.len);
+        let mut s = format!(
+            "addr=0x{:x};rkey=0x{:x};len={}",
+            self.addr, self.rkey, self.len
+        );
         if let Some(id) = self.id {
             s.push_str(&format!(";id={id}"));
         }
@@ -182,12 +185,18 @@ impl RdmaWriteStatus {
 }
 
 fn parse_hex_u64(s: &str) -> Option<u64> {
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     u64::from_str_radix(s, 16).ok()
 }
 
 fn parse_hex_u32(s: &str) -> Option<u32> {
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     u32::from_str_radix(s, 16).ok()
 }
 
@@ -317,7 +326,8 @@ mod tests {
         assert_eq!(r.len, 16_777_216);
         assert_eq!(r.id, None);
         // Split-mode variant from §7.7.3.
-        let s = RdmaWriteReq::parse("addr=0x7f4a2c000000;rkey=0x01ab3f00;len=16777216;id=42").unwrap();
+        let s =
+            RdmaWriteReq::parse("addr=0x7f4a2c000000;rkey=0x01ab3f00;len=16777216;id=42").unwrap();
         assert_eq!(s.id, Some(42));
     }
 
@@ -342,8 +352,12 @@ mod tests {
     #[test]
     fn status_round_trips() {
         for s in [
-            RdmaWriteStatus::Complete { bytes_written: 14_680_064 },
-            RdmaWriteStatus::TooLarge { object_size: 1_073_741_824 },
+            RdmaWriteStatus::Complete {
+                bytes_written: 14_680_064,
+            },
+            RdmaWriteStatus::TooLarge {
+                object_size: 1_073_741_824,
+            },
             RdmaWriteStatus::Declined,
         ] {
             assert_eq!(RdmaWriteStatus::parse(&s.header_value()), Some(s));
@@ -362,16 +376,27 @@ mod tests {
 
     /// A request advertising a 1 KiB buffer, optionally requesting split mode.
     fn req(len: u64, id: Option<u32>) -> RdmaWriteReq {
-        RdmaWriteReq { addr: 0x1000, rkey: 0x2a, len, id }
+        RdmaWriteReq {
+            addr: 0x1000,
+            rkey: 0x2a,
+            len,
+            id,
+        }
     }
 
     #[test]
     fn decide_too_large_writes_nothing() {
         // object_size > buffer -> TooLarge, regardless of split (precedence).
         let a = RdmaWriteAction::decide(&req(1024, None), 2048, false);
-        assert_eq!(a, RdmaWriteAction::Respond(RdmaWriteStatus::TooLarge { object_size: 2048 }));
+        assert_eq!(
+            a,
+            RdmaWriteAction::Respond(RdmaWriteStatus::TooLarge { object_size: 2048 })
+        );
         let split = RdmaWriteAction::decide(&req(1024, Some(7)), 2048, true);
-        assert_eq!(split, RdmaWriteAction::Respond(RdmaWriteStatus::TooLarge { object_size: 2048 }));
+        assert_eq!(
+            split,
+            RdmaWriteAction::Respond(RdmaWriteStatus::TooLarge { object_size: 2048 })
+        );
     }
 
     #[test]
@@ -379,7 +404,10 @@ mod tests {
         // Plain mode, empty object: respond Complete{0} with no write (no portable
         // zero-length MR, and no data plane waiting).
         let a = RdmaWriteAction::decide(&req(1024, None), 0, false);
-        assert_eq!(a, RdmaWriteAction::Respond(RdmaWriteStatus::Complete { bytes_written: 0 }));
+        assert_eq!(
+            a,
+            RdmaWriteAction::Respond(RdmaWriteStatus::Complete { bytes_written: 0 })
+        );
     }
 
     #[test]
@@ -387,7 +415,11 @@ mod tests {
         let a = RdmaWriteAction::decide(&req(1024, None), 512, false);
         assert_eq!(
             a,
-            RdmaWriteAction::Write { payload_len: 512, source_len: 512, transfer_id: None }
+            RdmaWriteAction::Write {
+                payload_len: 512,
+                source_len: 512,
+                transfer_id: None
+            }
         );
     }
 
@@ -396,7 +428,11 @@ mod tests {
         let a = RdmaWriteAction::decide(&req(1024, Some(42)), 512, true);
         assert_eq!(
             a,
-            RdmaWriteAction::Write { payload_len: 512, source_len: 512, transfer_id: Some(42) }
+            RdmaWriteAction::Write {
+                payload_len: 512,
+                source_len: 512,
+                transfer_id: Some(42)
+            }
         );
     }
 
@@ -407,7 +443,11 @@ mod tests {
         let a = RdmaWriteAction::decide(&req(1024, Some(9)), 0, true);
         assert_eq!(
             a,
-            RdmaWriteAction::Write { payload_len: 0, source_len: 1, transfer_id: Some(9) }
+            RdmaWriteAction::Write {
+                payload_len: 0,
+                source_len: 1,
+                transfer_id: Some(9)
+            }
         );
     }
 
@@ -418,10 +458,17 @@ mod tests {
         let a = RdmaWriteAction::decide(&req(1024, Some(5)), 512, false);
         assert_eq!(
             a,
-            RdmaWriteAction::Write { payload_len: 512, source_len: 512, transfer_id: None }
+            RdmaWriteAction::Write {
+                payload_len: 512,
+                source_len: 512,
+                transfer_id: None
+            }
         );
         let empty = RdmaWriteAction::decide(&req(1024, Some(5)), 0, false);
-        assert_eq!(empty, RdmaWriteAction::Respond(RdmaWriteStatus::Complete { bytes_written: 0 }));
+        assert_eq!(
+            empty,
+            RdmaWriteAction::Respond(RdmaWriteStatus::Complete { bytes_written: 0 })
+        );
     }
 
     #[test]
@@ -430,7 +477,11 @@ mod tests {
         let a = RdmaWriteAction::decide(&req(1024, None), 1024, false);
         assert_eq!(
             a,
-            RdmaWriteAction::Write { payload_len: 1024, source_len: 1024, transfer_id: None }
+            RdmaWriteAction::Write {
+                payload_len: 1024,
+                source_len: 1024,
+                transfer_id: None
+            }
         );
     }
 

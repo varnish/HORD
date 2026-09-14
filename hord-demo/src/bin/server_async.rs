@@ -63,12 +63,12 @@ const DEFAULT_BIND: &str = "192.0.2.1"; // rxe device IP fallback; override via 
 const DEFAULT_PORT: u16 = 4791;
 const MAX_BODY: usize = 1usize << 30; // 1 GiB guard on /size/<n>
 const CHUNK: usize = 256 * 1024; // streamed body chunk size
-// Per-connection zero-copy source pool (§8.3): up to this many reusable source
-// buffers of this size, grown lazily and reused across a connection's zero-copy
-// responses instead of registering an MR per response. Split mode (and any
-// keep-alive client) serves many responses per connection, so the registrations
-// amortize there; an object larger than the slab — or past the cap — falls back to
-// a one-off registration (§8.4), so these tune efficiency, not correctness.
+                                 // Per-connection zero-copy source pool (§8.3): up to this many reusable source
+                                 // buffers of this size, grown lazily and reused across a connection's zero-copy
+                                 // responses instead of registering an MR per response. Split mode (and any
+                                 // keep-alive client) serves many responses per connection, so the registrations
+                                 // amortize there; an object larger than the slab — or past the cap — falls back to
+                                 // a one-off registration (§8.4), so these tune efficiency, not correctness.
 const SOURCE_POOL_CAP: usize = 4;
 const SOURCE_POOL_BUF_SIZE: usize = 4 << 20; // 4 MiB
 
@@ -88,12 +88,18 @@ struct PatternBody {
 impl PatternBody {
     /// Whole object: bytes `[0, total)`.
     fn new(total: usize) -> Self {
-        PatternBody { offset: 0, end: total }
+        PatternBody {
+            offset: 0,
+            end: total,
+        }
     }
 
     /// A single byte range (§7.6): `len` bytes starting at absolute offset `start`.
     fn range(start: usize, len: usize) -> Self {
-        PatternBody { offset: start, end: start + len }
+        PatternBody {
+            offset: start,
+            end: start + len,
+        }
     }
 }
 
@@ -131,8 +137,15 @@ impl Body for PatternBody {
 /// Build a response with a stream body, optionally echoing a zero-copy status
 /// (e.g. `declined` — §7.4 requires it on a body-bearing response to a request
 /// that carried `X-HORD-RDMA-Write`).
-fn respond(status: u16, content_type: &str, body: DemoBody, zc: Option<RdmaWriteStatus>) -> Response<DemoBody> {
-    let mut b = Response::builder().status(status).header("content-type", content_type);
+fn respond(
+    status: u16,
+    content_type: &str,
+    body: DemoBody,
+    zc: Option<RdmaWriteStatus>,
+) -> Response<DemoBody> {
+    let mut b = Response::builder()
+        .status(status)
+        .header("content-type", content_type);
     if let Some(zc) = zc {
         b = b.header(HEADER, zc.header_value());
     }
@@ -143,7 +156,11 @@ fn respond(status: u16, content_type: &str, body: DemoBody, zc: Option<RdmaWrite
 /// the payload travelled out-of-band via RDMA write. `content_range` is `Some`
 /// only for a satisfied range (§7.6): a `206` echoes `Content-Range`, while a
 /// `200`/`413` carries none (mirrors the sync `serve_size_zero_copy`).
-fn zc_response(status_code: u16, zc: RdmaWriteStatus, content_range: Option<String>) -> Response<DemoBody> {
+fn zc_response(
+    status_code: u16,
+    zc: RdmaWriteStatus,
+    content_range: Option<String>,
+) -> Response<DemoBody> {
     let mut b = Response::builder()
         .status(status_code)
         .header("content-type", "application/octet-stream")
@@ -158,7 +175,11 @@ fn zc_response(status_code: u16, zc: RdmaWriteStatus, content_range: Option<Stri
 /// Partial Content` with a `Content-Range` and the sub-range body, optionally
 /// echoing a zero-copy status (`declined`, per §7.4) when the request carried the
 /// header.
-fn range_response(body: DemoBody, content_range: String, zc: Option<RdmaWriteStatus>) -> Response<DemoBody> {
+fn range_response(
+    body: DemoBody,
+    content_range: String,
+    zc: Option<RdmaWriteStatus>,
+) -> Response<DemoBody> {
     let mut b = Response::builder()
         .status(206)
         .header("content-type", "application/octet-stream")
@@ -208,7 +229,11 @@ async fn serve(
     };
     // §7.6: capture the (single) `Range` header value while the request is in
     // hand — it is resolved against the object size below.
-    let range = req.headers().get("range").and_then(|v| v.to_str().ok()).map(str::to_string);
+    let range = req
+        .headers()
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     // Drop the request before any await (we never read a GET body); nothing below
     // borrows it.
     drop(req);
@@ -217,7 +242,12 @@ async fn serve(
     let declined = had_header.then_some(RdmaWriteStatus::Declined);
 
     if method != Method::GET {
-        return Ok(respond(405, "text/plain", full(b"only GET is supported\n"), declined));
+        return Ok(respond(
+            405,
+            "text/plain",
+            full(b"only GET is supported\n"),
+            declined,
+        ));
     }
     if path == "/" {
         return Ok(respond(
@@ -235,26 +265,44 @@ async fn serve(
                 // → 206 + Content-Range; a range past the end → 416. The one-sided
                 // write is offset-agnostic, so a range composes with zero-copy by
                 // writing the sub-range from its absolute object offset.
-                match range.as_deref().map(|r| parse_range(r, n)).unwrap_or(RangeSpec::Full) {
+                match range
+                    .as_deref()
+                    .map(|r| parse_range(r, n))
+                    .unwrap_or(RangeSpec::Full)
+                {
                     RangeSpec::Unsatisfiable => unsatisfiable_response(n),
                     RangeSpec::Range { start, end } => {
                         let len = end - start + 1;
                         if let Some(req) = zc_req {
                             serve_zero_copy(&stream, &pool, &req, start, len, n, true).await
                         } else {
-                            range_response(PatternBody::range(start, len).boxed(), content_range(start, end, n), declined)
+                            range_response(
+                                PatternBody::range(start, len).boxed(),
+                                content_range(start, end, n),
+                                declined,
+                            )
                         }
                     }
                     RangeSpec::Full => {
                         if let Some(req) = zc_req {
                             serve_zero_copy(&stream, &pool, &req, 0, n, n, false).await
                         } else {
-                            respond(200, "application/octet-stream", PatternBody::new(n).boxed(), declined)
+                            respond(
+                                200,
+                                "application/octet-stream",
+                                PatternBody::new(n).boxed(),
+                                declined,
+                            )
                         }
                     }
                 }
             }
-            Ok(_) => respond(413, "text/plain", full(b"size exceeds server limit\n"), declined),
+            Ok(_) => respond(
+                413,
+                "text/plain",
+                full(b"size exceeds server limit\n"),
+                declined,
+            ),
             Err(_) => respond(400, "text/plain", full(b"bad size\n"), declined),
         });
     }
@@ -288,7 +336,9 @@ async fn serve_zero_copy(
     // A satisfied range echoes `Content-Range`; a `200`/`413` carries none.
     let range_hdr = |status: &RdmaWriteStatus| -> Option<String> {
         match status {
-            RdmaWriteStatus::Complete { .. } if partial => Some(content_range(base, base + len - 1, total)),
+            RdmaWriteStatus::Complete { .. } if partial => {
+                Some(content_range(base, base + len - 1, total))
+            }
             _ => None,
         }
     };
@@ -300,7 +350,9 @@ async fn serve_zero_copy(
     // bytes from their absolute object offset `base` (Milestone 3 removes it). Gated
     // on the range *length*, not the whole object size.
     match stream
-        .serve_rdma_write_pooled(pool, req, len as u64, |src| pattern_fill_registered_from(src, base, len))
+        .serve_rdma_write_pooled(pool, req, len as u64, |src| {
+            pattern_fill_registered_from(src, base, len)
+        })
         .await
     {
         // Delivered. Keep the split/plain distinction (and the transfer id) in the
@@ -308,8 +360,12 @@ async fn serve_zero_copy(
         Ok(status @ RdmaWriteStatus::Complete { bytes_written }) => {
             let code = if partial { 206 } else { 200 };
             match req.id.filter(|_| stream.split_mode_negotiated()) {
-                Some(id) => eprintln!("[server] -> {code} (split: complete id={id} bytes_written={bytes_written})"),
-                None => eprintln!("[server] -> {code} (zero-copy: complete bytes_written={bytes_written})"),
+                Some(id) => eprintln!(
+                    "[server] -> {code} (split: complete id={id} bytes_written={bytes_written})"
+                ),
+                None => eprintln!(
+                    "[server] -> {code} (zero-copy: complete bytes_written={bytes_written})"
+                ),
             }
             zc_response(code, status, range_hdr(&status))
         }
@@ -452,7 +508,10 @@ fn main() -> ExitCode {
         config.zero_copy,
     );
 
-    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("[server] runtime build failed: {e}");

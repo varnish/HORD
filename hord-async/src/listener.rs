@@ -282,7 +282,10 @@ impl HordListener {
     /// threads' completion to async via `spawn_blocking`).
     pub async fn serve<F, Fut>(self, shutdown: watch::Receiver<bool>, serve_fn: F)
     where
-        F: FnMut(AsyncHordStream, Option<SocketAddr>, watch::Receiver<bool>) -> Fut + Clone + Send + 'static,
+        F: FnMut(AsyncHordStream, Option<SocketAddr>, watch::Receiver<bool>) -> Fut
+            + Clone
+            + Send
+            + 'static,
         Fut: Future<Output = ()> + 'static,
     {
         let HordListener {
@@ -328,9 +331,9 @@ impl HordListener {
                     return;
                 }
             };
-            if let Err(e) =
-                rt.block_on(acceptor_loop(listener, senders, shutdown, stop_rx, acc_config))
-            {
+            if let Err(e) = rt.block_on(acceptor_loop(
+                listener, senders, shutdown, stop_rx, acc_config,
+            )) {
                 log::error!("hord: acceptor loop error: {e}");
             }
         });
@@ -636,7 +639,10 @@ async fn worker_loop<F, Fut>(
         let prepared = match HordStream::accept_prepare(conn, &config) {
             Ok(s) => s,
             Err(e) => {
-                log::warn!("hord: connection prepare failed for {}: {e}", peer_label(peer));
+                log::warn!(
+                    "hord: connection prepare failed for {}: {e}",
+                    peer_label(peer)
+                );
                 continue;
             }
         };
@@ -678,7 +684,9 @@ async fn worker_loop<F, Fut>(
         }
     };
     if tokio::time::timeout(grace, drain).await.is_err() {
-        log::warn!("hord: graceful drain timed out after {grace:?}; abandoning in-flight connections");
+        log::warn!(
+            "hord: graceful drain timed out after {grace:?}; abandoning in-flight connections"
+        );
         // The drain timed out and `tasks` is about to be dropped, aborting every
         // survivor. Force each in-flight connection's QP down FIRST so the NIC is
         // quiescent before the aborted futures free the source buffers their

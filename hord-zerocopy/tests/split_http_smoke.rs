@@ -25,9 +25,13 @@ use std::sync::{mpsc, Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use hord_stream::{HordConfig, HordStream, Listener};
-use hord_zerocopy::{serve_rdma_write, RdmaWriteReq, RdmaWriteStatus, SplitReceiver, ZeroCopyRequest};
+use hord_zerocopy::{
+    serve_rdma_write, RdmaWriteReq, RdmaWriteStatus, SplitReceiver, ZeroCopyRequest,
+};
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const PORT: u16 = 18523; // distinct from the stream/core tests and the demo
 const STALL: Duration = Duration::from_secs(15);
 
@@ -35,9 +39,9 @@ const STALL: Duration = Duration::from_secs(15);
 // zero-length object whose buffer is still non-trivial — the server writes 0
 // bytes but must still deliver the immediate.
 const PLAN: &[(u32, u64, usize)] = &[
-    (1, 1 << 20, 1 << 20),       // 1 MiB, exact-fit buffer
-    (2, 0, 4096),                // empty object
-    (3, 300 << 10, 512 << 10),   // 300 KiB into a 512 KiB buffer (partial fill)
+    (1, 1 << 20, 1 << 20),     // 1 MiB, exact-fit buffer
+    (2, 0, 4096),              // empty object
+    (3, 300 << 10, 512 << 10), // 300 KiB into a 512 KiB buffer (partial fill)
 ];
 
 fn pattern(len: usize, seed: u8) -> Vec<u8> {
@@ -51,7 +55,10 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 }
 
 fn object_size_for(id: u32) -> u64 {
-    PLAN.iter().find(|&&(tid, ..)| tid == id).expect("known id").1
+    PLAN.iter()
+        .find(|&&(tid, ..)| tid == id)
+        .expect("known id")
+        .1
 }
 
 #[test]
@@ -113,7 +120,11 @@ fn split_http_round_trip() {
     let descriptors: Vec<RdmaWriteReq> = reqs_owned.iter().map(|r| r.request()).collect();
     // Every descriptor should advertise its split id.
     for (r, &(id, ..)) in descriptors.iter().zip(PLAN) {
-        assert_eq!(r.id, Some(id), "with_id must thread the id into the request");
+        assert_eq!(
+            r.id,
+            Some(id),
+            "with_id must thread the id into the request"
+        );
     }
     req_tx.send(descriptors).expect("send requests");
 
@@ -129,7 +140,10 @@ fn split_http_round_trip() {
                     let id = c.transfer_id;
                     assert!(seen.insert(id), "transfer {id} completed twice");
                     let object_size = object_size_for(id) as usize;
-                    let idx = PLAN.iter().position(|&(tid, ..)| tid == id).expect("known id");
+                    let idx = PLAN
+                        .iter()
+                        .position(|&(tid, ..)| tid == id)
+                        .expect("known id");
                     let mut got = vec![0u8; object_size];
                     reqs_owned[idx].copy_out(0, &mut got);
                     assert_eq!(

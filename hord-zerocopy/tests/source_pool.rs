@@ -26,9 +26,13 @@ use std::io::{Read, Write};
 use std::sync::{mpsc, Arc, Barrier};
 
 use hord_stream::{HordConfig, HordStream, Listener, RegisteredBuffer};
-use hord_zerocopy::{serve_rdma_write_pooled, RdmaWriteReq, RdmaWriteStatus, SourcePool, ZeroCopyRequest};
+use hord_zerocopy::{
+    serve_rdma_write_pooled, RdmaWriteReq, RdmaWriteStatus, SourcePool, ZeroCopyRequest,
+};
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const OBJECT: usize = 2 * 1024 * 1024; // 2 MiB — many MTUs, dwarfs the credit window
 
 /// Deterministic, position-sensitive payload byte (matches the demo's pattern).
@@ -76,7 +80,12 @@ fn verify(zc: &ZeroCopyRequest, n: usize) {
         let take = tmp.len().min(n - off);
         zc.copy_out(off, &mut tmp[..take]);
         for (i, &got) in tmp[..take].iter().enumerate() {
-            assert_eq!(got, pattern_byte(off + i), "payload mismatch at byte {}", off + i);
+            assert_eq!(
+                got,
+                pattern_byte(off + i),
+                "payload mismatch at byte {}",
+                off + i
+            );
         }
         off += take;
     }
@@ -163,7 +172,10 @@ fn pool_amortizes_registration() {
         stats.registered, 1,
         "5 sequential responses should reuse a single registered source buffer"
     );
-    assert_eq!(stats.available, stats.registered, "every leased buffer should return to the pool");
+    assert_eq!(
+        stats.available, stats.registered,
+        "every leased buffer should return to the pool"
+    );
 }
 
 #[test]
@@ -173,7 +185,13 @@ fn pool_falls_back_for_oversized_objects() {
     // registration, the pool grows none — and correctness still holds (each payload
     // is integrity-checked in run_pool_case).
     let stats = run_pool_case(18741, 4, 2, OBJECT / 4);
-    assert_eq!(stats.registered, 0, "oversized objects must not grow the pool");
-    assert_eq!(stats.fallbacks, 4, "every oversized response should fall back once");
+    assert_eq!(
+        stats.registered, 0,
+        "oversized objects must not grow the pool"
+    );
+    assert_eq!(
+        stats.fallbacks, 4,
+        "every oversized response should fall back once"
+    );
     assert_eq!(stats.available, 0, "no pooled buffers to return");
 }

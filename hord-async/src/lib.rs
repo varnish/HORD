@@ -184,7 +184,10 @@ impl AsyncHordStream {
             }
         };
         timeout(ESTABLISH_TIMEOUT, establish).await.map_err(|_| {
-            io::Error::new(io::ErrorKind::TimedOut, "peer did not establish the connection in time")
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "peer did not establish the connection in time",
+            )
         })??;
 
         // Phase 2 — first-message handshake: post ours, then step `poll_handshake`,
@@ -213,7 +216,11 @@ impl AsyncHordStream {
         })??;
 
         stream.finish_handshake(&peer)?;
-        Ok(AsyncHordStream { cq, cm: Some(cm), stream })
+        Ok(AsyncHordStream {
+            cq,
+            cm: Some(cm),
+            stream,
+        })
     }
 
     /// Register a freshly-handshaked stream's fds with the reactor.
@@ -350,7 +357,10 @@ impl AsyncHordStream {
             // `rdma_write_gather`; the immediate rides the final WR.
             let r = match w.imm {
                 Some(id) => self.stream.begin_rdma_write_gather_with_imm(
-                    w.segments, w.peer_addr, w.peer_rkey, id,
+                    w.segments,
+                    w.peer_addr,
+                    w.peer_rkey,
+                    id,
                 ),
                 None => self
                     .stream
@@ -822,7 +832,8 @@ impl SharedAsyncStream {
         len: usize,
     ) -> io::Result<()> {
         let segments = [WriteSegment::from_registered(src, src_off, len)];
-        self.drive_write(&segments, peer_addr, peer_rkey, None).await
+        self.drive_write(&segments, peer_addr, peer_rkey, None)
+            .await
     }
 
     /// Split-mode (§7.7) counterpart of [`rdma_write`](Self::rdma_write): deliver the
@@ -842,7 +853,8 @@ impl SharedAsyncStream {
         transfer_id: u32,
     ) -> io::Result<()> {
         let segments = [WriteSegment::from_registered(src, src_off, len)];
-        self.drive_write(&segments, peer_addr, peer_rkey, Some(transfer_id)).await
+        self.drive_write(&segments, peer_addr, peer_rkey, Some(transfer_id))
+            .await
     }
 
     /// Scatter-gather counterpart of [`rdma_write`](Self::rdma_write) (spec §7,
@@ -872,7 +884,8 @@ impl SharedAsyncStream {
         peer_rkey: u32,
         transfer_id: u32,
     ) -> io::Result<()> {
-        self.drive_write(segments, peer_addr, peer_rkey, Some(transfer_id)).await
+        self.drive_write(segments, peer_addr, peer_rkey, Some(transfer_id))
+            .await
     }
 
     /// Shared driver behind the four `rdma_write*` entry points (and, through the
@@ -906,7 +919,10 @@ impl SharedAsyncStream {
             imm: None,
             post_outcome: None,
         };
-        let mut guard = WriteCancelGuard { stream: self, armed: true };
+        let mut guard = WriteCancelGuard {
+            stream: self,
+            armed: true,
+        };
         let r = async {
             let mut start = 0usize;
             let mut base = 0u64; // remote byte offset of the current batch
@@ -921,7 +937,11 @@ impl SharedAsyncStream {
                 };
                 let end = start + n;
                 let is_last = segments.is_empty() || end == segments.len();
-                w.segments = if segments.is_empty() { &segments[0..0] } else { &segments[start..end] };
+                w.segments = if segments.is_empty() {
+                    &segments[0..0]
+                } else {
+                    &segments[start..end]
+                };
                 w.peer_addr = peer_addr + base;
                 w.imm = if is_last { imm } else { None };
                 w.post_outcome = None;
@@ -1007,7 +1027,8 @@ impl SharedAsyncStream {
                 transfer_id,
             } => {
                 let src = self.register_source(source_len)?;
-                self.run_write_plan(&src, req, payload_len, transfer_id, fill).await?;
+                self.run_write_plan(&src, req, payload_len, transfer_id, fill)
+                    .await?;
                 // `src` drops after the write returns: `run_write_plan` awaited the
                 // write's completion (and ack), so no DMA references the MR —
                 // deregistration is sound. Mirrors `hord_zerocopy::serve_rdma_write`.
@@ -1081,7 +1102,10 @@ impl SharedAsyncStream {
                 self.rdma_write_with_imm(src, 0, req.addr, req.rkey, payload_len, id)
                     .await
             }
-            None => self.rdma_write(src, 0, req.addr, req.rkey, payload_len).await,
+            None => {
+                self.rdma_write(src, 0, req.addr, req.rkey, payload_len)
+                    .await
+            }
         }
     }
 
@@ -1318,7 +1342,10 @@ impl AsyncHordStream {
                 shared: Rc::clone(&shared),
                 _pump: Rc::clone(&guard),
             },
-            data: DataPlane { shared, _pump: guard },
+            data: DataPlane {
+                shared,
+                _pump: guard,
+            },
         }
     }
 }

@@ -193,7 +193,9 @@ mod tests {
     fn zero_copy_flag_round_trips() {
         let off = Handshake::new(65536, 32);
         assert!(!off.zero_copy_capable());
-        assert!(!Handshake::decode(&off.encode()).unwrap().zero_copy_capable());
+        assert!(!Handshake::decode(&off.encode())
+            .unwrap()
+            .zero_copy_capable());
 
         let on = Handshake::new(65536, 32).with_zero_copy(true);
         assert!(on.zero_copy_capable());

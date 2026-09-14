@@ -28,11 +28,13 @@ use std::time::Duration;
 
 use hord_core::{is_connection_setup_failure, CmParams, Connection, Listener};
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const PORT: u16 = 18523; // distinct from the other device tests (18520-18522)
 const WATCHDOG: Duration = Duration::from_secs(30); // generous; loopback is ~instant
-// Way past any device's max_qp_wr / max_cqe, so Endpoint::build is guaranteed to
-// fail at CQ/QP creation — a per-connection setup failure after the ack.
+                                                    // Way past any device's max_qp_wr / max_cqe, so Endpoint::build is guaranteed to
+                                                    // fail at CQ/QP creation — a per-connection setup failure after the ack.
 const IMPOSSIBLE_WR: usize = 1 << 28;
 
 #[test]

@@ -21,7 +21,9 @@ use hord_async::{AsyncHordStream, SharedAsyncStream};
 use hord_stream::{HordConfig, HordStream, Listener, Mr, RegisteredBuffer, WriteSegment};
 use hord_zerocopy::{RdmaWriteReq, RdmaWriteStatus, SourcePool};
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const PORT: u16 = 18820; // distinct from the demo (4791) and other loopback tests
 const PORT_POOLED: u16 = 18821; // serve_rdma_write_pooled_reports_bytes_written
 const PORT_TOO_LARGE: u16 = 18822; // serve_rdma_write_too_large_writes_nothing
@@ -80,7 +82,10 @@ fn zero_copy_async_round_trip() {
         let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
         current_thread_rt().block_on(async move {
             let stream = AsyncHordStream::from_accepted(conn, &srv_config).expect("accept");
-            assert!(stream.zero_copy_negotiated(), "server: zero-copy not negotiated");
+            assert!(
+                stream.zero_copy_negotiated(),
+                "server: zero-copy not negotiated"
+            );
             let mut shared = SharedAsyncStream::new(stream);
 
             let req = RdmaWriteReq::parse(&read_line(&mut shared).await).expect("parse request");
@@ -90,7 +95,9 @@ fn zero_copy_async_round_trip() {
                 .rdma_write(&src, 0, req.addr, req.rkey, OBJECT)
                 .await
                 .expect("rdma_write");
-            let status = RdmaWriteStatus::Complete { bytes_written: OBJECT as u64 };
+            let status = RdmaWriteStatus::Complete {
+                bytes_written: OBJECT as u64,
+            };
             write_line(&mut shared, &status.header_value()).await;
             // Give the client time to read the status before we tear down.
             shared.disconnect();
@@ -116,7 +123,9 @@ fn zero_copy_async_round_trip() {
         let status = RdmaWriteStatus::parse(&status).expect("parse status");
         assert_eq!(
             status,
-            RdmaWriteStatus::Complete { bytes_written: OBJECT as u64 },
+            RdmaWriteStatus::Complete {
+                bytes_written: OBJECT as u64
+            },
             "expected a complete zero-copy write"
         );
 
@@ -127,7 +136,12 @@ fn zero_copy_async_round_trip() {
             let take = tmp.len().min(OBJECT - off);
             buf.copy_out(off, &mut tmp[..take]);
             for (i, &got) in tmp[..take].iter().enumerate() {
-                assert_eq!(got, pattern_byte(off + i), "payload mismatch at byte {}", off + i);
+                assert_eq!(
+                    got,
+                    pattern_byte(off + i),
+                    "payload mismatch at byte {}",
+                    off + i
+                );
             }
             off += take;
         }
@@ -156,7 +170,10 @@ fn serve_rdma_write_pooled_reports_bytes_written() {
         let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
         current_thread_rt().block_on(async move {
             let stream = AsyncHordStream::from_accepted(conn, &srv_config).expect("accept");
-            assert!(stream.zero_copy_negotiated(), "server: zero-copy not negotiated");
+            assert!(
+                stream.zero_copy_negotiated(),
+                "server: zero-copy not negotiated"
+            );
             let mut shared = SharedAsyncStream::new(stream);
             let pool = SourcePool::new(2, OBJECT);
 
@@ -168,7 +185,9 @@ fn serve_rdma_write_pooled_reports_bytes_written() {
                 .expect("serve_rdma_write_pooled");
             assert_eq!(
                 status,
-                RdmaWriteStatus::Complete { bytes_written: OBJECT as u64 },
+                RdmaWriteStatus::Complete {
+                    bytes_written: OBJECT as u64
+                },
                 "serve must report the DMA'd byte count"
             );
             write_line(&mut shared, &status.header_value()).await;
@@ -194,7 +213,9 @@ fn serve_rdma_write_pooled_reports_bytes_written() {
             .expect("status read timed out");
         assert_eq!(
             RdmaWriteStatus::parse(&status),
-            Some(RdmaWriteStatus::Complete { bytes_written: OBJECT as u64 }),
+            Some(RdmaWriteStatus::Complete {
+                bytes_written: OBJECT as u64
+            }),
             "expected a complete zero-copy write reporting OBJECT bytes"
         );
 
@@ -205,7 +226,12 @@ fn serve_rdma_write_pooled_reports_bytes_written() {
             let take = tmp.len().min(OBJECT - off);
             buf.copy_out(off, &mut tmp[..take]);
             for (i, &got) in tmp[..take].iter().enumerate() {
-                assert_eq!(got, pattern_byte(off + i), "payload mismatch at byte {}", off + i);
+                assert_eq!(
+                    got,
+                    pattern_byte(off + i),
+                    "payload mismatch at byte {}",
+                    off + i
+                );
             }
             off += take;
         }
@@ -233,16 +259,26 @@ fn serve_rdma_write_too_large_writes_nothing() {
         let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
         current_thread_rt().block_on(async move {
             let stream = AsyncHordStream::from_accepted(conn, &srv_config).expect("accept");
-            assert!(stream.zero_copy_negotiated(), "server: zero-copy not negotiated");
+            assert!(
+                stream.zero_copy_negotiated(),
+                "server: zero-copy not negotiated"
+            );
             let mut shared = SharedAsyncStream::new(stream);
 
             let req = RdmaWriteReq::parse(&read_line(&mut shared).await).expect("parse request");
             // OBJECT (4 MiB) > the client's SMALL buffer -> TooLarge, no write.
             let status = shared
-                .serve_rdma_write(&req, OBJECT as u64, |_| panic!("fill must not run for TooLarge"))
+                .serve_rdma_write(&req, OBJECT as u64, |_| {
+                    panic!("fill must not run for TooLarge")
+                })
                 .await
                 .expect("serve_rdma_write");
-            assert_eq!(status, RdmaWriteStatus::TooLarge { object_size: OBJECT as u64 });
+            assert_eq!(
+                status,
+                RdmaWriteStatus::TooLarge {
+                    object_size: OBJECT as u64
+                }
+            );
             write_line(&mut shared, &status.header_value()).await;
             shared.disconnect();
         });
@@ -268,14 +304,19 @@ fn serve_rdma_write_too_large_writes_nothing() {
             .expect("status read timed out");
         assert_eq!(
             RdmaWriteStatus::parse(&status),
-            Some(RdmaWriteStatus::TooLarge { object_size: OBJECT as u64 }),
+            Some(RdmaWriteStatus::TooLarge {
+                object_size: OBJECT as u64
+            }),
             "expected too_large for an object larger than the client buffer"
         );
 
         // Nothing was written: the buffer still holds the sentinel.
         let mut got = vec![0u8; SMALL];
         buf.copy_out(0, &mut got);
-        assert!(got.iter().all(|&b| b == SENTINEL), "TooLarge must not write into the buffer");
+        assert!(
+            got.iter().all(|&b| b == SENTINEL),
+            "TooLarge must not write into the buffer"
+        );
     });
 
     server.join().expect("server thread panicked");
@@ -328,19 +369,24 @@ fn gather_write_lands_fragments_contiguously() {
                 }
                 // SAFETY: `v` stays live in `backing` until after the gather write
                 // completes (it drains every WR before resolving).
-                let mr = unsafe { shared.register_external(v.as_mut_ptr(), v.len()) }.expect("reg ext");
+                let mr =
+                    unsafe { shared.register_external(v.as_mut_ptr(), v.len()) }.expect("reg ext");
                 backing.push(v);
                 mrs.push(mr);
             }
 
             let req = RdmaWriteReq::parse(&read_line(&mut shared).await).expect("parse request");
-            let segments: Vec<WriteSegment> =
-                mrs.iter().map(|mr| WriteSegment::from_mr(mr, 0, SEG)).collect();
+            let segments: Vec<WriteSegment> = mrs
+                .iter()
+                .map(|mr| WriteSegment::from_mr(mr, 0, SEG))
+                .collect();
             shared
                 .rdma_write_gather(&segments, req.addr, req.rkey)
                 .await
                 .expect("rdma_write_gather");
-            let status = RdmaWriteStatus::Complete { bytes_written: TOTAL as u64 };
+            let status = RdmaWriteStatus::Complete {
+                bytes_written: TOTAL as u64,
+            };
             write_line(&mut shared, &status.header_value()).await;
             drop(segments);
             drop(mrs);
@@ -366,7 +412,9 @@ fn gather_write_lands_fragments_contiguously() {
             .expect("status read timed out");
         assert_eq!(
             RdmaWriteStatus::parse(&status),
-            Some(RdmaWriteStatus::Complete { bytes_written: TOTAL as u64 }),
+            Some(RdmaWriteStatus::Complete {
+                bytes_written: TOTAL as u64
+            }),
         );
 
         // The fragmented source must have landed contiguously, in order.
@@ -376,7 +424,12 @@ fn gather_write_lands_fragments_contiguously() {
             let take = tmp.len().min(TOTAL - off);
             buf.copy_out(off, &mut tmp[..take]);
             for (i, &got) in tmp[..take].iter().enumerate() {
-                assert_eq!(got, pattern_byte(off + i), "payload mismatch at byte {}", off + i);
+                assert_eq!(
+                    got,
+                    pattern_byte(off + i),
+                    "payload mismatch at byte {}",
+                    off + i
+                );
             }
             off += take;
         }
@@ -396,12 +449,15 @@ fn gather_write_lands_fragments_contiguously() {
 fn over_cap_async_gather_batches_and_lands_contiguously() {
     const PORT_BATCH: u16 = 18824; // distinct from the plain gather test (18823)
     const SEG: usize = 256 * 1024; // per-fragment size
-    // 40 fragments => >=3 WRs for any max_send_sge in 1..=16, comfortably above the
-    // send_pool of 2 below, so the gather always spans several drained batches.
+                                   // 40 fragments => >=3 WRs for any max_send_sge in 1..=16, comfortably above the
+                                   // send_pool of 2 below, so the gather always spans several drained batches.
     const N: usize = 40;
     const TOTAL: usize = SEG * N; // 10 MiB contiguous object
-    // send_pool below the gather's WR count -> forces batching.
-    let config = HordConfig { send_pool_size: 2, ..HordConfig::default() };
+                                  // send_pool below the gather's WR count -> forces batching.
+    let config = HordConfig {
+        send_pool_size: 2,
+        ..HordConfig::default()
+    };
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     let srv_config = config.clone();
@@ -429,15 +485,18 @@ fn over_cap_async_gather_batches_and_lands_contiguously() {
             // SAFETY: `whole` stays live until after the gather completes below.
             let mr = unsafe { shared.register_external(whole.as_mut_ptr(), whole.len()) }
                 .expect("reg ext");
-            let segments: Vec<WriteSegment> =
-                (0..N).map(|k| WriteSegment::from_mr(&mr, k * SEG, SEG)).collect();
+            let segments: Vec<WriteSegment> = (0..N)
+                .map(|k| WriteSegment::from_mr(&mr, k * SEG, SEG))
+                .collect();
 
             let req = RdmaWriteReq::parse(&read_line(&mut shared).await).expect("parse request");
             shared
                 .rdma_write_gather(&segments, req.addr, req.rkey)
                 .await
                 .expect("over-cap rdma_write_gather");
-            let status = RdmaWriteStatus::Complete { bytes_written: TOTAL as u64 };
+            let status = RdmaWriteStatus::Complete {
+                bytes_written: TOTAL as u64,
+            };
             write_line(&mut shared, &status.header_value()).await;
             drop(segments);
             drop(mr);
@@ -463,7 +522,9 @@ fn over_cap_async_gather_batches_and_lands_contiguously() {
             .expect("status read timed out");
         assert_eq!(
             RdmaWriteStatus::parse(&status),
-            Some(RdmaWriteStatus::Complete { bytes_written: TOTAL as u64 }),
+            Some(RdmaWriteStatus::Complete {
+                bytes_written: TOTAL as u64
+            }),
         );
 
         // Every fragment must have landed contiguously, in order.
@@ -473,7 +534,12 @@ fn over_cap_async_gather_batches_and_lands_contiguously() {
             let take = tmp.len().min(TOTAL - off);
             buf.copy_out(off, &mut tmp[..take]);
             for (i, &got) in tmp[..take].iter().enumerate() {
-                assert_eq!(got, pattern_byte(off + i), "payload mismatch at byte {}", off + i);
+                assert_eq!(
+                    got,
+                    pattern_byte(off + i),
+                    "payload mismatch at byte {}",
+                    off + i
+                );
             }
             off += take;
         }

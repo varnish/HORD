@@ -25,7 +25,9 @@ use hord_async::{AsyncHordStream, SharedAsyncStream, SplitParts};
 use hord_stream::{HordConfig, HordStream, Listener, RegisteredBuffer};
 use hord_zerocopy::{RdmaWriteReq, RdmaWriteStatus};
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const PORT: u16 = 18921; // distinct from the demo (4791) and other loopback tests
 const OBJECT: usize = 4 * 1024 * 1024; // 4 MiB — many MTUs, dwarfs the credit window
 const TRANSFER_ID: u32 = 0x00C0_FFEE; // the §7.7 id echoed back on the data plane
@@ -85,7 +87,10 @@ fn split_data_plane_separate_task() {
         let conn = HordStream::accept_begin(&listener, &srv_config).expect("accept_begin");
         current_thread_rt().block_on(async move {
             let stream = AsyncHordStream::from_accepted(conn, &srv_config).expect("accept");
-            assert!(stream.split_mode_negotiated(), "server: split mode not negotiated");
+            assert!(
+                stream.split_mode_negotiated(),
+                "server: split mode not negotiated"
+            );
             let mut shared = SharedAsyncStream::new(stream);
 
             let req = RdmaWriteReq::parse(&read_line(&mut shared).await).expect("parse request");
@@ -96,7 +101,9 @@ fn split_data_plane_separate_task() {
                 .rdma_write_with_imm(&src, 0, req.addr, req.rkey, OBJECT, id)
                 .await
                 .expect("rdma_write_with_imm");
-            let status = RdmaWriteStatus::Complete { bytes_written: OBJECT as u64 };
+            let status = RdmaWriteStatus::Complete {
+                bytes_written: OBJECT as u64,
+            };
             write_line(&mut shared, &status.header_value()).await;
             srv_teardown.wait();
             shared.disconnect();
@@ -109,10 +116,15 @@ fn split_data_plane_separate_task() {
     rt.block_on(local.run_until(async move {
         let stream = AsyncHordStream::connect(&IP, PORT, &config).expect("connect");
         let SplitParts { read, write, data } = stream.into_split();
-        assert!(data.split_mode_negotiated(), "client: split mode not negotiated");
+        assert!(
+            data.split_mode_negotiated(),
+            "client: split mode not negotiated"
+        );
 
         // Register the destination buffer and advertise it (with the split id).
-        let buf = data.register_remote_writable(OBJECT).expect("register dest");
+        let buf = data
+            .register_remote_writable(OBJECT)
+            .expect("register dest");
         let req = RdmaWriteReq {
             addr: buf.as_mut_ptr() as u64,
             rkey: buf.rkey(),
@@ -144,7 +156,9 @@ fn split_data_plane_separate_task() {
         let status = RdmaWriteStatus::parse(&status).expect("parse status");
         assert_eq!(
             status,
-            RdmaWriteStatus::Complete { bytes_written: OBJECT as u64 },
+            RdmaWriteStatus::Complete {
+                bytes_written: OBJECT as u64
+            },
             "expected a complete zero-copy write",
         );
 
@@ -162,7 +176,12 @@ fn split_data_plane_separate_task() {
             let take = tmp.len().min(OBJECT - off);
             buf.copy_out(off, &mut tmp[..take]);
             for (i, &got) in tmp[..take].iter().enumerate() {
-                assert_eq!(got, pattern_byte(off + i), "payload mismatch at byte {}", off + i);
+                assert_eq!(
+                    got,
+                    pattern_byte(off + i),
+                    "payload mismatch at byte {}",
+                    off + i
+                );
             }
             off += take;
         }

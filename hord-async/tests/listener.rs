@@ -34,7 +34,9 @@ use hord_async::{AsyncHordStream, ConnMeta, HordListener, SharedAsyncStream};
 use hord_stream::{Connection, HordConfig, WriteSegment};
 use hord_zerocopy::RdmaWriteReq;
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 
 mod common;
 use common::{current_thread_rt, pattern_byte, pattern_vec};
@@ -60,7 +62,12 @@ async fn read_req(stream: &mut AsyncHordStream) -> std::io::Result<Option<usize>
         .trim()
         .strip_prefix("REQ ")
         .and_then(|x| x.parse::<usize>().ok())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad request: {s:?}")))?;
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bad request: {s:?}"),
+            )
+        })?;
     Ok(Some(n))
 }
 
@@ -149,11 +156,16 @@ fn keep_alive_many_requests_one_qp() {
                 .map_err(|_| format!("request {k} timed out — keep-alive likely broke"))?
                 .map_err(|e| format!("request {k}: {e}"))?;
             if body.len() != N || !body.iter().enumerate().all(|(i, &b)| b == pattern_byte(i)) {
-                return Err(format!("request {k}: payload mismatch (len {})", body.len()));
+                return Err(format!(
+                    "request {k}: payload mismatch (len {})",
+                    body.len()
+                ));
             }
         }
         // Real half-close — the only thing that should surface as EOF on the server.
-        s.shutdown().await.map_err(|e| format!("client shutdown: {e}"))?;
+        s.shutdown()
+            .await
+            .map_err(|e| format!("client shutdown: {e}"))?;
         Ok(())
     });
 
@@ -203,9 +215,7 @@ fn shared_listener_pd_mr_serves_two_connections() {
                 let mut shared = SharedAsyncStream::new(stream);
                 let line = read_line(&mut shared).await.expect("read RDMA request");
                 let req = RdmaWriteReq::parse(&line).expect("parse RDMA request");
-                let seg = unsafe {
-                    WriteSegment::from_raw(src_addr as *const u8, lkey, OBJECT)
-                };
+                let seg = unsafe { WriteSegment::from_raw(src_addr as *const u8, lkey, OBJECT) };
                 shared
                     .rdma_write_gather(&[seg], req.addr, req.rkey)
                     .await
@@ -281,12 +291,15 @@ fn slow_handshake_does_not_stall_the_worker() {
         .workers(1)
         .grace_timeout(Duration::from_secs(1));
     let listener_thread = std::thread::spawn(move || {
-        current_thread_rt().block_on(listener.serve(rx, move |mut stream, _peer, _shutdown| async move {
-            if let Some(n) = read_req(&mut stream).await.expect("read_req") {
-                stream.write_all(&pattern_vec(n)).await.expect("write body");
-                stream.flush().await.expect("flush body");
-            }
-        }));
+        current_thread_rt().block_on(listener.serve(
+            rx,
+            move |mut stream, _peer, _shutdown| async move {
+                if let Some(n) = read_req(&mut stream).await.expect("read_req") {
+                    stream.write_all(&pattern_vec(n)).await.expect("write body");
+                    stream.flush().await.expect("flush body");
+                }
+            },
+        ));
     });
 
     // The stalling peer: drive the QP to ESTABLISHED with the raw connection
@@ -318,7 +331,10 @@ fn slow_handshake_does_not_stall_the_worker() {
             .map_err(|e| format!("connect: {e}"))?;
         let body = tokio::time::timeout(Duration::from_secs(5), request(&mut s, N))
             .await
-            .map_err(|_| "good client request timed out — worker stalled behind the slow handshake".to_string())?
+            .map_err(|_| {
+                "good client request timed out — worker stalled behind the slow handshake"
+                    .to_string()
+            })?
             .map_err(|e| format!("request: {e}"))?;
         if body.len() != N || !body.iter().enumerate().all(|(i, &b)| b == pattern_byte(i)) {
             return Err(format!("payload mismatch (len {})", body.len()));
@@ -396,12 +412,25 @@ fn conn_meta_surfaces_peer_addr_and_caps() {
     // Lossy-sentinel fix: a loopback peer resolves to a real address, surfaced as
     // `Some` — never folded into the old `0.0.0.0:0` placeholder.
     let peer = peer.expect("peer should resolve on a loopback RoCEv2 connection");
-    assert!(!peer.ip().is_unspecified(), "peer must not be the 0.0.0.0 sentinel");
-    assert_eq!(meta.peer_addr, Some(peer), "conn_meta.peer_addr must match the dispatched peer");
+    assert!(
+        !peer.ip().is_unspecified(),
+        "peer must not be the 0.0.0.0 sentinel"
+    );
+    assert_eq!(
+        meta.peer_addr,
+        Some(peer),
+        "conn_meta.peer_addr must match the dispatched peer"
+    );
 
     // Negotiated caps: the default config advertises both on both ends.
-    assert!(meta.zero_copy_negotiated, "zero-copy should negotiate (default config)");
-    assert!(meta.split_mode_negotiated, "split mode should negotiate (default config)");
+    assert!(
+        meta.zero_copy_negotiated,
+        "zero-copy should negotiate (default config)"
+    );
+    assert!(
+        meta.split_mode_negotiated,
+        "split mode should negotiate (default config)"
+    );
 
     // `established_at` is stamped at handshake completion. `SystemTime` is NOT
     // monotonic (an NTP step can move it backward mid-run), so assert a generous
@@ -428,9 +457,9 @@ fn conn_meta_surfaces_peer_addr_and_caps() {
 fn poll_write_backpressures_slow_reader() {
     const PORT: u16 = 18631;
     const PAYLOAD: usize = 16 * 1024 * 1024; // 16 MiB — dwarfs the credit window
-    // A prefix far below PAYLOAD: big enough to prove the write genuinely started
-    // and bytes are flowing, small enough that draining it can't let the full write
-    // complete — the server re-blocks on credits well short of PAYLOAD.
+                                             // A prefix far below PAYLOAD: big enough to prove the write genuinely started
+                                             // and bytes are flowing, small enough that draining it can't let the full write
+                                             // complete — the server re-blocks on credits well short of PAYLOAD.
     const PREFIX: usize = 1024 * 1024; // 1 MiB
 
     // The server writes PAYLOAD bytes, flips `write_done` only once the whole write
@@ -497,7 +526,11 @@ fn poll_write_backpressures_slow_reader() {
     );
     assert_eq!(got.len(), PAYLOAD, "wrong payload length");
     let mismatch = got.iter().enumerate().find(|(i, &b)| b != pattern_byte(*i));
-    assert!(mismatch.is_none(), "payload mismatch at {:?}", mismatch.map(|(i, _)| i));
+    assert!(
+        mismatch.is_none(),
+        "payload mismatch at {:?}",
+        mismatch.map(|(i, _)| i)
+    );
 }
 
 #[test]
@@ -669,10 +702,10 @@ fn shutdown_mid_backpressured_rdma_write_is_safe() {
                     let src = shared.register_source(CHUNK).expect("register source");
                     src.copy_in(0, &pattern_vec(CHUNK));
                     let _ = writing_tx.send(()); // we are about to drive writes
-                    // Loop write-with-immediate. The first N (the client's recv-WR
-                    // count) land; thereafter the peer has no recv WR and the writes
-                    // RNR-stall, so this call parks in `poll_rdma_write` forever — the
-                    // task is wedged with a write outstanding against `src`.
+                                                 // Loop write-with-immediate. The first N (the client's recv-WR
+                                                 // count) land; thereafter the peer has no recv WR and the writes
+                                                 // RNR-stall, so this call parks in `poll_rdma_write` forever — the
+                                                 // task is wedged with a write outstanding against `src`.
                     let mut id = 0u32;
                     loop {
                         if shared
@@ -697,8 +730,12 @@ fn shutdown_mid_backpressured_rdma_write_is_safe() {
     let (release_tx, release_rx) = oneshot::channel::<()>();
     let client_thread = std::thread::spawn(move || {
         current_thread_rt().block_on(async move {
-            let mut s = AsyncHordStream::connect(&IP, PORT, &HordConfig::default()).expect("connect");
-            assert!(s.split_mode_negotiated(), "client: split mode not negotiated");
+            let mut s =
+                AsyncHordStream::connect(&IP, PORT, &HordConfig::default()).expect("connect");
+            assert!(
+                s.split_mode_negotiated(),
+                "client: split mode not negotiated"
+            );
             let buf = s.register_remote_writable(CHUNK).expect("register dest");
             let req = RdmaWriteReq {
                 addr: buf.as_mut_ptr() as u64,
@@ -728,7 +765,9 @@ fn shutdown_mid_backpressured_rdma_write_is_safe() {
     // Fire shutdown and time how long the drain+abort takes to return.
     let t0 = Instant::now();
     shutdown.send(true).expect("send shutdown");
-    listener_thread.join().expect("listener thread panicked (torn teardown?)");
+    listener_thread
+        .join()
+        .expect("listener thread panicked (torn teardown?)");
     let elapsed = t0.elapsed();
 
     // Release the client and join it (no assertion needed — it must not have
@@ -775,24 +814,27 @@ fn idle_keep_alive_drains_promptly_on_shutdown() {
 
     // Server: keep-alive serve loop, but `select!`ed against the shutdown signal the
     // listener hands in as the third arg — so an idle connection winds down promptly.
-    let (shutdown, listener_thread) = spawn_listener(PORT, move |mut stream, _peer, mut sd: watch::Receiver<bool>| async move {
-        loop {
-            tokio::select! {
-                req = read_req(&mut stream) => match req {
-                    Ok(Some(n)) => {
-                        if stream.write_all(&pattern_vec(n)).await.is_err() { break; }
-                        if stream.flush().await.is_err() { break; }
+    let (shutdown, listener_thread) = spawn_listener(
+        PORT,
+        move |mut stream, _peer, mut sd: watch::Receiver<bool>| async move {
+            loop {
+                tokio::select! {
+                    req = read_req(&mut stream) => match req {
+                        Ok(Some(n)) => {
+                            if stream.write_all(&pattern_vec(n)).await.is_err() { break; }
+                            if stream.flush().await.is_err() { break; }
+                        }
+                        _ => break, // clean EOF or error
+                    },
+                    // Flip to `true` (or dropped sender, `Err`) → wind this connection
+                    // down at once instead of looping back into the next-request read.
+                    res = sd.changed() => {
+                        if res.is_err() || *sd.borrow() { break; }
                     }
-                    _ => break, // clean EOF or error
-                },
-                // Flip to `true` (or dropped sender, `Err`) → wind this connection
-                // down at once instead of looping back into the next-request read.
-                res = sd.changed() => {
-                    if res.is_err() || *sd.borrow() { break; }
                 }
             }
-        }
-    });
+        },
+    );
 
     // Client: one request, then sit idle (open, silent) until released — the
     // keep-alive idle state the server parks in. `release_rx` keeps the !Send stream
@@ -801,7 +843,8 @@ fn idle_keep_alive_drains_promptly_on_shutdown() {
     let (release_tx, release_rx) = oneshot::channel::<()>();
     let client_thread = std::thread::spawn(move || {
         current_thread_rt().block_on(async move {
-            let mut s = AsyncHordStream::connect(&IP, PORT, &HordConfig::default()).expect("connect");
+            let mut s =
+                AsyncHordStream::connect(&IP, PORT, &HordConfig::default()).expect("connect");
             let body = request(&mut s, N).await.expect("request");
             assert_eq!(body.len(), N, "wrong payload length");
             let _ = ready_tx.send(()); // one request done; now idle on keep-alive

@@ -24,7 +24,9 @@ use hord_demo::{
 use hord_stream::{HordConfig, HordStream, Listener};
 use hord_zerocopy::{serve_rdma_write, RdmaWriteReq, RdmaWriteStatus, ZeroCopyRequest};
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const OBJECT: usize = 4 * 1024 * 1024; // 4 MiB object the range carves into
 
 /// Read one `\n`-terminated line (the lines here are tiny header values).
@@ -88,12 +90,19 @@ fn run_range_case(port: u16, range_spec: &str) -> Outcome {
                 .expect("serve_rdma_write");
                 write_line(
                     &mut s,
-                    &format!("{}|{}", status.header_value(), content_range(start, end, OBJECT)),
+                    &format!(
+                        "{}|{}",
+                        status.header_value(),
+                        content_range(start, end, OBJECT)
+                    ),
                 );
             }
             RangeSpec::Unsatisfiable => {
                 // §7.6/§7.4: 416, Content-Range */total, and no write at all.
-                write_line(&mut s, &format!("416|{}", content_range_unsatisfied(OBJECT)));
+                write_line(
+                    &mut s,
+                    &format!("416|{}", content_range_unsatisfied(OBJECT)),
+                );
             }
             RangeSpec::Full => panic!("test drives only satisfiable / unsatisfiable ranges"),
         }
@@ -115,7 +124,9 @@ fn run_range_case(port: u16, range_spec: &str) -> Outcome {
     write_line(&mut s, range_spec);
 
     let reply = read_line(&mut s);
-    let (status_v, cr_v) = reply.split_once('|').expect("reply is status|content-range");
+    let (status_v, cr_v) = reply
+        .split_once('|')
+        .expect("reply is status|content-range");
 
     let outcome = match RdmaWriteStatus::parse(status_v) {
         Some(RdmaWriteStatus::Complete { bytes_written }) => {
@@ -123,8 +134,16 @@ fn run_range_case(port: u16, range_spec: &str) -> Outcome {
             let (cr_start, cr_end, cr_total) = parse_content_range(cr_v).expect("content-range");
             assert_eq!(cr_total, OBJECT, "Content-Range total");
             assert_eq!(cr_start, base, "Content-Range start");
-            assert_eq!(len, cr_end - cr_start + 1, "Content-Range length vs bytes_written");
-            assert!(len <= zc.capacity(), "bytes_written {len} exceeds buffer {}", zc.capacity());
+            assert_eq!(
+                len,
+                cr_end - cr_start + 1,
+                "Content-Range length vs bytes_written"
+            );
+            assert!(
+                len <= zc.capacity(),
+                "bytes_written {len} exceeds buffer {}",
+                zc.capacity()
+            );
             // Verify the delivered sub-range against the *absolute* object pattern.
             let mut tmp = vec![0u8; len.clamp(1, 256 * 1024)];
             let mut off = 0;

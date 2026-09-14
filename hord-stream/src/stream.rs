@@ -304,7 +304,12 @@ impl<'a> WriteSegment<'a> {
     /// the write that consumes this segment completes. Prefer the borrow-checked
     /// [`from_registered`](Self::from_registered) / [`from_mr`](Self::from_mr).
     pub unsafe fn from_raw(addr: *const u8, lkey: u32, len: usize) -> Self {
-        WriteSegment { local_addr: addr, lkey, len, _src: PhantomData }
+        WriteSegment {
+            local_addr: addr,
+            lkey,
+            len,
+            _src: PhantomData,
+        }
     }
 
     /// Length of this span in bytes.
@@ -405,9 +410,9 @@ pub struct HordStream {
     ctrl_slot: usize,      // reserved send slot index for control (CREDIT_ONLY) messages
     ctrl_send_busy: bool,  // a control message is in flight on `ctrl_slot`
 
-    tx_stage: Vec<u8>,        // bytes buffered by write(), drained into messages
+    tx_stage: Vec<u8>, // bytes buffered by write(), drained into messages
     rx_ready: VecDeque<ReadyMsg>, // received data, still in its recv buffer, awaiting read()
-    peer_closed: bool,        // observed a flush/transport error -> treat as EOF/broken pipe
+    peer_closed: bool, // observed a flush/transport error -> treat as EOF/broken pipe
     // The CM channel has been flipped non-blocking (after the handshake), so the
     // blocking busy-poll may check it for a peer-initiated graceful half-close.
     // `false` if the flip failed at setup — half-close detection is then simply
@@ -430,7 +435,7 @@ pub struct HordStream {
     // flag in `apply_peer` — so after the handshake it is exactly "both sides
     // advertised the capability".
     zero_copy: bool,
-    writes_outstanding: u32,  // one-sided RDMA writes posted but not yet reaped
+    writes_outstanding: u32, // one-sided RDMA writes posted but not yet reaped
 
     // ---- protocol splitting (spec §7.7) ----
     // Like `zero_copy`: our config AND-ed with the peer's flag (and our own
@@ -714,7 +719,10 @@ impl HordStream {
         let lkey = self._handshake.lkey();
         // SAFETY: `ptr` is the base of the handshake MR (`lkey`), live until the
         // completion is reaped in `exchange_handshake`; the buffer outlives it.
-        unsafe { self.conn.post_recv(HS_RECV_WR_ID, ptr, HANDSHAKE_LEN as u32, lkey) }
+        unsafe {
+            self.conn
+                .post_recv(HS_RECV_WR_ID, ptr, HANDSHAKE_LEN as u32, lkey)
+        }
     }
 
     /// Exchange the HORD handshake as the first messages over the established QP:
@@ -758,7 +766,10 @@ impl HordStream {
         // SAFETY: the send region is within the handshake MR and stays live until
         // its send completion is reaped by `poll_handshake`.
         let send_ptr = unsafe { self._handshake.as_mut_ptr().add(HANDSHAKE_LEN) };
-        unsafe { self.conn.post_send(HS_SEND_WR_ID, send_ptr, HANDSHAKE_LEN as u32, lkey) }
+        unsafe {
+            self.conn
+                .post_send(HS_SEND_WR_ID, send_ptr, HANDSHAKE_LEN as u32, lkey)
+        }
     }
 
     /// Non-blocking step of the handshake exchange after
@@ -1231,7 +1242,9 @@ impl HordStream {
     fn post_split_recvs(&mut self) -> io::Result<()> {
         debug_assert!(self.split_recv.is_none(), "split headroom posted twice");
         let n = self.split_headroom;
-        let buf = self.conn.register_buffer(n * self.msg_size, ACCESS_LOCAL_WRITE)?;
+        let buf = self
+            .conn
+            .register_buffer(n * self.msg_size, ACCESS_LOCAL_WRITE)?;
         // Store the MR *before* posting, for two reasons: `post_recv_slot` resolves
         // a split slot through `recv_slot`, which reads `self.split_recv`; and a
         // mid-loop post failure must not drop the MR while the WRs already posted
@@ -1385,7 +1398,10 @@ impl HordStream {
     /// holds `< payload_cap` bytes between calls.
     pub fn try_write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.peer_closed {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection closed",
+            ));
         }
         let cap = self.payload_cap;
         let mut input = buf;
@@ -1493,7 +1509,11 @@ impl HordStream {
     /// before an async wait, so a peer blocked on us — the #3 path — unblocks);
     /// otherwise it uses the proactive threshold to avoid a credit-only storm.
     pub fn return_owed_credits(&mut self, urgent: bool) -> io::Result<()> {
-        let threshold = if urgent { 1 } else { self.proactive_threshold() };
+        let threshold = if urgent {
+            1
+        } else {
+            self.proactive_threshold()
+        };
         self.maybe_return_credits(threshold)
     }
 
@@ -1628,7 +1648,11 @@ impl HordStream {
         mut emit: impl FnMut(u64, &[Sge]) -> io::Result<()>,
     ) -> io::Result<usize> {
         let max_sge = max_sge.clamp(1, MAX_WRITE_SGE);
-        let mut sges = [Sge { addr: 0, length: 0, lkey: 0 }; MAX_WRITE_SGE];
+        let mut sges = [Sge {
+            addr: 0,
+            length: 0,
+            lkey: 0,
+        }; MAX_WRITE_SGE];
         let mut n_sge = 0usize; // SGEs staged in the in-progress WR
         let mut wr_bytes = 0u64; // bytes staged in the in-progress WR
         let mut remote_off = 0u64; // byte offset of the in-progress WR
@@ -1680,7 +1704,11 @@ impl HordStream {
     /// first segment alone needs more than `wr_budget` WRs — i.e. a single span over
     /// `wr_budget * WRITE_WR_MAX` bytes — so the caller makes progress; that lone
     /// segment then surfaces its own over-cap `InvalidInput`, never a silent hang).
-    fn next_batch_len(segments: &[WriteSegment<'_>], max_sge: usize, wr_budget: usize) -> (usize, u64) {
+    fn next_batch_len(
+        segments: &[WriteSegment<'_>],
+        max_sge: usize,
+        wr_budget: usize,
+    ) -> (usize, u64) {
         let max_sge = max_sge.clamp(1, MAX_WRITE_SGE);
         let budget = wr_budget.max(1);
         let mut n_sge = 0usize; // SGEs in the in-progress WR
@@ -1749,13 +1777,20 @@ impl HordStream {
         imm: Option<u32>,
     ) -> io::Result<()> {
         if self.peer_closed {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection closed",
+            ));
         }
         let max_sge = self.conn.max_send_sge();
         // Count the WRs the packing will produce (no posting), for admission.
         let n_data_wrs = Self::plan_gather(segments, max_sge, |_, _| Ok(()))?;
         // An all-empty gather still needs one WR to carry the immediate.
-        let n_wrs = if n_data_wrs == 0 && imm.is_some() { 1 } else { n_data_wrs };
+        let n_wrs = if n_data_wrs == 0 && imm.is_some() {
+            1
+        } else {
+            n_data_wrs
+        };
         if n_wrs == 0 {
             return Ok(()); // nothing to write and no immediate to deliver
         }
@@ -1801,8 +1836,13 @@ impl HordStream {
             // `segments` keeps the sources alive for the whole write); the
             // destination is authorized by the peer-supplied rkey.
             unsafe {
-                self.conn
-                    .post_write_gather(wr_id, sges, peer_addr + remote_off, peer_rkey, imm_here)
+                self.conn.post_write_gather(
+                    wr_id,
+                    sges,
+                    peer_addr + remote_off,
+                    peer_rkey,
+                    imm_here,
+                )
             }?;
             self.writes_outstanding += 1;
             if imm_here.is_some() {
@@ -2037,7 +2077,9 @@ impl HordStream {
         len: usize,
         imm: Option<u32>,
     ) -> io::Result<()> {
-        self.drive_write_all(|s| s.begin_rdma_write_inner(src, src_off, peer_addr, peer_rkey, len, imm))
+        self.drive_write_all(|s| {
+            s.begin_rdma_write_inner(src, src_off, peer_addr, peer_rkey, len, imm)
+        })
     }
 
     /// Mark the stream closed — e.g. when the async layer observes a CM
@@ -2139,7 +2181,10 @@ impl Write for HordStream {
     /// blocking on send slots/credits as needed.
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         if self.peer_closed {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection closed",
+            ));
         }
         let mut off = 0;
         while off < data.len() {
@@ -2259,7 +2304,9 @@ mod fullduplex_tests {
     use std::sync::{mpsc, Arc, Barrier};
     use std::time::{Duration, Instant};
 
-    static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+    static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+    }); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
     const PORT: u16 = 18519; // a free port distinct from the demo's 4791
     const BODY: usize = 16 * 1024 * 1024; // 16 MiB each way — far exceeds the pipe
     const STALL: Duration = Duration::from_secs(15); // no-progress watchdog
@@ -2303,7 +2350,8 @@ mod fullduplex_tests {
         while s.send_credits > 0 && sent < to_send.len() {
             if !s.send_free.is_empty() {
                 let end = (sent + cap).min(to_send.len());
-                s.post_data_message(&to_send[sent..end]).expect("post_data_message");
+                s.post_data_message(&to_send[sent..end])
+                    .expect("post_data_message");
                 sent = end;
                 last = Instant::now();
             } else if !s.pump(false).expect("pump") && last.elapsed() > STALL {
@@ -2323,7 +2371,8 @@ mod fullduplex_tests {
 
             while sent < to_send.len() && !s.send_free.is_empty() && s.send_credits > 0 {
                 let end = (sent + cap).min(to_send.len());
-                s.post_data_message(&to_send[sent..end]).expect("post_data_message");
+                s.post_data_message(&to_send[sent..end])
+                    .expect("post_data_message");
                 sent = end;
                 progressed = true;
             }
@@ -2425,7 +2474,9 @@ mod half_close_tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+    static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+    }); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
     const PORT: u16 = 18526; // distinct from the other in-crate loopback tests
     const DEADLINE: Duration = Duration::from_secs(15);
 
@@ -2503,7 +2554,9 @@ mod split_tests {
     use std::sync::{mpsc, Arc, Barrier};
     use std::time::{Duration, Instant};
 
-    static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+    static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+    }); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
     const PORT: u16 = 18522; // distinct from full_duplex_bulk (18519) and the smokes
     const PORT_BP: u16 = 18523; // split_credit_backpressure
     const PORT_BPF: u16 = 18524; // split_credit_backpressure_facade
@@ -2605,7 +2658,10 @@ mod split_tests {
         let mut seen = std::collections::HashSet::new();
         let start = Instant::now();
         while seen.len() < TRANSFERS.len() {
-            match client.poll_completed_transfer().expect("poll_completed_transfer") {
+            match client
+                .poll_completed_transfer()
+                .expect("poll_completed_transfer")
+            {
                 Some(id) => {
                     assert!(seen.insert(id), "transfer {id} completed twice");
                     let (idx, &(_, len)) = TRANSFERS
@@ -2615,7 +2671,11 @@ mod split_tests {
                         .unwrap_or_else(|| panic!("unknown transfer ID {id} in imm_data"));
                     let mut got = vec![0u8; len];
                     bufs[idx].copy_out(0, &mut got);
-                    assert_eq!(got, pattern(len, id as u8), "transfer {id} payload mismatch");
+                    assert_eq!(
+                        got,
+                        pattern(len, id as u8),
+                        "transfer {id} payload mismatch"
+                    );
                 }
                 None => panic!("connection closed before all transfers completed"),
             }
@@ -2663,7 +2723,10 @@ mod split_tests {
             let listener = Listener::bind(&IP, PORT_ZL).expect("bind");
             ready_tx.send(()).expect("signal ready");
             let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
-            assert!(s.split_mode_negotiated(), "server: split mode should negotiate");
+            assert!(
+                s.split_mode_negotiated(),
+                "server: split mode should negotiate"
+            );
 
             // A non-empty source the len==0 write reads zero bytes from.
             let src = s.register_source(8).expect("register src");
@@ -2682,7 +2745,10 @@ mod split_tests {
 
         ready_rx.recv().expect("server ready");
         let mut client = HordStream::connect(&IP, PORT_ZL, &config).expect("connect");
-        assert!(client.split_mode_negotiated(), "client: split mode should negotiate");
+        assert!(
+            client.split_mode_negotiated(),
+            "client: split mode should negotiate"
+        );
 
         // A small remote-writable target; the 0-byte writes land nothing in it.
         let buf = client.register_remote_writable(64).expect("register dst");
@@ -2694,9 +2760,15 @@ mod split_tests {
         let mut seen = std::collections::HashSet::new();
         let start = Instant::now();
         while seen.len() < 2 {
-            match client.poll_completed_transfer().expect("poll_completed_transfer") {
+            match client
+                .poll_completed_transfer()
+                .expect("poll_completed_transfer")
+            {
                 Some(id) => {
-                    assert!(id == ID_EMPTY || id == ID_ZEROLEN, "unexpected transfer ID {id}");
+                    assert!(
+                        id == ID_EMPTY || id == ID_ZEROLEN,
+                        "unexpected transfer ID {id}"
+                    );
                     assert!(seen.insert(id), "transfer {id} completed twice");
                 }
                 None => panic!("connection closed before both transfers completed"),
@@ -2753,7 +2825,9 @@ mod split_tests {
         ready_rx.recv().expect("server ready");
         let mut client = HordStream::connect(&IP, PORT_FAIL, &config).expect("connect");
         assert!(client.split_mode_negotiated());
-        let buf = client.register_remote_writable(CLIENT_CAP).expect("register dst");
+        let buf = client
+            .register_remote_writable(CLIENT_CAP)
+            .expect("register dst");
         target_tx
             .send((buf.as_mut_ptr() as u64, buf.rkey()))
             .expect("send target");
@@ -2816,7 +2890,10 @@ mod split_tests {
             let listener = Listener::bind(&IP, PORT_BP).expect("bind");
             ready_tx.send(()).expect("signal ready");
             let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
-            assert!(s.split_mode_negotiated(), "server: split mode should negotiate");
+            assert!(
+                s.split_mode_negotiated(),
+                "server: split mode should negotiate"
+            );
             // The bound on *our* sending is the window the client advertised.
             assert_eq!(
                 s.peer_split_credits, WINDOW as u32,
@@ -2855,7 +2932,10 @@ mod split_tests {
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(e) => panic!("unexpected error retrying the third write: {e}"),
                 }
-                assert!(start.elapsed() < STALL, "transfer-credit window never freed");
+                assert!(
+                    start.elapsed() < STALL,
+                    "transfer-credit window never freed"
+                );
             }
             // Drain the rest before dropping the sources (NIC DMA-reads them).
             while s.writes_pending() {
@@ -2868,7 +2948,10 @@ mod split_tests {
 
         ready_rx.recv().expect("server ready");
         let mut client = HordStream::connect(&IP, PORT_BP, &config).expect("connect");
-        assert!(client.split_mode_negotiated(), "client: split mode should negotiate");
+        assert!(
+            client.split_mode_negotiated(),
+            "client: split mode should negotiate"
+        );
 
         let bufs: Vec<RegisteredBuffer> = (0..N)
             .map(|_| client.register_remote_writable(LEN).expect("register dst"))
@@ -2883,13 +2966,23 @@ mod split_tests {
         let mut seen = std::collections::HashSet::new();
         let start = Instant::now();
         while seen.len() < N {
-            match client.poll_completed_transfer().expect("poll_completed_transfer") {
+            match client
+                .poll_completed_transfer()
+                .expect("poll_completed_transfer")
+            {
                 Some(id) => {
                     assert!(seen.insert(id), "transfer {id} completed twice");
-                    let idx = ids.iter().position(|&x| x == id).expect("known transfer ID");
+                    let idx = ids
+                        .iter()
+                        .position(|&x| x == id)
+                        .expect("known transfer ID");
                     let mut got = vec![0u8; LEN];
                     bufs[idx].copy_out(0, &mut got);
-                    assert_eq!(got, pattern(LEN, id as u8), "transfer {id} payload mismatch");
+                    assert_eq!(
+                        got,
+                        pattern(LEN, id as u8),
+                        "transfer {id} payload mismatch"
+                    );
                 }
                 None => panic!("connection closed before all transfers completed"),
             }
@@ -2929,7 +3022,10 @@ mod split_tests {
             let listener = Listener::bind(&IP, PORT_BPF).expect("bind");
             ready_tx.send(()).expect("signal ready");
             let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
-            assert!(s.split_mode_negotiated(), "server: split mode should negotiate");
+            assert!(
+                s.split_mode_negotiated(),
+                "server: split mode should negotiate"
+            );
 
             let descs = desc_rx.recv().expect("recv descriptors");
             let mut srcs = Vec::new();
@@ -2959,7 +3055,10 @@ mod split_tests {
 
         ready_rx.recv().expect("server ready");
         let mut client = HordStream::connect(&IP, PORT_BPF, &config).expect("connect");
-        assert!(client.split_mode_negotiated(), "client: split mode should negotiate");
+        assert!(
+            client.split_mode_negotiated(),
+            "client: split mode should negotiate"
+        );
 
         let bufs: Vec<RegisteredBuffer> = (0..N)
             .map(|_| client.register_remote_writable(LEN).expect("register dst"))
@@ -2973,13 +3072,23 @@ mod split_tests {
         let mut seen = std::collections::HashSet::new();
         let start = Instant::now();
         while seen.len() < N {
-            match client.poll_completed_transfer().expect("poll_completed_transfer") {
+            match client
+                .poll_completed_transfer()
+                .expect("poll_completed_transfer")
+            {
                 Some(id) => {
                     assert!(seen.insert(id), "transfer {id} completed twice");
-                    let idx = ids.iter().position(|&x| x == id).expect("known transfer ID");
+                    let idx = ids
+                        .iter()
+                        .position(|&x| x == id)
+                        .expect("known transfer ID");
                     let mut got = vec![0u8; LEN];
                     bufs[idx].copy_out(0, &mut got);
-                    assert_eq!(got, pattern(LEN, id as u8), "transfer {id} payload mismatch");
+                    assert_eq!(
+                        got,
+                        pattern(LEN, id as u8),
+                        "transfer {id} payload mismatch"
+                    );
                 }
                 None => panic!("connection closed before all transfers completed"),
             }
@@ -3011,7 +3120,9 @@ mod gather_tests {
     use std::io::{Read, Write};
     use std::sync::mpsc;
 
-    static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+    static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+    }); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
     const PORT: u16 = 18530; // distinct from the other in-crate loopback tests
     const SEG_LEN: usize = 64 * 1024; // per-allocation (per-segment) size
     const N_SEG: usize = 40; // > MAX_WRITE_SGE (16) -> the gather spans several WRs
@@ -3065,9 +3176,12 @@ mod gather_tests {
             let addr: u64 = it.next().unwrap().parse().unwrap();
             let rkey: u32 = it.next().unwrap().parse().unwrap();
 
-            let segments: Vec<WriteSegment> =
-                mrs.iter().map(|mr| WriteSegment::from_mr(mr, 0, SEG_LEN)).collect();
-            s.rdma_write_gather_all(&segments, addr, rkey).expect("gather write");
+            let segments: Vec<WriteSegment> = mrs
+                .iter()
+                .map(|mr| WriteSegment::from_mr(mr, 0, SEG_LEN))
+                .collect();
+            s.rdma_write_gather_all(&segments, addr, rkey)
+                .expect("gather write");
             write_line(&mut s, "done");
             // The write drained, so the source MRs/backing may now be released.
             drop(segments);
@@ -3079,7 +3193,10 @@ mod gather_tests {
         ready_rx.recv().expect("ready");
         let mut c = HordStream::connect(&IP, PORT, &config).expect("connect");
         let buf = c.register_remote_writable(TOTAL).expect("reg dst");
-        write_line(&mut c, &format!("{} {}", buf.as_mut_ptr() as u64, buf.rkey()));
+        write_line(
+            &mut c,
+            &format!("{} {}", buf.as_mut_ptr() as u64, buf.rkey()),
+        );
         assert_eq!(read_line(&mut c), "done");
 
         // The fragmented source must have landed contiguously, in order.
@@ -3106,7 +3223,10 @@ mod gather_tests {
         const TRANSFER_ID: u32 = 0x7E57_1D00;
 
         // send_pool below the gather's WR count -> forces batching.
-        let config = HordConfig { send_pool_size: 2, ..HordConfig::default() };
+        let config = HordConfig {
+            send_pool_size: 2,
+            ..HordConfig::default()
+        };
 
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let (desc_tx, desc_rx) = mpsc::channel::<(u64, u32)>();
@@ -3118,7 +3238,10 @@ mod gather_tests {
             let listener = Listener::bind(&IP, PORT_BATCH).expect("bind");
             ready_tx.send(()).expect("ready");
             let mut s = HordStream::accept(&listener, &srv_config).expect("accept");
-            assert!(s.split_mode_negotiated(), "server: split mode should negotiate");
+            assert!(
+                s.split_mode_negotiated(),
+                "server: split mode should negotiate"
+            );
             // The gather must exceed the send pool, else nothing would batch.
             let n_wrs = N_SEG.div_ceil(s.max_send_sge());
             assert!(
@@ -3149,8 +3272,13 @@ mod gather_tests {
 
         ready_rx.recv().expect("server ready");
         let mut client = HordStream::connect(&IP, PORT_BATCH, &config).expect("connect");
-        assert!(client.split_mode_negotiated(), "client: split mode should negotiate");
-        let buf = client.register_remote_writable(TOTAL).expect("register dst");
+        assert!(
+            client.split_mode_negotiated(),
+            "client: split mode should negotiate"
+        );
+        let buf = client
+            .register_remote_writable(TOTAL)
+            .expect("register dst");
         desc_tx
             .send((buf.as_mut_ptr() as u64, buf.rkey()))
             .expect("send descriptor");
@@ -3158,7 +3286,10 @@ mod gather_tests {
         // One transfer ID for the whole over-cap gather (the immediate rides the
         // final batch only). poll_completed_transfer busy-polls until a transfer
         // completes or the connection closes (None).
-        let id = match client.poll_completed_transfer().expect("poll_completed_transfer") {
+        let id = match client
+            .poll_completed_transfer()
+            .expect("poll_completed_transfer")
+        {
             Some(id) => id,
             None => panic!("connection closed before the transfer completed"),
         };
@@ -3222,7 +3353,10 @@ mod plan_gather_tests {
     fn plan(segments: &[WriteSegment<'_>], max_sge: usize) -> Vec<(u64, Vec<(u64, u32)>)> {
         let mut wrs = Vec::new();
         let n = HordStream::plan_gather(segments, max_sge, |remote_off, sges| {
-            wrs.push((remote_off, sges.iter().map(|s| (s.addr, s.length)).collect()));
+            wrs.push((
+                remote_off,
+                sges.iter().map(|s| (s.addr, s.length)).collect(),
+            ));
             Ok(())
         })
         .expect("plan_gather");
@@ -3232,7 +3366,10 @@ mod plan_gather_tests {
 
     #[test]
     fn single_small_segment_is_one_1sge_wr() {
-        assert_eq!(plan(&[seg(0x1000, 4096)], 16), vec![(0, vec![(0x1000, 4096)])]);
+        assert_eq!(
+            plan(&[seg(0x1000, 4096)], 16),
+            vec![(0, vec![(0x1000, 4096)])]
+        );
     }
 
     #[test]
@@ -3274,7 +3411,10 @@ mod plan_gather_tests {
         assert_eq!(wrs[1], (cap, vec![(base + cap, WRITE_WR_MAX as u32)]));
         assert_eq!(wrs[2], (2 * cap, vec![(base + 2 * cap, half as u32)]));
         // Every byte of the segment is laid down exactly once.
-        let laid: u64 = wrs.iter().flat_map(|(_, s)| s.iter().map(|&(_, l)| l as u64)).sum();
+        let laid: u64 = wrs
+            .iter()
+            .flat_map(|(_, s)| s.iter().map(|&(_, l)| l as u64))
+            .sum();
         assert_eq!(laid, total as u64);
     }
 
@@ -3303,10 +3443,16 @@ mod plan_gather_tests {
             assert!(n >= 1, "a batch must consume at least one segment");
             let batch = &segments[start..start + n];
             let want: u64 = batch.iter().map(|s| s.len() as u64).sum();
-            assert_eq!(nb, want, "reported batch bytes must equal the segment-length sum");
+            assert_eq!(
+                nb, want,
+                "reported batch bytes must equal the segment-length sum"
+            );
             let wrs = HordStream::plan_gather(batch, max_sge, |_, _| Ok(())).expect("plan");
             if n > 1 {
-                assert!(wrs <= budget, "batch of {n} segs packs {wrs} WRs > budget {budget}");
+                assert!(
+                    wrs <= budget,
+                    "batch of {n} segs packs {wrs} WRs > budget {budget}"
+                );
             }
             out.push(n);
             seen_bytes += nb;
@@ -3344,7 +3490,9 @@ mod plan_gather_tests {
         // Each segment is one full WR by the byte cap, so budget 2 packs 2 segments
         // per batch regardless of max_sge. 5 such segments tile as [2, 2, 1].
         let cap = WRITE_WR_MAX;
-        let segs: Vec<_> = (0..5).map(|i| seg(0x1_0000_0000 + i as u64 * cap as u64, cap)).collect();
+        let segs: Vec<_> = (0..5)
+            .map(|i| seg(0x1_0000_0000 + i as u64 * cap as u64, cap))
+            .collect();
         assert_eq!(batches(&segs, 16, 2), vec![2, 2, 1]);
     }
 

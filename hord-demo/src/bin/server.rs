@@ -32,13 +32,13 @@ use hord_zerocopy::{serve_rdma_write_pooled, RdmaWriteReq, RdmaWriteStatus, Sour
 const DEFAULT_BIND: &str = "192.0.2.1"; // rxe device IP fallback; override via $HORD_TEST_IP or --bind (see CLAUDE.md)
 const DEFAULT_PORT: u16 = 4791;
 const MAX_BODY: usize = 1usize << 30; // 1 GiB guard on /size/<n>
-// Per-connection zero-copy source pool (§8.3): up to this many reusable source
-// buffers of this size, grown lazily and reused across a connection's responses
-// instead of registering an MR per response. A response larger than the slab — or
-// past the cap — falls back to a one-off registration (§8.4), so these only tune
-// efficiency, not correctness. (This demo closes the connection per request, so it
-// registers one buffer per connection — no worse than per-response; the win shows
-// on a keep-alive or split workload that reuses the connection.)
+                                      // Per-connection zero-copy source pool (§8.3): up to this many reusable source
+                                      // buffers of this size, grown lazily and reused across a connection's responses
+                                      // instead of registering an MR per response. A response larger than the slab — or
+                                      // past the cap — falls back to a one-off registration (§8.4), so these only tune
+                                      // efficiency, not correctness. (This demo closes the connection per request, so it
+                                      // registers one buffer per connection — no worse than per-response; the win shows
+                                      // on a keep-alive or split workload that reuses the connection.)
 const SOURCE_POOL_CAP: usize = 4;
 const SOURCE_POOL_BUF_SIZE: usize = 4 << 20; // 4 MiB
 
@@ -50,12 +50,7 @@ fn main() -> ExitCode {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--bind" => bind = args.next().unwrap_or(bind),
-            "--port" => {
-                port = args
-                    .next()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(port)
-            }
+            "--port" => port = args.next().and_then(|p| p.parse().ok()).unwrap_or(port),
             "-h" | "--help" => {
                 eprintln!("usage: hord-server [--bind <ip>] [--port <port>]");
                 return ExitCode::SUCCESS;
@@ -124,7 +119,15 @@ fn serve_one(stream: &mut HordStream, pool: &SourcePool) -> io::Result<()> {
     };
 
     if method != "GET" {
-        return respond(stream, 405, "Method Not Allowed", b"only GET is supported\n", "text/plain", declined, None);
+        return respond(
+            stream,
+            405,
+            "Method Not Allowed",
+            b"only GET is supported\n",
+            "text/plain",
+            declined,
+            None,
+        );
     }
 
     if path == "/" {
@@ -139,7 +142,11 @@ fn serve_one(stream: &mut HordStream, pool: &SourcePool) -> io::Result<()> {
                 // against the object size. Absent/ignored → the whole object
                 // (200); a satisfiable range → 206 + Content-Range; a range
                 // entirely past the end → 416.
-                match head.header("Range").map(|r| parse_range(r, n)).unwrap_or(RangeSpec::Full) {
+                match head
+                    .header("Range")
+                    .map(|r| parse_range(r, n))
+                    .unwrap_or(RangeSpec::Full)
+                {
                     RangeSpec::Unsatisfiable => return respond_unsatisfiable(stream, n),
                     RangeSpec::Range { start, end } => {
                         let len = end - start + 1;
@@ -164,7 +171,15 @@ fn serve_one(stream: &mut HordStream, pool: &SourcePool) -> io::Result<()> {
                         }
                         let mut body = vec![0u8; n];
                         pattern_fill(&mut body);
-                        return respond(stream, 200, "OK", &body, "application/octet-stream", declined, None);
+                        return respond(
+                            stream,
+                            200,
+                            "OK",
+                            &body,
+                            "application/octet-stream",
+                            declined,
+                            None,
+                        );
                     }
                 }
             }
@@ -180,12 +195,28 @@ fn serve_one(stream: &mut HordStream, pool: &SourcePool) -> io::Result<()> {
                 );
             }
             Err(_) => {
-                return respond(stream, 400, "Bad Request", b"bad size\n", "text/plain", declined, None);
+                return respond(
+                    stream,
+                    400,
+                    "Bad Request",
+                    b"bad size\n",
+                    "text/plain",
+                    declined,
+                    None,
+                );
             }
         }
     }
 
-    respond(stream, 404, "Not Found", b"not found\n", "text/plain", declined, None)
+    respond(
+        stream,
+        404,
+        "Not Found",
+        b"not found\n",
+        "text/plain",
+        declined,
+        None,
+    )
 }
 
 /// Serve a `/size/<n>` body — or a `[base, base+len)` sub-range of it (§7.6) —
@@ -228,12 +259,18 @@ fn serve_size_zero_copy(
     // Content-Range only on a satisfied range (206); a too_large (413) is the
     // plain zero-copy "exceeds your buffer" outcome and carries no range header.
     if partial && matches!(status, RdmaWriteStatus::Complete { .. }) {
-        head.push_str(&format!("Content-Range: {}\r\n", content_range(base, base + len - 1, total)));
+        head.push_str(&format!(
+            "Content-Range: {}\r\n",
+            content_range(base, base + len - 1, total)
+        ));
     }
     head.push_str("Connection: close\r\n\r\n");
     stream.write_all(head.as_bytes())?;
     stream.flush()?;
-    eprintln!("[server] -> {code} {reason} (zero-copy: {})", status.header_value());
+    eprintln!(
+        "[server] -> {code} {reason} (zero-copy: {})",
+        status.header_value()
+    );
     Ok(())
 }
 

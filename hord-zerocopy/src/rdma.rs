@@ -31,7 +31,9 @@ impl ZeroCopyRequest {
     /// Register a `capacity`-byte destination region the server may RDMA-write
     /// into. Gate on [`HordStream::zero_copy_negotiated`] before offering it.
     pub fn new(stream: &HordStream, capacity: usize) -> io::Result<Self> {
-        Ok(Self::from_buffer(stream.register_remote_writable(capacity)?))
+        Ok(Self::from_buffer(
+            stream.register_remote_writable(capacity)?,
+        ))
     }
 
     /// Wrap an already-registered remote-writable buffer. Use this when the
@@ -237,11 +239,11 @@ fn run_write_plan(
 pub struct SourcePool(Rc<RefCell<PoolInner>>);
 
 struct PoolInner {
-    buf_size: usize,           // slab size; a request larger than this falls back
-    capacity: usize,           // max pooled buffers (bounds pinned memory)
+    buf_size: usize, // slab size; a request larger than this falls back
+    capacity: usize, // max pooled buffers (bounds pinned memory)
     free: Vec<RegisteredBuffer>,
-    registered: usize,         // pooled buffers in existence (free + lent out)
-    fallbacks: u64,            // one-off registrations (oversized / pool exhausted)
+    registered: usize, // pooled buffers in existence (free + lent out)
+    fallbacks: u64,    // one-off registrations (oversized / pool exhausted)
 }
 
 impl SourcePool {
@@ -321,7 +323,10 @@ impl SourcePool {
         // Fallback: oversized for the slab, or the pool is at capacity and empty.
         let buf = register(len.max(1))?;
         self.0.borrow_mut().fallbacks += 1;
-        Ok(SourceLease { buf: Some(buf), pool: None })
+        Ok(SourceLease {
+            buf: Some(buf),
+            pool: None,
+        })
     }
 
     /// Wrap a pooled buffer in a lease that returns it to this pool on drop.

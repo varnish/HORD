@@ -103,7 +103,10 @@ fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
 }
 
 fn invalid_ip(ip: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, format!("invalid ip address: {ip}"))
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("invalid ip address: {ip}"),
+    )
 }
 
 /// Terminal error carried by the [`io::Error`] that [`Listener::accept`] /
@@ -151,7 +154,11 @@ impl ConnectionSetupFailed {
 
 impl std::fmt::Display for ConnectionSetupFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "incoming connection setup failed (peer rejected): {}", self.0)
+        write!(
+            f,
+            "incoming connection setup failed (peer rejected): {}",
+            self.0
+        )
     }
 }
 
@@ -162,7 +169,8 @@ impl std::error::Error for ConnectionSetupFailed {}
 /// (already rejected) and keep accepting, instead of treating it as a
 /// listener-level error and backing off / climbing toward a fatal-error cap.
 pub fn is_connection_setup_failure(e: &io::Error) -> bool {
-    e.get_ref().is_some_and(|inner| inner.is::<ConnectionSetupFailed>())
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<ConnectionSetupFailed>())
 }
 
 fn parse_addr(ip: &str, port: u16) -> io::Result<SocketAddr> {
@@ -708,7 +716,9 @@ impl Listener {
     /// `true` before driving [`try_accept`](Self::try_accept) from an event loop;
     /// the default (blocking) mode is what [`accept`](Self::accept) needs.
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        self.event_channel.set_nonblocking(nonblocking).map_err(to_io)
+        self.event_channel
+            .set_nonblocking(nonblocking)
+            .map_err(to_io)
     }
 
     /// File descriptor of the listener's CM event channel, for registration with
@@ -763,7 +773,9 @@ impl Endpoint {
         // A little slack over the WR counts (the old shim used the same +16).
         let cqe = (send_wr + recv_wr + 16) as u32;
         let mut cq_builder = ctx.create_cq_builder();
-        cq_builder.setup_cqe(cqe).setup_comp_channel(&comp_channel, 0);
+        cq_builder
+            .setup_cqe(cqe)
+            .setup_comp_channel(&comp_channel, 0);
         let cq = cq_builder.build_ex().map_err(to_io)?;
 
         // One CQ for both send and recv. The builder defaults already enable
@@ -908,7 +920,11 @@ impl Connection {
         // Bounded by the same `ESTABLISH_TIMEOUT` the server's accept uses, so a
         // peer that accepts the request then stalls cannot pin this thread — the
         // "no peer pins a thread forever" guarantee now holds on both ends.
-        wait_event(&self.event_channel, EventType::ConnectResponse, ESTABLISH_TIMEOUT)?;
+        wait_event(
+            &self.event_channel,
+            EventType::ConnectResponse,
+            ESTABLISH_TIMEOUT,
+        )?;
         self.modify_qp(QueuePairState::ReadyToReceive)?;
         self.modify_qp(QueuePairState::ReadyToSend)?;
         self.id.establish().map_err(to_io)?;
@@ -925,7 +941,11 @@ impl Connection {
     /// `TimedOut` and the caller drops the half-open connection.
     pub fn accept_finish(&self) -> io::Result<()> {
         self.accept_establish_begin()?;
-        wait_event(&self.event_channel, EventType::Established, ESTABLISH_TIMEOUT)
+        wait_event(
+            &self.event_channel,
+            EventType::Established,
+            ESTABLISH_TIMEOUT,
+        )
     }
 
     /// Server side, establish **phase one**: drive RTR → RTS and `accept` (sending
@@ -1085,7 +1105,9 @@ impl Connection {
     ) -> io::Result<()> {
         self.with_qp(|qp| {
             let mut guard = qp.start_post_send();
-            let handle = guard.construct_wr(wr_id, WorkRequestFlags::Signaled).setup_send();
+            let handle = guard
+                .construct_wr(wr_id, WorkRequestFlags::Signaled)
+                .setup_send();
             // SAFETY: caller guarantees the buffer outlives the completion.
             handle.setup_sge(lkey, addr as u64, length);
             guard.post().map_err(to_io)
@@ -1111,7 +1133,11 @@ impl Connection {
         remote_addr: u64,
         rkey: u32,
     ) -> io::Result<()> {
-        let sge = [Sge { addr: addr as u64, length, lkey }];
+        let sge = [Sge {
+            addr: addr as u64,
+            length,
+            lkey,
+        }];
         // SAFETY: the caller upholds `post_write_gather`'s contract for this one span
         // (live registered local memory, a valid peer rkey) — see this method's docs.
         unsafe { self.post_write_gather(wr_id, &sge, remote_addr, rkey, None) }
@@ -1138,7 +1164,11 @@ impl Connection {
         rkey: u32,
         imm: u32,
     ) -> io::Result<()> {
-        let sge = [Sge { addr: addr as u64, length, lkey }];
+        let sge = [Sge {
+            addr: addr as u64,
+            length,
+            lkey,
+        }];
         // SAFETY: same single-span contract as `post_write`. The host-order→`__be32`
         // imm conversion lives solely in `post_write_gather` now.
         unsafe { self.post_write_gather(wr_id, &sge, remote_addr, rkey, Some(imm)) }
@@ -1188,7 +1218,11 @@ impl Connection {
         // Build the verbs SGE array on the stack (bounded by `MAX_WRITE_SGE`), so
         // there is no per-write heap allocation and the rdma-sys type stays out of
         // the public API.
-        let mut sges = [rdma_mummy_sys::ibv_sge { addr: 0, length: 0, lkey: 0 }; MAX_WRITE_SGE];
+        let mut sges = [rdma_mummy_sys::ibv_sge {
+            addr: 0,
+            length: 0,
+            lkey: 0,
+        }; MAX_WRITE_SGE];
         for (slot, s) in sges.iter_mut().zip(sg_list) {
             *slot = rdma_mummy_sys::ibv_sge {
                 addr: s.addr,
@@ -1288,8 +1322,9 @@ impl Connection {
         loop {
             let mut cq_ptr: *mut rdma_mummy_sys::ibv_cq = std::ptr::null_mut();
             let mut cq_ctx: *mut c_void = std::ptr::null_mut();
-            let rc =
-                unsafe { rdma_mummy_sys::ibv_get_cq_event(channel.as_ptr(), &mut cq_ptr, &mut cq_ctx) };
+            let rc = unsafe {
+                rdma_mummy_sys::ibv_get_cq_event(channel.as_ptr(), &mut cq_ptr, &mut cq_ctx)
+            };
             if rc != 0 {
                 break;
             }
@@ -1500,7 +1535,11 @@ fn poll_readable(fd: RawFd, timeout: Duration) -> io::Result<()> {
             0 => 1,
             n => n.min(libc::c_int::MAX as u128) as libc::c_int,
         };
-        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         // SAFETY: `pfd` is a single, live, correctly-initialised `pollfd` for the
         // duration of the call; `poll` reads/writes only that one element.
         let rc = unsafe { libc::poll(&mut pfd, 1, ms) };

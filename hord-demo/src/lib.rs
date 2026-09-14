@@ -92,7 +92,8 @@ impl Head {
     }
 
     pub fn content_length(&self) -> Option<usize> {
-        self.header("Content-Length").and_then(|v| v.trim().parse().ok())
+        self.header("Content-Length")
+            .and_then(|v| v.trim().parse().ok())
     }
 }
 
@@ -163,7 +164,10 @@ pub fn parse_range(value: &str, total: usize) -> RangeSpec {
             if n == 0 || total == 0 {
                 return RangeSpec::Unsatisfiable;
             }
-            RangeSpec::Range { start: total.saturating_sub(n), end: total - 1 }
+            RangeSpec::Range {
+                start: total.saturating_sub(n),
+                end: total - 1,
+            }
         }
         // "a-": from a to the end.
         (false, true) => {
@@ -174,7 +178,10 @@ pub fn parse_range(value: &str, total: usize) -> RangeSpec {
             if start >= total {
                 return RangeSpec::Unsatisfiable;
             }
-            RangeSpec::Range { start, end: total - 1 }
+            RangeSpec::Range {
+                start,
+                end: total - 1,
+            }
         }
         // "a-b": explicit inclusive range.
         (false, false) => {
@@ -188,7 +195,10 @@ pub fn parse_range(value: &str, total: usize) -> RangeSpec {
             if start >= total {
                 return RangeSpec::Unsatisfiable;
             }
-            RangeSpec::Range { start, end: last.min(total - 1) }
+            RangeSpec::Range {
+                start,
+                end: last.min(total - 1),
+            }
         }
         (true, true) => RangeSpec::Full, // bare "-"
     }
@@ -274,7 +284,12 @@ pub fn size_from_path(path: &str) -> Option<usize> {
 /// equal `pattern_byte(base + i)`) — for a range response `base` is the range
 /// start. Reads out in bounded chunks (the consumer reading its own buffer — not
 /// a transport copy). Same return convention as [`verify_zero_copy`].
-pub fn verify_zero_copy_at(zc: &ZeroCopyRequest, base: usize, n: usize, path: &str) -> Result<bool, String> {
+pub fn verify_zero_copy_at(
+    zc: &ZeroCopyRequest,
+    base: usize,
+    n: usize,
+    path: &str,
+) -> Result<bool, String> {
     if size_from_path(path).is_none() {
         return Ok(false);
     }
@@ -287,7 +302,10 @@ pub fn verify_zero_copy_at(zc: &ZeroCopyRequest, base: usize, n: usize, path: &s
         for (i, &got) in tmp[..take].iter().enumerate() {
             let want = pattern_byte(base + off + i);
             if got != want {
-                return Err(format!("payload mismatch at byte {}: got {got}, expected {want}", base + off + i));
+                return Err(format!(
+                    "payload mismatch at byte {}: got {got}, expected {want}",
+                    base + off + i
+                ));
             }
         }
         off += take;
@@ -306,12 +324,25 @@ pub fn verify_zero_copy(zc: &ZeroCopyRequest, n: usize, path: &str) -> Result<bo
 /// offset `base` (body byte `i` must equal `pattern_byte(base + i)`); `base` is
 /// the range start for a `206` response. `is_success` is true for a 200 or 206.
 /// Same return convention as [`verify_zero_copy`].
-pub fn verify_stream_body_at(body: &[u8], is_success: bool, path: &str, base: usize) -> Result<bool, String> {
+pub fn verify_stream_body_at(
+    body: &[u8],
+    is_success: bool,
+    path: &str,
+    base: usize,
+) -> Result<bool, String> {
     if !is_success || size_from_path(path).is_none() {
         return Ok(false);
     }
-    if let Some((i, &got)) = body.iter().enumerate().find(|(i, &b)| b != pattern_byte(base + *i)) {
-        return Err(format!("payload mismatch at byte {}: got {got}, expected {}", base + i, pattern_byte(base + i)));
+    if let Some((i, &got)) = body
+        .iter()
+        .enumerate()
+        .find(|(i, &b)| b != pattern_byte(base + *i))
+    {
+        return Err(format!(
+            "payload mismatch at byte {}: got {got}, expected {}",
+            base + i,
+            pattern_byte(base + i)
+        ));
     }
     Ok(true)
 }
@@ -328,47 +359,92 @@ mod tests {
 
     #[test]
     fn parse_range_explicit() {
-        assert_eq!(parse_range("bytes=0-499", 1000), RangeSpec::Range { start: 0, end: 499 });
-        assert_eq!(parse_range("bytes=0-0", 1000), RangeSpec::Range { start: 0, end: 0 });
-        assert_eq!(parse_range("bytes=500-999", 1000), RangeSpec::Range { start: 500, end: 999 });
+        assert_eq!(
+            parse_range("bytes=0-499", 1000),
+            RangeSpec::Range { start: 0, end: 499 }
+        );
+        assert_eq!(
+            parse_range("bytes=0-0", 1000),
+            RangeSpec::Range { start: 0, end: 0 }
+        );
+        assert_eq!(
+            parse_range("bytes=500-999", 1000),
+            RangeSpec::Range {
+                start: 500,
+                end: 999
+            }
+        );
     }
 
     #[test]
     fn parse_range_clamps_end_to_object() {
-        assert_eq!(parse_range("bytes=0-100000", 1000), RangeSpec::Range { start: 0, end: 999 });
-        assert_eq!(parse_range("bytes=900-100000", 1000), RangeSpec::Range { start: 900, end: 999 });
+        assert_eq!(
+            parse_range("bytes=0-100000", 1000),
+            RangeSpec::Range { start: 0, end: 999 }
+        );
+        assert_eq!(
+            parse_range("bytes=900-100000", 1000),
+            RangeSpec::Range {
+                start: 900,
+                end: 999
+            }
+        );
     }
 
     #[test]
     fn parse_range_open_ended() {
-        assert_eq!(parse_range("bytes=500-", 1000), RangeSpec::Range { start: 500, end: 999 });
-        assert_eq!(parse_range("bytes=0-", 1000), RangeSpec::Range { start: 0, end: 999 });
+        assert_eq!(
+            parse_range("bytes=500-", 1000),
+            RangeSpec::Range {
+                start: 500,
+                end: 999
+            }
+        );
+        assert_eq!(
+            parse_range("bytes=0-", 1000),
+            RangeSpec::Range { start: 0, end: 999 }
+        );
     }
 
     #[test]
     fn parse_range_suffix() {
-        assert_eq!(parse_range("bytes=-500", 1000), RangeSpec::Range { start: 500, end: 999 });
+        assert_eq!(
+            parse_range("bytes=-500", 1000),
+            RangeSpec::Range {
+                start: 500,
+                end: 999
+            }
+        );
         // suffix bigger than the object → whole object
-        assert_eq!(parse_range("bytes=-5000", 1000), RangeSpec::Range { start: 0, end: 999 });
+        assert_eq!(
+            parse_range("bytes=-5000", 1000),
+            RangeSpec::Range { start: 0, end: 999 }
+        );
     }
 
     #[test]
     fn parse_range_unsatisfiable() {
-        assert_eq!(parse_range("bytes=1000-1001", 1000), RangeSpec::Unsatisfiable); // start == total
-        assert_eq!(parse_range("bytes=5000-6000", 1000), RangeSpec::Unsatisfiable);
+        assert_eq!(
+            parse_range("bytes=1000-1001", 1000),
+            RangeSpec::Unsatisfiable
+        ); // start == total
+        assert_eq!(
+            parse_range("bytes=5000-6000", 1000),
+            RangeSpec::Unsatisfiable
+        );
         assert_eq!(parse_range("bytes=1000-", 1000), RangeSpec::Unsatisfiable);
         assert_eq!(parse_range("bytes=-0", 1000), RangeSpec::Unsatisfiable); // zero-length suffix
-        assert_eq!(parse_range("bytes=0-0", 0), RangeSpec::Unsatisfiable);   // empty object
+        assert_eq!(parse_range("bytes=0-0", 0), RangeSpec::Unsatisfiable); // empty object
     }
 
     #[test]
     fn parse_range_ignored_forms_serve_full() {
         assert_eq!(parse_range("bytes=0-1,2-3", 1000), RangeSpec::Full); // multi-range (no multipart)
-        assert_eq!(parse_range("items=0-1", 1000), RangeSpec::Full);     // unknown unit
-        assert_eq!(parse_range("bytes=abc", 1000), RangeSpec::Full);     // malformed
-        assert_eq!(parse_range("bytes=zz-10", 1000), RangeSpec::Full);   // bad number
+        assert_eq!(parse_range("items=0-1", 1000), RangeSpec::Full); // unknown unit
+        assert_eq!(parse_range("bytes=abc", 1000), RangeSpec::Full); // malformed
+        assert_eq!(parse_range("bytes=zz-10", 1000), RangeSpec::Full); // bad number
         assert_eq!(parse_range("bytes=500-100", 1000), RangeSpec::Full); // start > end
-        assert_eq!(parse_range("", 1000), RangeSpec::Full);              // empty
+        assert_eq!(parse_range("", 1000), RangeSpec::Full); // empty
     }
 
     #[test]

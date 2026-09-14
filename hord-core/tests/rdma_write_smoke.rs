@@ -24,11 +24,11 @@
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use hord_core::{
-    CmParams, Connection, Listener, Opcode, ACCESS_LOCAL_WRITE, ACCESS_REMOTE_WRITE,
-};
+use hord_core::{CmParams, Connection, Listener, Opcode, ACCESS_LOCAL_WRITE, ACCESS_REMOTE_WRITE};
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const PORT: u16 = 18520; // distinct from the demo (4791) and full_duplex_bulk (18519)
 const LEN: usize = 16 * 1024 * 1024; // 16 MiB — many MTUs in one WR
 
@@ -61,9 +61,7 @@ fn rdma_write_round_trip() {
     let server = std::thread::spawn(move || {
         let listener = Listener::bind(&IP, PORT).expect("bind");
         ready_tx.send(()).expect("signal ready");
-        let conn = listener
-            .accept(4, 4, CmParams::default())
-            .expect("accept");
+        let conn = listener.accept(4, 4, CmParams::default()).expect("accept");
         let conn = Arc::new(conn);
         // Source region: filled with a known pattern; the NIC only reads it, so
         // local access (no remote flag) suffices.
@@ -149,9 +147,7 @@ fn rdma_write_with_imm_round_trip() {
     let server = std::thread::spawn(move || {
         let listener = Listener::bind(&IP, PORT_IMM).expect("bind");
         ready_tx.send(()).expect("signal ready");
-        let conn = listener
-            .accept(4, 4, CmParams::default())
-            .expect("accept");
+        let conn = listener.accept(4, 4, CmParams::default()).expect("accept");
         let conn = Arc::new(conn);
         let src = conn
             .register_buffer(LEN, ACCESS_LOCAL_WRITE)
@@ -344,7 +340,10 @@ fn rdma_write_imm_only_zero_sge() {
         "receiver opcode (expected RECV_RDMA_WITH_IMM)"
     );
     assert_eq!(wc.wr_id, 7, "consumed our posted recv WR");
-    assert_eq!(wc.imm_data, TRANSFER_ID, "transfer ID corrupted (0-SGE path)");
+    assert_eq!(
+        wc.imm_data, TRANSFER_ID,
+        "transfer ID corrupted (0-SGE path)"
+    );
     assert_eq!(wc.byte_len, 0, "imm-only write should land zero bytes");
 
     teardown.wait();

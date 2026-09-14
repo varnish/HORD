@@ -25,7 +25,9 @@ use std::sync::{mpsc, Arc, Barrier};
 use hord_stream::{HordConfig, HordStream, Listener, RegisteredBuffer};
 use hord_zerocopy::{serve_rdma_write, RdmaWriteReq, RdmaWriteStatus, ZeroCopyRequest};
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const OBJECT: usize = 4 * 1024 * 1024; // 4 MiB — many MTUs, dwarfs the credit window
 
 /// Deterministic, position-sensitive payload byte (matches the demo's pattern).
@@ -39,7 +41,7 @@ fn read_line(s: &mut HordStream) -> String {
     let mut b = [0u8; 1];
     loop {
         match s.read(&mut b).expect("read line") {
-            0 => break,             // EOF
+            0 => break, // EOF
             _ if b[0] == b'\n' => break,
             _ => out.push(b[0]),
         }
@@ -104,14 +106,23 @@ fn run_case(port: u16, client_cap: usize) -> RdmaWriteStatus {
 
     if let RdmaWriteStatus::Complete { bytes_written } = status {
         let n = bytes_written as usize;
-        assert!(n <= zc.capacity(), "bytes_written {n} exceeds buffer {}", zc.capacity());
+        assert!(
+            n <= zc.capacity(),
+            "bytes_written {n} exceeds buffer {}",
+            zc.capacity()
+        );
         let mut tmp = vec![0u8; n.clamp(1, 256 * 1024)];
         let mut off = 0;
         while off < n {
             let take = tmp.len().min(n - off);
             zc.copy_out(off, &mut tmp[..take]);
             for (i, &got) in tmp[..take].iter().enumerate() {
-                assert_eq!(got, pattern_byte(off + i), "payload mismatch at byte {}", off + i);
+                assert_eq!(
+                    got,
+                    pattern_byte(off + i),
+                    "payload mismatch at byte {}",
+                    off + i
+                );
             }
             off += take;
         }
@@ -130,7 +141,9 @@ fn zero_copy_complete_round_trip() {
     let status = run_case(18720, OBJECT);
     assert_eq!(
         status,
-        RdmaWriteStatus::Complete { bytes_written: OBJECT as u64 },
+        RdmaWriteStatus::Complete {
+            bytes_written: OBJECT as u64
+        },
         "expected a complete zero-copy write"
     );
 }
@@ -143,7 +156,9 @@ fn zero_copy_too_large() {
     let status = run_case(18721, 1024 * 1024);
     assert_eq!(
         status,
-        RdmaWriteStatus::TooLarge { object_size: OBJECT as u64 },
+        RdmaWriteStatus::TooLarge {
+            object_size: OBJECT as u64
+        },
         "expected too_large"
     );
 }

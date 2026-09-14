@@ -25,7 +25,9 @@ use tokio::task::LocalSet;
 use hord_async::{AsyncHordStream, SplitParts};
 use hord_stream::{HordConfig, HordStream, Listener};
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const PORT: u16 = 18920; // distinct from the demo (4791) and other loopback tests
 const BODY: usize = 16 * 1024 * 1024; // 16 MiB each way — dwarfs the credit window
 const WATCHDOG: Duration = Duration::from_secs(30); // a stall (deadlock) fails fast
@@ -37,7 +39,12 @@ use common::{current_thread_rt, pattern};
 /// `read_exact(BODY)` into another, and verify the received bytes equal `expect`.
 /// `teardown` holds both endpoints' connections open until both have exchanged
 /// everything, so neither disconnects mid-flight (mirrors `full_duplex_bulk`).
-async fn run_endpoint(stream: AsyncHordStream, send_seed: u8, recv_seed: u8, teardown: Arc<Barrier>) {
+async fn run_endpoint(
+    stream: AsyncHordStream,
+    send_seed: u8,
+    recv_seed: u8,
+    teardown: Arc<Barrier>,
+) {
     let SplitParts { read, write, data } = stream.into_split();
 
     // Writer task: push our whole body, then flush to a full delivery barrier.

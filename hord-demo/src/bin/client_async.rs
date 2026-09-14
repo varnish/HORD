@@ -90,7 +90,17 @@ fn main() -> ExitCode {
     // A LocalSet lets us spawn_local the hyper connection task (the stream is
     // !Send, so it cannot use tokio::spawn on a multi-thread runtime).
     let local = tokio::task::LocalSet::new();
-    let opts = Opts { server, port, path, zero_copy, zc_buf, range, split, count, quiet };
+    let opts = Opts {
+        server,
+        port,
+        path,
+        zero_copy,
+        zc_buf,
+        range,
+        split,
+        count,
+        quiet,
+    };
     let fut = async {
         if opts.split {
             run_split(opts).await
@@ -120,7 +130,16 @@ struct Opts {
 }
 
 async fn run(opts: Opts) -> Result<(), BoxError> {
-    let Opts { server, port, path, zero_copy, zc_buf, range, quiet, .. } = opts;
+    let Opts {
+        server,
+        port,
+        path,
+        zero_copy,
+        zc_buf,
+        range,
+        quiet,
+        ..
+    } = opts;
     let config = HordConfig::default();
     if !quiet {
         eprintln!("[client] connecting to {server}:{port} ...");
@@ -156,25 +175,26 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
     // ZeroCopyRequest) is independent of the stream — it owns its own connection
     // handle — so we keep it alongside and it outlives the stream's teardown.
     let capacity = zc_buf.or(range_len).or(total).unwrap_or(DEFAULT_ZC_BUF);
-    let dest: Option<ZeroCopyRequest> = if zero_copy && stream.zero_copy_negotiated() && capacity > 0 {
-        let zc = ZeroCopyRequest::from_buffer(stream.register_remote_writable(capacity)?);
-        if !quiet {
-            eprintln!("[client] zero-copy: advertising a {capacity}-byte buffer");
-        }
-        Some(zc)
-    } else {
-        if zero_copy && !quiet {
-            // capacity == 0 (e.g. /size/0): a zero-length destination MR is not
-            // portable and a 0-byte zero-copy transfer is pointless, so fall back.
-            let why = if !stream.zero_copy_negotiated() {
-                "peer did not negotiate it"
-            } else {
-                "buffer would be 0 bytes"
-            };
-            eprintln!("[client] --zero-copy requested but {why}; using the stream");
-        }
-        None
-    };
+    let dest: Option<ZeroCopyRequest> =
+        if zero_copy && stream.zero_copy_negotiated() && capacity > 0 {
+            let zc = ZeroCopyRequest::from_buffer(stream.register_remote_writable(capacity)?);
+            if !quiet {
+                eprintln!("[client] zero-copy: advertising a {capacity}-byte buffer");
+            }
+            Some(zc)
+        } else {
+            if zero_copy && !quiet {
+                // capacity == 0 (e.g. /size/0): a zero-length destination MR is not
+                // portable and a 0-byte zero-copy transfer is pointless, so fall back.
+                let why = if !stream.zero_copy_negotiated() {
+                    "peer did not negotiate it"
+                } else {
+                    "buffer would be 0 bytes"
+                };
+                eprintln!("[client] --zero-copy requested but {why}; using the stream");
+            }
+            None
+        };
 
     // Low-level http1 handshake: a sender + a connection future we must drive.
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
@@ -237,7 +257,10 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
         let _ = conn_task.await;
         println!("status:      {status}");
         println!("delivery:    none (range not satisfiable)");
-        println!("content-range: {}", content_range.as_deref().unwrap_or("(none)"));
+        println!(
+            "content-range: {}",
+            content_range.as_deref().unwrap_or("(none)")
+        );
         return Ok(());
     }
 
@@ -251,14 +274,20 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
             // Trust the peer's bytes_written only as far as our own buffer (see
             // the sync client) — keeps the in-place verify in range.
             if n > zc.capacity() {
-                return Err(format!("server reported bytes_written={n} > buffer {}", zc.capacity()).into());
+                return Err(format!(
+                    "server reported bytes_written={n} > buffer {}",
+                    zc.capacity()
+                )
+                .into());
             }
             let verified = verify_zero_copy_at(zc, range_base, n, &path).map_err(to_err)?;
             (n, "zero-copy (RDMA write)", verified)
         }
         Some(RdmaWriteStatus::TooLarge { object_size }) => {
             if !quiet {
-                eprintln!("[client] zero-copy declined: object_size={object_size} exceeds our buffer");
+                eprintln!(
+                    "[client] zero-copy declined: object_size={object_size} exceeds our buffer"
+                );
             }
             (0usize, "none (too_large)", false)
         }
@@ -305,7 +334,15 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
 /// shared handle lets both planes reach the one stream without a second CQ waiter
 /// (which the prototype does not support).
 async fn run_split(opts: Opts) -> Result<(), BoxError> {
-    let Opts { server, port, path, zc_buf, count, quiet, .. } = opts;
+    let Opts {
+        server,
+        port,
+        path,
+        zc_buf,
+        count,
+        quiet,
+        ..
+    } = opts;
     if count == 0 {
         return Err("--count must be >= 1".into());
     }
@@ -420,7 +457,9 @@ async fn run_split(opts: Opts) -> Result<(), BoxError> {
                     .ok_or_else(|| -> BoxError { format!("unknown transfer id {id}").into() })?;
                 if let Some(n) = object_size {
                     let n = n.min(zc.capacity());
-                    if verify_zero_copy(zc, n, &path).map_err(|m: String| -> BoxError { m.into() })? {
+                    if verify_zero_copy(zc, n, &path)
+                        .map_err(|m: String| -> BoxError { m.into() })?
+                    {
                         verified += 1;
                     }
                 }

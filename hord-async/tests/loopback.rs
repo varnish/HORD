@@ -19,7 +19,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use hord_async::AsyncHordStream;
 use hord_stream::{HordConfig, HordStream, Listener};
 
-static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
+static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("HORD_TEST_IP").unwrap_or_else(|_| "192.0.2.1".to_string())
+}); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const PORT: u16 = 18620; // distinct from the demo (4791) and full_duplex (18519)
 const BODY: usize = 4 * 1024 * 1024; // 4 MiB — many messages, dwarfs the window
 
@@ -74,7 +76,11 @@ fn async_request_response() {
 
         assert_eq!(n, BODY, "wrong body length");
         let mismatch = got.iter().enumerate().find(|(i, &b)| b != pattern_byte(*i));
-        assert!(mismatch.is_none(), "payload mismatch at {:?}", mismatch.map(|(i, _)| i));
+        assert!(
+            mismatch.is_none(),
+            "payload mismatch at {:?}",
+            mismatch.map(|(i, _)| i)
+        );
     });
 
     server.join().expect("server thread panicked");

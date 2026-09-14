@@ -179,7 +179,10 @@ fn run(
     }
 
     // Interpret the zero-copy response header, if we offered zero-copy.
-    let zc_status = zc.as_ref().and(head.header(HEADER)).and_then(RdmaWriteStatus::parse);
+    let zc_status = zc
+        .as_ref()
+        .and(head.header(HEADER))
+        .and_then(RdmaWriteStatus::parse);
 
     let to_io = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
     let (body_len, delivery, verified) = match zc_status {
@@ -202,14 +205,19 @@ fn run(
         }
         Some(RdmaWriteStatus::TooLarge { object_size }) => {
             if !quiet {
-                eprintln!("[client] zero-copy declined: object_size={object_size} exceeds our buffer");
+                eprintln!(
+                    "[client] zero-copy declined: object_size={object_size} exceeds our buffer"
+                );
             }
             (0, "none (too_large)", false)
         }
         // Declined, malformed, or no zero-copy: read the body off the stream.
         _ => {
             let content_length = head.content_length().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "response lacked a Content-Length")
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "response lacked a Content-Length",
+                )
             })?;
             if !quiet {
                 eprintln!("[client] Content-Length: {content_length}");
