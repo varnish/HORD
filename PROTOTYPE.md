@@ -115,6 +115,45 @@ RDMA library, so an embedder can unit-test header handling on a machine with no
 NIC and no rdma-core (`cargo test -p hord-zerocopy`). Its `rdma` feature pulls in
 `hord-stream` — and so the RDMA libraries — to add the write orchestration.
 
+## Spec coverage map
+
+Where each normative section of [SPEC.md](SPEC.md) is implemented. The code
+carries 260 inline `§` annotations pointing *into* the spec; this table is the
+reverse index. Sections 1–3 (motivation, goals, terminology) and 14 (relationship
+to existing standards) are prose and are omitted.
+
+| Spec section | Implemented in | Status |
+| ------------ | -------------- | ------ |
+| §4 Architecture, §4.1 HTTP profile | `hord-demo`, `hord-stream` | yes |
+| §5.1 Server startup | `hord-core` — `Listener::bind` | yes |
+| §5.2 Connection setup | `hord-core` — RDMA-CM resolve/connect/accept | yes |
+| §5.3 Handshake | `hord-stream/src/handshake.rs` | yes — **transport deviates**, see below |
+| §5.4 Teardown | `hord-core`, `hord-stream` — `ConnTeardown` | yes |
+| §6 Stream abstraction (6.1–6.3) | `hord-stream/src/stream.rs`, `envelope.rs` | yes |
+| §7.1 Negotiation | `hord-stream` handshake flags, `hord-zerocopy` | yes |
+| §7.2 Request headers | `hord-zerocopy/src/lib.rs` — `RdmaWriteReq` | yes |
+| §7.3 Server behaviour | `hord-zerocopy/src/lib.rs`, `rdma.rs` | yes |
+| §7.4 Response outcomes | `hord-zerocopy`, `hord-demo/src/bin/server_async.rs` | yes |
+| §7.5 GPUDirect RDMA | — | **not built** |
+| §7.6 Range requests | `hord-demo/src/lib.rs` (codec), `server_async.rs` | yes |
+| §7.7 Protocol splitting (7.7.1–7.7.7) | `hord-stream/src/stream.rs`, `hord-async`, `hord-zerocopy` | yes |
+| §8.1–8.2 Buffer pool, sizing | `hord-zerocopy/src/rdma.rs`, `HordConfig` | yes |
+| §8.3–8.4 Registration, large objects | `hord-zerocopy/src/rdma.rs` — `SourcePool` | yes |
+| §9 Flow control (9.1–9.3) | `hord-stream/src/stream.rs` | yes |
+| §10 Error handling | `hord-core` — `ConnectionSetupFailed`, `DeviceRemoved`; `hord-async/src/listener.rs` | yes |
+| §11 Security considerations | advisory; §11.4 trust model noted in `hord-async/src/listener.rs` | n/a |
+| §12.1 Handshake wire format | `hord-stream/src/handshake.rs` | yes — 16 of 60 bytes, see findings |
+| §12.2 Message envelope | `hord-stream/src/envelope.rs` | yes |
+| §12.3–12.4 `X-HORD-RDMA-Write` | `hord-zerocopy/src/lib.rs` | yes |
+| §13.2 Rust API surface | this workspace | yes |
+
+Two cautions when reading the code against the spec. First, §6 and §9 are
+implemented but carry no inline `§6`/`§9` markers — the comments in `stream.rs`
+name them ("the stream abstraction", "credit-based flow control") rather than
+numbering them, so grepping for the section number finds nothing. Second, the
+handshake's *transport* deviates from the spec's title: see below.
+
+
 ## Building
 
 Needs the RDMA dev packages plus clang/libclang (sideway's `rdma-mummy-sys`
@@ -288,11 +327,16 @@ Both of the remaining design-level items were then closed by the **async pass**:
 
 ## Findings worth folding back into the spec
 
-- **Handshake size (spec 12.1).** The spec's handshake is 60 bytes (14
-  meaningful + 46 reserved). The RDMA CM private-data area for an RC connection
-  is only ~56 bytes on IB/RoCE, so a 60-byte handshake does not reliably fit.
-  This prototype transmits just 16 bytes and drops the rest of the reserved
-  tail. Bytes 14..16 — reserved in the spec — now carry the `split_credits`
+- **Handshake transport and size (spec 5.3 / 12.1).** §12.1 is titled "Handshake
+  (CM Private Data)", but this prototype does not use CM private data at all: the
+  handshake is the **first message exchanged over the established QP** (see the
+  module docs in `hord-stream/src/handshake.rs`), so the transport layer never
+  touches it. That change removed the original motivation for a small handshake —
+  the RDMA CM private-data area for an RC connection is only ~56 bytes on IB/RoCE,
+  so the spec's 60-byte handshake (14 meaningful + 46 reserved) would not reliably
+  have fitted. The 16-byte frame was kept regardless, since the reserved tail
+  carries nothing. Recommend §12.1 either drop "(CM Private Data)" from its title
+  or state both transports. Bytes 14..16 — reserved in the spec — now carry the `split_credits`
   transfer-credit window (see below); a peer that leaves them zero (or sends only
   14 bytes) reads as zero credits, so split mode declines gracefully. Recommend
   trimming the reserved field in the spec and defining the credit field.
