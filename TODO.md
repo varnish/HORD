@@ -4,15 +4,24 @@
 
 - [ ] **§7.5 GPUDirect** — untestable on this host (no GPU / real NIC); the
       addr/rkey path is opaque, so it should work unchanged on capable hardware.
-- [ ] **§7.6 range requests** — small add-on on top of the zero-copy path.
-- [ ] A zero-copy *source* buffer pool on the server (amortize registration —
-      §8.3) instead of registering per response.
-- [ ] Concurrent independent read+write on one async stream (two tasks over
-      `tokio::io::split`) needs a multi-waiter scheme on the completion fd.
+- [x] **§7.6 range requests** — done, in both the sync and the async/hyper demos
+      (`--range`, 206/`Content-Range`, 416), with `hord-demo/tests/range_loopback.rs`
+      covering the stream and zero-copy paths.
+- [x] A zero-copy *source* buffer pool on the server (amortize registration —
+      §8.3) instead of registering per response — done: `SourcePool` /
+      `serve_rdma_write_pooled` in `hord-zerocopy/src/rdma.rs`, used by both demo
+      servers, with an oversized-object fallback (§8.4).
+- [x] Concurrent independent read+write on one async stream — done:
+      `AsyncHordStream::into_split()` hands out `SplitParts { read, write, data }`
+      and the reactor parks tasks on its own waker list rather than on the fd
+      (the multi-waiter scheme). Covered by `hord-async/tests/duplex.rs`.
 - [ ] **§5.3 Version-mismatch reject** — a peer that doesn't recognise the handshake
       version MUST reject with its own handshake (highest supported version) as
-      reject private data. Currently the handshake is parsed but mismatch is not
-      handled.
+      reject private data. A mismatch *is* detected today (`Handshake::decode`
+      returns "unsupported HORD version {n}"), but the connection just fails: the
+      peer never learns which version we speak. Note the spec wording assumes the
+      handshake rides CM private data, which it no longer does — it is now the first
+      message over the QP — so the reply path needs redefining alongside §12.1.
 - [ ] **§11.2 RDMA write bounds validation** — verify that the server's RDMA
       write stays within the `addr`/`len` bounds the client advertised. The
       client trusts the server today; a malicious or buggy server could
