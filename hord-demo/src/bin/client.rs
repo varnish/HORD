@@ -26,8 +26,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use hord_demo::{
-    parse_range, read_body, read_head, size_from_path, verify_stream_body_at, verify_zero_copy_at,
-    Head, RangeSpec,
+    read_body, read_head, resolve_range, size_from_path, verify_stream_body_at,
+    verify_zero_copy_at, Head,
 };
 use hord_stream::{HordConfig, HordStream};
 use hord_zerocopy::{RdmaWriteStatus, ZeroCopyRequest, HEADER};
@@ -113,6 +113,15 @@ fn main() -> ExitCode {
     }
 }
 
+/// Where the response body came from, and what we could prove about it.
+struct Delivery {
+    body_len: usize,
+    /// Human-readable delivery path, for the `delivery:` summary line.
+    source: &'static str,
+    /// True when the bytes were checked against the `/size/<n>` pattern.
+    verified: bool,
+}
+
 fn run(
     server: &str,
     port: u16,
@@ -135,68 +144,19 @@ fn run(
         stream.zero_copy_negotiated()
     );
 
-    // §7.6: when a range is requested against a known `/size/<n>` object, resolve
-    // it locally so we register a destination sized to the range (not the whole
-    // object) and verify the delivered bytes at the right absolute offset.
+    // §7.6: resolve the requested range locally, so the destination buffer is
+    // sized to the range (not the whole object) and the delivered bytes are
+    // verified at their absolute object offset.
     let total = size_from_path(path);
-    let (range_base, range_len) = match (&range, total) {
-        (Some(spec), Some(t)) => match parse_range(&format!("bytes={spec}"), t) {
-            RangeSpec::Range { start, end } => (start, Some(end - start + 1)),
-            // Full (ignored → whole object) or Unsatisfiable (expect 416): no
-            // concrete sub-range to size the buffer to.
-            _ => (0, None),
-        },
-        _ => (0, None),
-    };
-
-    // Offer zero-copy only if both we asked and the peer negotiated it. Register
-    // the destination buffer up front so its address/rkey can ride in the GET.
+    let (range_base, range_len) = resolve_range(range.as_deref(), total);
     let capacity = zc_buf.or(range_len).or(total).unwrap_or(DEFAULT_ZC_BUF);
-    let zc = if zero_copy && stream.zero_copy_negotiated() && capacity > 0 {
-        let req = ZeroCopyRequest::new(&stream, capacity)?;
-        say!(
-            report,
-            "[client] zero-copy: advertising a {capacity}-byte buffer"
-        );
-        Some(req)
-    } else {
-        if zero_copy {
-            // capacity == 0 (e.g. /size/0): a zero-length destination MR is not
-            // portable and a 0-byte zero-copy transfer is pointless, so fall back.
-            let why = if !stream.zero_copy_negotiated() {
-                "peer did not negotiate it"
-            } else {
-                "buffer would be 0 bytes"
-            };
-            say!(
-                report,
-                "[client] --zero-copy requested but {why}; using the stream"
-            );
-        }
-        None
-    };
+    let zc = offer_zero_copy(&stream, zero_copy, capacity, &report)?;
 
-    // Build and send the request (adding the zero-copy header when offered).
-    let mut request = format!(
-        "GET {path} HTTP/1.1\r\n\
-         Host: {server}\r\n\
-         User-Agent: hord-client/0.1\r\n\
-         Connection: close\r\n"
-    );
-    if let Some(spec) = &range {
-        request.push_str(&format!("Range: bytes={spec}\r\n"));
-    }
-    if let Some(zc) = &zc {
-        request.push_str(&zc.header_line());
-        request.push_str("\r\n");
-    }
-    request.push_str("\r\n");
-
+    let request = build_request(server, path, range.as_deref(), zc.as_ref());
     let req_start = Instant::now();
     stream.write_all(request.as_bytes())?;
     stream.flush()?;
 
-    // Read the response head.
     let (head_bytes, leftover) = read_head(&mut stream)?;
     let head = Head::parse(&head_bytes)?;
     let (version, status, reason) = &head.start;
@@ -205,25 +165,121 @@ fn run(
     // §7.6: an unsatisfiable range → 416 with `Content-Range: bytes */total` and
     // no body. Nothing to verify; report and finish.
     if status == "416" {
-        let cr = head.header("Content-Range").unwrap_or("(none)");
         drop(stream);
         println!("status:      {status} {reason}");
         println!("delivery:    none (range not satisfiable)");
-        println!("content-range: {cr}");
+        println!(
+            "content-range: {}",
+            head.header("Content-Range").unwrap_or("(none)")
+        );
         return Ok(());
     }
 
-    // Interpret the zero-copy response header, if we offered zero-copy.
-    let zc_status = zc
-        .as_ref()
-        .and(head.header(HEADER))
-        .and_then(RdmaWriteStatus::parse);
+    let delivery = receive_body(
+        &mut stream,
+        &head,
+        leftover,
+        zc.as_ref(),
+        range_base,
+        path,
+        &report,
+    )?;
+    let elapsed = req_start.elapsed();
 
+    // Drop the stream (which destroys the QP — stopping the NIC) BEFORE `zc`'s
+    // destination buffer is dropped at end of scope, so the MR is deregistered
+    // only after no DMA can target it. The payload was already read out above.
+    drop(stream);
+
+    print_summary(
+        &format!("{status} {reason}"),
+        head.header("Content-Range"),
+        &delivery,
+        elapsed,
+    );
+    Ok(())
+}
+
+/// Register the zero-copy destination buffer, if we asked for zero-copy *and*
+/// the peer negotiated it. Returns `None` — after saying why — when either half
+/// is missing, which is the signal to take the ordinary stream body instead.
+fn offer_zero_copy(
+    stream: &HordStream,
+    requested: bool,
+    capacity: usize,
+    report: &Report,
+) -> io::Result<Option<ZeroCopyRequest>> {
+    if !requested {
+        return Ok(None);
+    }
+    // capacity == 0 (e.g. /size/0): a zero-length destination MR is not portable
+    // and a 0-byte zero-copy transfer is pointless, so fall back.
+    let why = if !stream.zero_copy_negotiated() {
+        "peer did not negotiate it"
+    } else if capacity == 0 {
+        "buffer would be 0 bytes"
+    } else {
+        let req = ZeroCopyRequest::new(stream, capacity)?;
+        say!(
+            report,
+            "[client] zero-copy: advertising a {capacity}-byte buffer"
+        );
+        return Ok(Some(req));
+    };
+    say!(
+        report,
+        "[client] --zero-copy requested but {why}; using the stream"
+    );
+    Ok(None)
+}
+
+/// The GET, carrying `Range` (§7.6) and `X-HORD-RDMA-Write` (§7.2) when offered.
+fn build_request(
+    server: &str,
+    path: &str,
+    range: Option<&str>,
+    zc: Option<&ZeroCopyRequest>,
+) -> String {
+    let mut request = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {server}\r\n\
+         User-Agent: hord-client/0.1\r\n\
+         Connection: close\r\n"
+    );
+    if let Some(spec) = range {
+        request.push_str(&format!("Range: bytes={spec}\r\n"));
+    }
+    if let Some(zc) = zc {
+        request.push_str(&zc.header_line());
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    request
+}
+
+/// Take delivery of the body and verify it at `range_base`, its absolute offset
+/// in the object (0 for a whole object).
+///
+/// Which of the two paths ran is decided by the server's `X-HORD-RDMA-Write`
+/// response status (§7.3): `complete` means the bytes are already in our
+/// registered buffer and nothing came over the stream; anything else —
+/// `declined`, `too_large`, malformed, or no zero-copy at all — means an
+/// ordinary `Content-Length`-framed body to read.
+fn receive_body(
+    stream: &mut HordStream,
+    head: &Head,
+    leftover: Vec<u8>,
+    zc: Option<&ZeroCopyRequest>,
+    range_base: usize,
+    path: &str,
+    report: &Report,
+) -> io::Result<Delivery> {
     let to_io = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
-    let (body_len, delivery, verified) = match zc_status {
+    let zc_status = zc.and(head.header(HEADER)).and_then(RdmaWriteStatus::parse);
+    match zc_status {
         Some(RdmaWriteStatus::Complete { bytes_written }) => {
             let n = bytes_written as usize;
-            let zc = zc.as_ref().expect("zc set when status parsed");
+            let zc = zc.expect("zc set when status parsed");
             // We trust the peer's bytes_written only as far as our own buffer: a
             // conforming server never reports more than it wrote (≤ our advertised
             // len), and the bound keeps copy_out in range regardless. (RoCEv2 is
@@ -236,14 +292,22 @@ fn run(
             }
             // The body is already in our buffer — verify it in place.
             let verified = verify_zero_copy_at(zc, range_base, n, path).map_err(to_io)?;
-            (n, "zero-copy (RDMA write)", verified)
+            Ok(Delivery {
+                body_len: n,
+                source: "zero-copy (RDMA write)",
+                verified,
+            })
         }
         Some(RdmaWriteStatus::TooLarge { object_size }) => {
             say!(
                 report,
                 "[client] zero-copy declined: object_size={object_size} exceeds our buffer"
             );
-            (0, "none (too_large)", false)
+            Ok(Delivery {
+                body_len: 0,
+                source: "none (too_large)",
+                verified: false,
+            })
         }
         // Declined, malformed, or no zero-copy: read the body off the stream.
         _ => {
@@ -254,34 +318,40 @@ fn run(
                 )
             })?;
             say!(report, "[client] Content-Length: {content_length}");
-            let body = read_body(&mut stream, leftover, content_length)?;
+            let body = read_body(stream, leftover, content_length)?;
+            let status = &head.start.1;
             let verified =
                 verify_stream_body_at(&body, status == "200" || status == "206", path, range_base)
                     .map_err(to_io)?;
-            (body.len(), "stream", verified)
+            Ok(Delivery {
+                body_len: body.len(),
+                source: "stream",
+                verified,
+            })
         }
-    };
-    let elapsed = req_start.elapsed();
+    }
+}
 
-    // Drop the stream (which destroys the QP — stopping the NIC) BEFORE `zc`'s
-    // destination buffer is dropped at end of scope, so the MR is deregistered
-    // only after no DMA can target it. The payload was already read out above.
-    drop(stream);
-
+/// The machine-readable result, on stdout (progress goes to stderr via [`Report`]).
+fn print_summary(
+    status: &str,
+    content_range: Option<&str>,
+    delivery: &Delivery,
+    elapsed: std::time::Duration,
+) {
     let secs = elapsed.as_secs_f64();
-    let mb = body_len as f64 / (1024.0 * 1024.0);
+    let mb = delivery.body_len as f64 / (1024.0 * 1024.0);
     let throughput = if secs > 0.0 { mb / secs } else { f64::INFINITY };
 
-    println!("status:      {status} {reason}");
-    println!("delivery:    {delivery}");
-    if let Some(cr) = head.header("Content-Range") {
+    println!("status:      {status}");
+    println!("delivery:    {}", delivery.source);
+    if let Some(cr) = content_range {
         println!("content-range: {cr}");
     }
-    println!("body bytes:  {body_len}");
+    println!("body bytes:  {}", delivery.body_len);
     println!("elapsed:     {elapsed:?}");
     println!("throughput:  {throughput:.1} MiB/s");
-    if verified {
+    if delivery.verified {
         println!("integrity:   OK (byte pattern verified)");
     }
-    Ok(())
 }

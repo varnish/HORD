@@ -18,6 +18,10 @@
 //!   [`content_range_unsatisfied`] / [`parse_content_range`] write and read back
 //!   the matching `Content-Range`. Multipart byteranges stay out of scope
 //!   (§4.1.2), so a multi-range request degrades to a full `200`.
+//!   [`resolve_range`] is the client's side of the same arithmetic: it turns a
+//!   `--range` spec into the `(base, len)` pair a client needs *before* it
+//!   sends the request — the destination buffer size and the offset to verify
+//!   the delivered bytes at.
 //! * **The verifiable byte pattern** — [`pattern_byte`] and the `pattern_fill*`
 //!   (server side) / `verify_*` (client side) helpers behind the demo's
 //!   `/size/<n>` route, which is how the demos prove end-to-end integrity of
@@ -257,6 +261,33 @@ pub fn parse_content_range(value: &str) -> Option<(usize, usize, usize)> {
     ))
 }
 
+/// Resolve a client-side range request against a known object size, yielding
+/// `(base, len)`: the range's absolute offset into the object, and its length
+/// when it is a concrete sub-range.
+///
+/// `spec` is the bare `--range` argument (`a-b`, `a-`, `-n`), not a full
+/// `Range` header value; `total` is the object size when the path names one
+/// (see [`size_from_path`]). A client needs both halves of the answer before it
+/// sends the request: `len` sizes the zero-copy destination buffer to the range
+/// rather than the whole object, and `base` is the offset the delivered bytes
+/// are verified at (see [`verify_zero_copy_at`] / [`verify_stream_body_at`]).
+///
+/// `len` is `None` whenever there is no concrete sub-range to size to — no
+/// range asked for, an unknown object size, a form that degrades to the whole
+/// object ([`RangeSpec::Full`]), or one that is past the end
+/// ([`RangeSpec::Unsatisfiable`], where the client expects a `416` with no
+/// body). `base` is then `0`, which is also the correct verification offset for
+/// a whole-object response.
+pub fn resolve_range(spec: Option<&str>, total: Option<usize>) -> (usize, Option<usize>) {
+    match (spec, total) {
+        (Some(spec), Some(total)) => match parse_range(&format!("bytes={spec}"), total) {
+            RangeSpec::Range { start, end } => (start, Some(end - start + 1)),
+            _ => (0, None),
+        },
+        _ => (0, None),
+    }
+}
+
 /// Deterministic, verifiable payload byte at position `i`. Used by the
 /// `/size/<n>` test route so the client can check integrity end to end.
 pub fn pattern_byte(i: usize) -> u8 {
@@ -483,6 +514,27 @@ mod tests {
         assert_eq!(content_range_unsatisfied(1000), "bytes */1000");
         // the unsatisfied form is not a concrete range
         assert_eq!(parse_content_range("bytes */1000"), None);
+    }
+
+    #[test]
+    fn resolve_range_sizes_and_offsets_a_concrete_range() {
+        assert_eq!(resolve_range(Some("100-199"), Some(1000)), (100, Some(100)));
+        assert_eq!(resolve_range(Some("0-0"), Some(1000)), (0, Some(1)));
+        assert_eq!(resolve_range(Some("500-"), Some(1000)), (500, Some(500)));
+        assert_eq!(resolve_range(Some("-500"), Some(1000)), (500, Some(500)));
+        // the end clamps to the object, so the length does too
+        assert_eq!(
+            resolve_range(Some("900-100000"), Some(1000)),
+            (900, Some(100))
+        );
+    }
+
+    #[test]
+    fn resolve_range_yields_no_sub_range_without_one() {
+        assert_eq!(resolve_range(None, Some(1000)), (0, None)); // no --range
+        assert_eq!(resolve_range(Some("0-99"), None), (0, None)); // size unknown
+        assert_eq!(resolve_range(Some("0-1,2-3"), Some(1000)), (0, None)); // Full
+        assert_eq!(resolve_range(Some("5000-6000"), Some(1000)), (0, None)); // 416
     }
 
     #[test]

@@ -22,8 +22,7 @@ use hyper_util::rt::TokioIo;
 
 use hord_async::{AsyncHordStream, SharedAsyncStream};
 use hord_demo::{
-    parse_range, size_from_path, verify_stream_body_at, verify_zero_copy, verify_zero_copy_at,
-    RangeSpec,
+    resolve_range, size_from_path, verify_stream_body_at, verify_zero_copy, verify_zero_copy_at,
 };
 use hord_stream::HordConfig;
 use hord_zerocopy::{RdmaWriteStatus, ZeroCopyRequest, HEADER};
@@ -164,6 +163,15 @@ struct Opts {
     quiet: bool,
 }
 
+/// Where the response body came from, and what we could prove about it.
+struct Delivery {
+    body_len: usize,
+    /// Human-readable delivery path, for the `delivery:` summary line.
+    source: &'static str,
+    /// True when the bytes were checked against the `/size/<n>` pattern.
+    verified: bool,
+}
+
 async fn run(opts: Opts) -> Result<(), BoxError> {
     let Opts {
         server,
@@ -188,50 +196,15 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
         stream.zero_copy_negotiated()
     );
 
-    // §7.6: when a range is requested against a known /size/<n> object, resolve it
-    // locally so we size the destination to the range (not the whole object) and
-    // verify the delivered bytes at the right absolute offset (mirrors the sync
-    // client). Full (ignored → whole object) / Unsatisfiable (expect 416) leave no
-    // concrete sub-range to size to.
+    // §7.6: resolve the requested range locally (mirrors the sync client), so the
+    // destination buffer is sized to the range rather than the whole object and
+    // the delivered bytes are verified at their absolute object offset.
     let total = size_from_path(&path);
-    let (range_base, range_len) = match (&range, total) {
-        (Some(spec), Some(t)) => match parse_range(&format!("bytes={spec}"), t) {
-            RangeSpec::Range { start, end } => (start, Some(end - start + 1)),
-            _ => (0, None),
-        },
-        _ => (0, None),
-    };
-
-    // Offer zero-copy only if we asked and the peer negotiated it. Register the
-    // destination buffer up front, before the stream is handed to hyper, so its
-    // address/rkey can ride in the request header. The buffer (inside the
-    // ZeroCopyRequest) is independent of the stream — it owns its own connection
-    // handle — so we keep it alongside and it outlives the stream's teardown.
+    let (range_base, range_len) = resolve_range(range.as_deref(), total);
     let capacity = zc_buf.or(range_len).or(total).unwrap_or(DEFAULT_ZC_BUF);
-    let dest: Option<ZeroCopyRequest> =
-        if zero_copy && stream.zero_copy_negotiated() && capacity > 0 {
-            let zc = ZeroCopyRequest::from_buffer(stream.register_remote_writable(capacity)?);
-            say!(
-                report,
-                "[client] zero-copy: advertising a {capacity}-byte buffer"
-            );
-            Some(zc)
-        } else {
-            if zero_copy {
-                // capacity == 0 (e.g. /size/0): a zero-length destination MR is not
-                // portable and a 0-byte zero-copy transfer is pointless, so fall back.
-                let why = if !stream.zero_copy_negotiated() {
-                    "peer did not negotiate it"
-                } else {
-                    "buffer would be 0 bytes"
-                };
-                say!(
-                    report,
-                    "[client] --zero-copy requested but {why}; using the stream"
-                );
-            }
-            None
-        };
+    // Register before the stream is handed to hyper, so the address/rkey can ride
+    // in the request header.
+    let dest = offer_zero_copy(&stream, zero_copy, capacity, &report)?;
 
     // Low-level http1 handshake: a sender + a connection future we must drive.
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
@@ -255,11 +228,95 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
     let request = builder.body(Empty::<Bytes>::new())?;
 
     let req_start = Instant::now();
-    // Bound the request + full body read by a deadline: a stalled-but-alive peer
-    // errors here rather than hanging forever (review item #11). Returns the
-    // status, the parsed zero-copy response status (if any), and the stream body.
-    let offered_zc = dest.is_some();
-    let (status, zc_status, content_range, body) = tokio::time::timeout(DEADLINE, async {
+    let exchange = exchange(&mut sender, request, dest.is_some(), &report).await?;
+    let elapsed = req_start.elapsed();
+
+    // §7.6: an unsatisfiable range → 416 with `Content-Range: bytes */total` and no
+    // body. Nothing to verify; report and finish.
+    if exchange.status.as_u16() == 416 {
+        drop(sender);
+        let _ = conn_task.await;
+        println!("status:      {}", exchange.status);
+        println!("delivery:    none (range not satisfiable)");
+        println!(
+            "content-range: {}",
+            exchange.content_range.as_deref().unwrap_or("(none)")
+        );
+        return Ok(());
+    }
+
+    let delivery = take_delivery(&exchange, dest.as_ref(), range_base, &path, &report)?;
+
+    // Dropping the sender lets the connection close; wait for its task to end.
+    drop(sender);
+    let _ = conn_task.await;
+
+    print_summary(
+        &exchange.status.to_string(),
+        exchange.content_range.as_deref(),
+        &delivery,
+        elapsed,
+    );
+    Ok(())
+}
+
+/// Register the zero-copy destination buffer, if we asked for zero-copy *and*
+/// the peer negotiated it. Returns `None` — after saying why — when either half
+/// is missing, which is the signal to take the ordinary stream body instead.
+///
+/// The buffer (inside the [`ZeroCopyRequest`]) is independent of the stream — it
+/// owns its own connection handle — so the caller keeps it alongside and it
+/// outlives the stream's teardown inside `hyper`.
+fn offer_zero_copy(
+    stream: &AsyncHordStream,
+    requested: bool,
+    capacity: usize,
+    report: &Report,
+) -> Result<Option<ZeroCopyRequest>, BoxError> {
+    if !requested {
+        return Ok(None);
+    }
+    // capacity == 0 (e.g. /size/0): a zero-length destination MR is not portable
+    // and a 0-byte zero-copy transfer is pointless, so fall back.
+    let why = if !stream.zero_copy_negotiated() {
+        "peer did not negotiate it"
+    } else if capacity == 0 {
+        "buffer would be 0 bytes"
+    } else {
+        let zc = ZeroCopyRequest::from_buffer(stream.register_remote_writable(capacity)?);
+        say!(
+            report,
+            "[client] zero-copy: advertising a {capacity}-byte buffer"
+        );
+        return Ok(Some(zc));
+    };
+    say!(
+        report,
+        "[client] --zero-copy requested but {why}; using the stream"
+    );
+    Ok(None)
+}
+
+/// What the HTTP exchange yielded, once the response head has been read and the
+/// (possibly empty) stream body collected.
+struct Exchange {
+    status: hyper::StatusCode,
+    /// The parsed `X-HORD-RDMA-Write` response status (§7.3), when we offered.
+    zc_status: Option<RdmaWriteStatus>,
+    /// §7.6: a 206/416 carries `Content-Range`.
+    content_range: Option<String>,
+    body: Bytes,
+}
+
+/// Send the request and read the whole response, bounded by [`DEADLINE`] so a
+/// stalled-but-alive peer errors here rather than hanging forever (review #11).
+async fn exchange(
+    sender: &mut hyper::client::conn::http1::SendRequest<Empty<Bytes>>,
+    request: Request<Empty<Bytes>>,
+    offered_zc: bool,
+    report: &Report,
+) -> Result<Exchange, BoxError> {
+    tokio::time::timeout(DEADLINE, async {
         let res = sender.send_request(request).await?;
         let status = res.status();
         say!(report, "[client] {:?} {status}", res.version());
@@ -271,40 +328,43 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
         } else {
             None
         };
-        // §7.6: a 206/416 carries Content-Range; capture it while the response is
-        // in hand (the body collect below consumes it).
+        // Capture Content-Range while the response is in hand (the body collect
+        // below consumes it).
         let content_range = res
             .headers()
             .get("content-range")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
         let collected = res.into_body().collect().await?;
-        Ok::<_, BoxError>((status, zc_status, content_range, collected.to_bytes()))
+        Ok::<_, BoxError>(Exchange {
+            status,
+            zc_status,
+            content_range,
+            body: collected.to_bytes(),
+        })
     })
     .await
-    .map_err(|_| -> BoxError { "request timed out".into() })??;
-    let elapsed = req_start.elapsed();
+    .map_err(|_| -> BoxError { "request timed out".into() })?
+}
 
-    // §7.6: an unsatisfiable range → 416 with `Content-Range: bytes */total` and no
-    // body. Nothing to verify; report and finish.
-    if status.as_u16() == 416 {
-        drop(sender);
-        let _ = conn_task.await;
-        println!("status:      {status}");
-        println!("delivery:    none (range not satisfiable)");
-        println!(
-            "content-range: {}",
-            content_range.as_deref().unwrap_or("(none)")
-        );
-        return Ok(());
-    }
-
-    // Determine where the body came from and verify the pattern (at the range's
-    // absolute object offset — `range_base` is 0 for a whole object).
+/// Determine where the body came from and verify it at `range_base`, its
+/// absolute offset in the object (0 for a whole object).
+///
+/// `X-HORD-RDMA-Write: status=complete` (§7.3) means the bytes are already in
+/// our registered buffer and the HTTP body is empty; anything else — `declined`,
+/// `too_large`, malformed, or no zero-copy at all — means the body arrived on
+/// the stream.
+fn take_delivery(
+    exchange: &Exchange,
+    dest: Option<&ZeroCopyRequest>,
+    range_base: usize,
+    path: &str,
+    report: &Report,
+) -> Result<Delivery, BoxError> {
     let to_err = |m: String| -> BoxError { m.into() };
-    let (body_len, delivery, verified) = match zc_status {
+    match exchange.zc_status {
         Some(RdmaWriteStatus::Complete { bytes_written }) => {
-            let zc = dest.as_ref().expect("dest set when zc status parsed");
+            let zc = dest.expect("dest set when zc status parsed");
             let n = bytes_written as usize;
             // Trust the peer's bytes_written only as far as our own buffer (see
             // the sync client) — keeps the in-place verify in range.
@@ -315,45 +375,60 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
                 )
                 .into());
             }
-            let verified = verify_zero_copy_at(zc, range_base, n, &path).map_err(to_err)?;
-            (n, "zero-copy (RDMA write)", verified)
+            let verified = verify_zero_copy_at(zc, range_base, n, path).map_err(to_err)?;
+            Ok(Delivery {
+                body_len: n,
+                source: "zero-copy (RDMA write)",
+                verified,
+            })
         }
         Some(RdmaWriteStatus::TooLarge { object_size }) => {
             say!(
                 report,
                 "[client] zero-copy declined: object_size={object_size} exceeds our buffer"
             );
-            (0usize, "none (too_large)", false)
+            Ok(Delivery {
+                body_len: 0,
+                source: "none (too_large)",
+                verified: false,
+            })
         }
         // Declined / no zero-copy: the body arrived on the stream.
         _ => {
-            let is_success = matches!(status.as_u16(), 200 | 206);
-            let verified =
-                verify_stream_body_at(&body, is_success, &path, range_base).map_err(to_err)?;
-            (body.len(), "stream", verified)
+            let is_success = matches!(exchange.status.as_u16(), 200 | 206);
+            let verified = verify_stream_body_at(&exchange.body, is_success, path, range_base)
+                .map_err(to_err)?;
+            Ok(Delivery {
+                body_len: exchange.body.len(),
+                source: "stream",
+                verified,
+            })
         }
-    };
+    }
+}
 
-    // Dropping the sender lets the connection close; wait for its task to end.
-    drop(sender);
-    let _ = conn_task.await;
-
+/// The machine-readable result, on stdout (progress goes to stderr via [`Report`]).
+fn print_summary(
+    status: &str,
+    content_range: Option<&str>,
+    delivery: &Delivery,
+    elapsed: Duration,
+) {
     let secs = elapsed.as_secs_f64();
-    let mb = body_len as f64 / (1024.0 * 1024.0);
+    let mb = delivery.body_len as f64 / (1024.0 * 1024.0);
     let throughput = if secs > 0.0 { mb / secs } else { f64::INFINITY };
 
     println!("status:      {status}");
-    println!("delivery:    {delivery}");
-    if let Some(cr) = &content_range {
+    println!("delivery:    {}", delivery.source);
+    if let Some(cr) = content_range {
         println!("content-range: {cr}");
     }
-    println!("body bytes:  {body_len}");
+    println!("body bytes:  {}", delivery.body_len);
     println!("elapsed:     {elapsed:?}");
     println!("throughput:  {throughput:.1} MiB/s");
-    if verified {
+    if delivery.verified {
         println!("integrity:   OK (byte pattern verified)");
     }
-    Ok(())
 }
 
 /// Protocol-splitting client (spec §7.7): issue `count` GETs, each advertising a
@@ -422,14 +497,40 @@ async fn run_split(opts: Opts) -> Result<(), BoxError> {
         }
     });
 
-    // Issue the GETs sequentially (http1 keep-alive). We await each response head
-    // only to confirm status=complete and to free the sender for the next
-    // request; the body is empty (the payload travelled out-of-band).
     let start = Instant::now();
+    issue_split_requests(&mut sender, &server, &path, &reqs, &report).await?;
+
+    // Close the control plane; its task drops its stream clone.
+    drop(sender);
+    let _ = conn_task.await;
+    let control_elapsed = start.elapsed();
+
+    let verified = collect_split_completions(&shared, &reqs, object_size, &path, &report).await?;
+
+    println!("delivery:    split (RDMA write-with-immediate, §7.7)");
+    println!("transfers:   {count} (collected off the CQ by id)");
+    println!("control:     {control_elapsed:?} (HTTP control plane)");
+    if object_size.is_some() {
+        println!("integrity:   {verified}/{count} payloads verified");
+    }
+    Ok(())
+}
+
+/// Control plane: issue one GET per advertised buffer, sequentially (http1
+/// keep-alive). Each response head is awaited only to confirm `status=complete`
+/// and to free the sender for the next request — the body is empty, because the
+/// payload travelled out-of-band.
+async fn issue_split_requests(
+    sender: &mut hyper::client::conn::http1::SendRequest<Empty<Bytes>>,
+    server: &str,
+    path: &str,
+    reqs: &[ZeroCopyRequest],
+    report: &Report,
+) -> Result<(), BoxError> {
     for (i, zc) in reqs.iter().enumerate() {
         let request = Request::builder()
-            .uri(&path)
-            .header("host", server.as_str())
+            .uri(path)
+            .header("host", server)
             .header("user-agent", "hord-client-async/0.1")
             .header(HEADER, zc.request().header_value())
             .body(Empty::<Bytes>::new())?;
@@ -458,18 +559,25 @@ async fn run_split(opts: Opts) -> Result<(), BoxError> {
             }
         }
     }
+    Ok(())
+}
 
-    // Close the control plane; its task drops its stream clone.
-    drop(sender);
-    let _ = conn_task.await;
-    let control_elapsed = start.elapsed();
-
-    // Data plane: collect `count` completions by id (already reaped above) and
-    // verify each landed payload against the deterministic pattern. Each wait is
-    // bounded by DEADLINE (spec §7.7.7: "Clients SHOULD implement a timeout for
-    // data-plane completions") so a transfer the server reported `complete` over
-    // HTTP but never signalled on the CQ — or any lost immediate — surfaces as a
-    // timeout error instead of hanging forever.
+/// Data plane: collect one completion per transfer by id (already reaped by the
+/// control-plane task) and verify each landed payload against the deterministic
+/// pattern, returning how many verified.
+///
+/// Each wait is bounded by [`DEADLINE`] (spec §7.7.7: "Clients SHOULD implement a
+/// timeout for data-plane completions") so a transfer the server reported
+/// `complete` over HTTP but never signalled on the CQ — or any lost immediate —
+/// surfaces as a timeout error instead of hanging forever.
+async fn collect_split_completions(
+    shared: &SharedAsyncStream,
+    reqs: &[ZeroCopyRequest],
+    object_size: Option<usize>,
+    path: &str,
+    report: &Report,
+) -> Result<usize, BoxError> {
+    let count = reqs.len();
     let mut seen = std::collections::HashSet::new();
     let mut verified = 0usize;
     while seen.len() < count {
@@ -482,39 +590,26 @@ async fn run_split(opts: Opts) -> Result<(), BoxError> {
                 )
                 .into()
             })??;
-        match next {
-            Some(id) => {
-                if !seen.insert(id) {
-                    return Err(format!("transfer id={id} completed twice").into());
-                }
-                let zc = reqs
-                    .get(id as usize)
-                    .ok_or_else(|| -> BoxError { format!("unknown transfer id {id}").into() })?;
-                if let Some(n) = object_size {
-                    let n = n.min(zc.capacity());
-                    if verify_zero_copy(zc, n, &path)
-                        .map_err(|m: String| -> BoxError { m.into() })?
-                    {
-                        verified += 1;
-                    }
-                }
-                say!(report, "[client] data plane: transfer id={id} landed");
-            }
-            None => {
-                return Err(format!(
-                    "connection closed; only {} of {count} transfers completed",
-                    seen.len()
-                )
-                .into());
+        let Some(id) = next else {
+            return Err(format!(
+                "connection closed; only {} of {count} transfers completed",
+                seen.len()
+            )
+            .into());
+        };
+        if !seen.insert(id) {
+            return Err(format!("transfer id={id} completed twice").into());
+        }
+        let zc = reqs
+            .get(id as usize)
+            .ok_or_else(|| -> BoxError { format!("unknown transfer id {id}").into() })?;
+        if let Some(n) = object_size {
+            let n = n.min(zc.capacity());
+            if verify_zero_copy(zc, n, path).map_err(|m: String| -> BoxError { m.into() })? {
+                verified += 1;
             }
         }
+        say!(report, "[client] data plane: transfer id={id} landed");
     }
-
-    println!("delivery:    split (RDMA write-with-immediate, §7.7)");
-    println!("transfers:   {count} (collected off the CQ by id)");
-    println!("control:     {control_elapsed:?} (HTTP control plane)");
-    if object_size.is_some() {
-        println!("integrity:   {verified}/{count} payloads verified");
-    }
-    Ok(())
+    Ok(verified)
 }
