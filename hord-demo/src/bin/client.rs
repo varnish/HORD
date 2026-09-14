@@ -36,6 +36,41 @@ const DEFAULT_SERVER: &str = "192.0.2.1"; // rxe device IP fallback; override vi
 const DEFAULT_PORT: u16 = 4791;
 const DEFAULT_ZC_BUF: usize = 1 << 20; // 1 MiB, when the size isn't in the path
 
+/// Progress reporting to stderr (stdout carries the machine-readable result),
+/// silenced by `--quiet`. Exists so the protocol steps in `run` read as a
+/// straight sequence — one unconditional `say!` per step — instead of an
+/// `if !quiet { eprintln!(…) }` block wrapped around every message. (The async
+/// client carries a copy: this is deliberately not in the `hord_demo` library,
+/// which is the transport-independent codec and has no business writing to
+/// stderr.)
+struct Report {
+    enabled: bool,
+}
+
+impl Report {
+    fn new(quiet: bool) -> Report {
+        Report { enabled: !quiet }
+    }
+
+    /// Takes pre-captured [`std::fmt::Arguments`] rather than a `String` so a
+    /// quiet run pays nothing: the formatting happens inside `eprintln!`, which
+    /// we never reach when silenced.
+    fn say(&self, msg: std::fmt::Arguments<'_>) {
+        if self.enabled {
+            eprintln!("{msg}");
+        }
+    }
+}
+
+/// `say!(report, "…{x}")` — same call shape as `eprintln!`, but `format_args!`
+/// only captures references to the arguments, so nothing is formatted unless
+/// [`Report::say`] decides to print.
+macro_rules! say {
+    ($report:expr, $($arg:tt)*) => {
+        $report.say(format_args!($($arg)*))
+    };
+}
+
 fn main() -> ExitCode {
     let mut server = std::env::var("HORD_TEST_IP").unwrap_or_else(|_| DEFAULT_SERVER.to_string());
     let mut port = DEFAULT_PORT;
@@ -87,20 +122,18 @@ fn run(
     range: Option<String>,
     quiet: bool,
 ) -> io::Result<()> {
+    let report = Report::new(quiet);
     let config = HordConfig::default();
-    if !quiet {
-        eprintln!("[client] connecting to {server}:{port} ...");
-    }
+    say!(report, "[client] connecting to {server}:{port} ...");
     let connect_start = Instant::now();
     let mut stream = HordStream::connect(server, port, &config)?;
-    if !quiet {
-        eprintln!(
-            "[client] connected in {:?} (payload capacity {} bytes/msg, zero_copy_negotiated={})",
-            connect_start.elapsed(),
-            stream.payload_capacity(),
-            stream.zero_copy_negotiated()
-        );
-    }
+    say!(
+        report,
+        "[client] connected in {:?} (payload capacity {} bytes/msg, zero_copy_negotiated={})",
+        connect_start.elapsed(),
+        stream.payload_capacity(),
+        stream.zero_copy_negotiated()
+    );
 
     // §7.6: when a range is requested against a known `/size/<n>` object, resolve
     // it locally so we register a destination sized to the range (not the whole
@@ -121,12 +154,13 @@ fn run(
     let capacity = zc_buf.or(range_len).or(total).unwrap_or(DEFAULT_ZC_BUF);
     let zc = if zero_copy && stream.zero_copy_negotiated() && capacity > 0 {
         let req = ZeroCopyRequest::new(&stream, capacity)?;
-        if !quiet {
-            eprintln!("[client] zero-copy: advertising a {capacity}-byte buffer");
-        }
+        say!(
+            report,
+            "[client] zero-copy: advertising a {capacity}-byte buffer"
+        );
         Some(req)
     } else {
-        if zero_copy && !quiet {
+        if zero_copy {
             // capacity == 0 (e.g. /size/0): a zero-length destination MR is not
             // portable and a 0-byte zero-copy transfer is pointless, so fall back.
             let why = if !stream.zero_copy_negotiated() {
@@ -134,7 +168,10 @@ fn run(
             } else {
                 "buffer would be 0 bytes"
             };
-            eprintln!("[client] --zero-copy requested but {why}; using the stream");
+            say!(
+                report,
+                "[client] --zero-copy requested but {why}; using the stream"
+            );
         }
         None
     };
@@ -163,9 +200,7 @@ fn run(
     let (head_bytes, leftover) = read_head(&mut stream)?;
     let head = Head::parse(&head_bytes)?;
     let (version, status, reason) = &head.start;
-    if !quiet {
-        eprintln!("[client] {version} {status} {reason}");
-    }
+    say!(report, "[client] {version} {status} {reason}");
 
     // §7.6: an unsatisfiable range → 416 with `Content-Range: bytes */total` and
     // no body. Nothing to verify; report and finish.
@@ -204,11 +239,10 @@ fn run(
             (n, "zero-copy (RDMA write)", verified)
         }
         Some(RdmaWriteStatus::TooLarge { object_size }) => {
-            if !quiet {
-                eprintln!(
-                    "[client] zero-copy declined: object_size={object_size} exceeds our buffer"
-                );
-            }
+            say!(
+                report,
+                "[client] zero-copy declined: object_size={object_size} exceeds our buffer"
+            );
             (0, "none (too_large)", false)
         }
         // Declined, malformed, or no zero-copy: read the body off the stream.
@@ -219,9 +253,7 @@ fn run(
                     "response lacked a Content-Length",
                 )
             })?;
-            if !quiet {
-                eprintln!("[client] Content-Length: {content_length}");
-            }
+            say!(report, "[client] Content-Length: {content_length}");
             let body = read_body(&mut stream, leftover, content_length)?;
             let verified =
                 verify_stream_body_at(&body, status == "200" || status == "206", path, range_base)

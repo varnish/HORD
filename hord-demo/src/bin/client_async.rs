@@ -36,6 +36,41 @@ const DEADLINE: Duration = Duration::from_secs(120); // bound the whole exchange
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Progress reporting to stderr (stdout carries the machine-readable result),
+/// silenced by `--quiet`. Exists so the protocol steps in `run` / `run_split`
+/// read as a straight sequence — one unconditional `say!` per step — instead of
+/// an `if !quiet { eprintln!(…) }` block wrapped around every message. (Mirrors
+/// the sync client; kept per-binary rather than in the `hord_demo` library,
+/// which is the transport-independent codec and has no business writing to
+/// stderr.)
+struct Report {
+    enabled: bool,
+}
+
+impl Report {
+    fn new(quiet: bool) -> Report {
+        Report { enabled: !quiet }
+    }
+
+    /// Takes pre-captured [`std::fmt::Arguments`] rather than a `String` so a
+    /// quiet run pays nothing: the formatting happens inside `eprintln!`, which
+    /// we never reach when silenced.
+    fn say(&self, msg: std::fmt::Arguments<'_>) {
+        if self.enabled {
+            eprintln!("{msg}");
+        }
+    }
+}
+
+/// `say!(report, "…{x}")` — same call shape as `eprintln!`, but `format_args!`
+/// only captures references to the arguments, so nothing is formatted unless
+/// [`Report::say`] decides to print.
+macro_rules! say {
+    ($report:expr, $($arg:tt)*) => {
+        $report.say(format_args!($($arg)*))
+    };
+}
+
 fn main() -> ExitCode {
     let mut server = std::env::var("HORD_TEST_IP").unwrap_or_else(|_| DEFAULT_SERVER.to_string());
     let mut port = DEFAULT_PORT;
@@ -140,20 +175,18 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
         quiet,
         ..
     } = opts;
+    let report = Report::new(quiet);
     let config = HordConfig::default();
-    if !quiet {
-        eprintln!("[client] connecting to {server}:{port} ...");
-    }
+    say!(report, "[client] connecting to {server}:{port} ...");
     let connect_start = Instant::now();
     let stream = AsyncHordStream::connect(&server, port, &config)?;
-    if !quiet {
-        eprintln!(
-            "[client] connected in {:?} (payload capacity {} bytes/msg, zero_copy_negotiated={})",
-            connect_start.elapsed(),
-            stream.payload_capacity(),
-            stream.zero_copy_negotiated()
-        );
-    }
+    say!(
+        report,
+        "[client] connected in {:?} (payload capacity {} bytes/msg, zero_copy_negotiated={})",
+        connect_start.elapsed(),
+        stream.payload_capacity(),
+        stream.zero_copy_negotiated()
+    );
 
     // §7.6: when a range is requested against a known /size/<n> object, resolve it
     // locally so we size the destination to the range (not the whole object) and
@@ -178,12 +211,13 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
     let dest: Option<ZeroCopyRequest> =
         if zero_copy && stream.zero_copy_negotiated() && capacity > 0 {
             let zc = ZeroCopyRequest::from_buffer(stream.register_remote_writable(capacity)?);
-            if !quiet {
-                eprintln!("[client] zero-copy: advertising a {capacity}-byte buffer");
-            }
+            say!(
+                report,
+                "[client] zero-copy: advertising a {capacity}-byte buffer"
+            );
             Some(zc)
         } else {
-            if zero_copy && !quiet {
+            if zero_copy {
                 // capacity == 0 (e.g. /size/0): a zero-length destination MR is not
                 // portable and a 0-byte zero-copy transfer is pointless, so fall back.
                 let why = if !stream.zero_copy_negotiated() {
@@ -191,7 +225,10 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
                 } else {
                     "buffer would be 0 bytes"
                 };
-                eprintln!("[client] --zero-copy requested but {why}; using the stream");
+                say!(
+                    report,
+                    "[client] --zero-copy requested but {why}; using the stream"
+                );
             }
             None
         };
@@ -225,9 +262,7 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
     let (status, zc_status, content_range, body) = tokio::time::timeout(DEADLINE, async {
         let res = sender.send_request(request).await?;
         let status = res.status();
-        if !quiet {
-            eprintln!("[client] {:?} {status}", res.version());
-        }
+        say!(report, "[client] {:?} {status}", res.version());
         let zc_status = if offered_zc {
             res.headers()
                 .get(HEADER)
@@ -284,11 +319,10 @@ async fn run(opts: Opts) -> Result<(), BoxError> {
             (n, "zero-copy (RDMA write)", verified)
         }
         Some(RdmaWriteStatus::TooLarge { object_size }) => {
-            if !quiet {
-                eprintln!(
-                    "[client] zero-copy declined: object_size={object_size} exceeds our buffer"
-                );
-            }
+            say!(
+                report,
+                "[client] zero-copy declined: object_size={object_size} exceeds our buffer"
+            );
             (0usize, "none (too_large)", false)
         }
         // Declined / no zero-copy: the body arrived on the stream.
@@ -346,10 +380,12 @@ async fn run_split(opts: Opts) -> Result<(), BoxError> {
     if count == 0 {
         return Err("--count must be >= 1".into());
     }
+    let report = Report::new(quiet);
     let config = HordConfig::default();
-    if !quiet {
-        eprintln!("[client] connecting to {server}:{port} (split mode) ...");
-    }
+    say!(
+        report,
+        "[client] connecting to {server}:{port} (split mode) ..."
+    );
     let stream = AsyncHordStream::connect(&server, port, &config)?;
     if !stream.zero_copy_negotiated() || !stream.split_mode_negotiated() {
         return Err(format!(
@@ -372,9 +408,10 @@ async fn run_split(opts: Opts) -> Result<(), BoxError> {
             .with_id(i as u32);
         reqs.push(zc);
     }
-    if !quiet {
-        eprintln!("[client] split: {count} transfers, {capacity}-byte buffers, path {path}");
-    }
+    say!(
+        report,
+        "[client] split: {count} transfers, {capacity}-byte buffers, path {path}"
+    );
 
     // Control plane: hyper over one clone of the shared stream.
     let (mut sender, conn) =
@@ -411,9 +448,7 @@ async fn run_split(opts: Opts) -> Result<(), BoxError> {
         .map_err(|_| -> BoxError { format!("request {i} timed out").into() })??;
         match zc_status {
             Some(RdmaWriteStatus::Complete { .. }) => {
-                if !quiet {
-                    eprintln!("[client] request id={i}: {status} status=complete");
-                }
+                say!(report, "[client] request id={i}: {status} status=complete");
             }
             other => {
                 return Err(format!(
@@ -463,9 +498,7 @@ async fn run_split(opts: Opts) -> Result<(), BoxError> {
                         verified += 1;
                     }
                 }
-                if !quiet {
-                    eprintln!("[client] data plane: transfer id={id} landed");
-                }
+                say!(report, "[client] data plane: transfer id={id} landed");
             }
             None => {
                 return Err(format!(

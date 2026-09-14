@@ -5,6 +5,34 @@
 //! correctly over a [`hord_stream::HordStream`]. The point of HORD is that the
 //! HTTP layer is unmodified and transport-agnostic; swapping this for `hyper`
 //! (once an async stream wrapper exists) changes nothing below the socket.
+//!
+//! What lives here, in file order:
+//!
+//! * **Head/body framing** — [`read_head`] (bounded by [`MAX_HEAD_BYTES`]),
+//!   [`Head::parse`] and [`read_body`]: enough HTTP/1.1 to drive the sync demo
+//!   binaries, which have no `hyper`.
+//! * **The range codec (spec §7.6, profile §4.1.1)** — [`parse_range`] resolves
+//!   a single-range `Range` value against a known object size into a
+//!   [`RangeSpec`] (a satisfiable range → `206`, past the end → `416`, anything
+//!   else ignored → serve the whole object), and [`content_range`] /
+//!   [`content_range_unsatisfied`] / [`parse_content_range`] write and read back
+//!   the matching `Content-Range`. Multipart byteranges stay out of scope
+//!   (§4.1.2), so a multi-range request degrades to a full `200`.
+//! * **The verifiable byte pattern** — [`pattern_byte`] and the `pattern_fill*`
+//!   (server side) / `verify_*` (client side) helpers behind the demo's
+//!   `/size/<n>` route, which is how the demos prove end-to-end integrity of
+//!   what was delivered, over the stream or by RDMA write.
+//!
+//! The range codec is deliberately transport-independent: it is `&str`/`usize`
+//! arithmetic that knows nothing about RDMA, and every helper that touches
+//! payload bytes takes the range's *absolute* object offset (the `_from` /
+//! `_at` variants) rather than assuming it starts at 0. That is why §7.6 cost
+//! no transport change at all — a one-sided RDMA write is offset-agnostic, so
+//! serving `bytes=a-b` is exactly the whole-object path with the source filled
+//! from offset `a` and `X-HORD-RDMA-Write`'s `len`/`bytes_written` describing
+//! the *range* length (see PROTOTYPE.md). The same code therefore serves all
+//! four demo binaries across the stream, zero-copy (§7.1–7.4) and split (§7.7)
+//! paths.
 
 use std::io::{self, Read};
 
