@@ -13,6 +13,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Formatting gate. The tree was reformatted wholesale by `cargo fmt --all` after
+  # having drifted to a wider, hand-maintained margin; without a gate that drift
+  # comes straight back on the next hand-edited PR. There is deliberately no
+  # rustfmt.toml — stock defaults are exactly what the tree is formatted to, so
+  # this job needs no config to stay honest.
+  fmt:
+    name: fmt (rustfmt --check)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --all --check
+        # No RDMA headers and no build cache: rustfmt parses the sources, it never
+        # compiles them, so this gate answers in seconds on a cold runner.
+        run: cargo fmt --all --check
+
   # Device-free workspace tests. The 13 RDMA loopback tests (the actual data path)
   # are `#[ignore]`d because they need a Soft-RoCE (`rxe0`) device, and GitHub's
   # hosted-runner kernel no longer provides one: the `azure` flavour (as of

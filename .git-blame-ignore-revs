@@ -1,0 +1,22 @@
+# Revisions to skip when attributing lines with `git blame` — whole-tree
+# mechanical reformats, which would otherwise make every touched line look
+# like it was last changed by a formatting pass.
+#
+# GitHub honours this file automatically. To make local `git blame` use it too:
+#
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Entries must be full 40-character SHAs; git rejects abbreviated ones.
+
+# style: cargo fmt --all
+# The tree had drifted to a wider, hand-maintained margin than rustfmt's default
+# 100 and no rustfmt.toml pinned it. Verified semantics-free: stripping all
+# whitespace from every changed file left only the trailing commas and block
+# braces rustfmt adds when wrapping.
+7fe5cfca0fedabafb692072d649019af960cf0eb
+
+# style: rescue comment blocks rustfmt swallowed as trailing comments
+# Follow-up to the above, also whitespace-only: rustfmt had attached prose
+# comment blocks to the preceding line's trailing comment and re-indented them
+# to that column; this moved them back to the following item's indent.
+29033035156253de5bdc320d1a359eb1c349c29e

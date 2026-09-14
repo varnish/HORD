@@ -57,6 +57,18 @@ sudo modprobe -r rdma_rxe
 
 - **Tooling**: `ibverbs-utils` (ibv_*) and `perftest` (ib_*_bw) are installed.
 
+- **Locked memory (`RLIMIT_MEMLOCK`)**: RDMA registration pins pages, so the
+  `#[ignore]`d data-path tests need a raised memlock limit — several of them
+  register 4–16 MiB buffers. Under the common 8 MiB default (`ulimit -l` reports
+  `8192`) roughly a quarter of the suite fails with `failed to register memory
+  region`. Worse, when it is the *server* side that cannot register, the client
+  sees only a `Rejected (status 28)` CM event, so the failure reads like a
+  data-path bug rather than a resource limit — check `ulimit -l` before chasing
+  one. Raise it with a `memlock unlimited` entry in `/etc/security/limits.conf`
+  (re-login to take effect). Fresh shells, containers and self-hosted runners are
+  where this bites; an interactive login on a host set up for RDMA usually
+  already has it.
+
 ## Testing & coverage
 
 Most of the meaningful tests (the actual RDMA data path) are `#[ignore]`d
