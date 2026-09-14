@@ -457,9 +457,10 @@ fn conn_meta_surfaces_peer_addr_and_caps() {
 fn poll_write_backpressures_slow_reader() {
     const PORT: u16 = 18631;
     const PAYLOAD: usize = 16 * 1024 * 1024; // 16 MiB — dwarfs the credit window
-                                             // A prefix far below PAYLOAD: big enough to prove the write genuinely started
-                                             // and bytes are flowing, small enough that draining it can't let the full write
-                                             // complete — the server re-blocks on credits well short of PAYLOAD.
+
+    // A prefix far below PAYLOAD: big enough to prove the write genuinely started
+    // and bytes are flowing, small enough that draining it can't let the full write
+    // complete — the server re-blocks on credits well short of PAYLOAD.
     const PREFIX: usize = 1024 * 1024; // 1 MiB
 
     // The server writes PAYLOAD bytes, flips `write_done` only once the whole write
@@ -702,10 +703,11 @@ fn shutdown_mid_backpressured_rdma_write_is_safe() {
                     let src = shared.register_source(CHUNK).expect("register source");
                     src.copy_in(0, &pattern_vec(CHUNK));
                     let _ = writing_tx.send(()); // we are about to drive writes
-                                                 // Loop write-with-immediate. The first N (the client's recv-WR
-                                                 // count) land; thereafter the peer has no recv WR and the writes
-                                                 // RNR-stall, so this call parks in `poll_rdma_write` forever — the
-                                                 // task is wedged with a write outstanding against `src`.
+
+                    // Loop write-with-immediate. The first N (the client's recv-WR
+                    // count) land; thereafter the peer has no recv WR and the writes
+                    // RNR-stall, so this call parks in `poll_rdma_write` forever — the
+                    // task is wedged with a write outstanding against `src`.
                     let mut id = 0u32;
                     loop {
                         if shared

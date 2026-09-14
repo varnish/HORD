@@ -63,12 +63,13 @@ const DEFAULT_BIND: &str = "192.0.2.1"; // rxe device IP fallback; override via 
 const DEFAULT_PORT: u16 = 4791;
 const MAX_BODY: usize = 1usize << 30; // 1 GiB guard on /size/<n>
 const CHUNK: usize = 256 * 1024; // streamed body chunk size
-                                 // Per-connection zero-copy source pool (§8.3): up to this many reusable source
-                                 // buffers of this size, grown lazily and reused across a connection's zero-copy
-                                 // responses instead of registering an MR per response. Split mode (and any
-                                 // keep-alive client) serves many responses per connection, so the registrations
-                                 // amortize there; an object larger than the slab — or past the cap — falls back to
-                                 // a one-off registration (§8.4), so these tune efficiency, not correctness.
+
+// Per-connection zero-copy source pool (§8.3): up to this many reusable source
+// buffers of this size, grown lazily and reused across a connection's zero-copy
+// responses instead of registering an MR per response. Split mode (and any
+// keep-alive client) serves many responses per connection, so the registrations
+// amortize there; an object larger than the slab — or past the cap — falls back to
+// a one-off registration (§8.4), so these tune efficiency, not correctness.
 const SOURCE_POOL_CAP: usize = 4;
 const SOURCE_POOL_BUF_SIZE: usize = 4 << 20; // 4 MiB
 

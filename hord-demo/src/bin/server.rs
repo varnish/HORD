@@ -32,13 +32,14 @@ use hord_zerocopy::{serve_rdma_write_pooled, RdmaWriteReq, RdmaWriteStatus, Sour
 const DEFAULT_BIND: &str = "192.0.2.1"; // rxe device IP fallback; override via $HORD_TEST_IP or --bind (see CLAUDE.md)
 const DEFAULT_PORT: u16 = 4791;
 const MAX_BODY: usize = 1usize << 30; // 1 GiB guard on /size/<n>
-                                      // Per-connection zero-copy source pool (§8.3): up to this many reusable source
-                                      // buffers of this size, grown lazily and reused across a connection's responses
-                                      // instead of registering an MR per response. A response larger than the slab — or
-                                      // past the cap — falls back to a one-off registration (§8.4), so these only tune
-                                      // efficiency, not correctness. (This demo closes the connection per request, so it
-                                      // registers one buffer per connection — no worse than per-response; the win shows
-                                      // on a keep-alive or split workload that reuses the connection.)
+
+// Per-connection zero-copy source pool (§8.3): up to this many reusable source
+// buffers of this size, grown lazily and reused across a connection's responses
+// instead of registering an MR per response. A response larger than the slab — or
+// past the cap — falls back to a one-off registration (§8.4), so these only tune
+// efficiency, not correctness. (This demo closes the connection per request, so it
+// registers one buffer per connection — no worse than per-response; the win shows
+// on a keep-alive or split workload that reuses the connection.)
 const SOURCE_POOL_CAP: usize = 4;
 const SOURCE_POOL_BUF_SIZE: usize = 4 << 20; // 4 MiB
 

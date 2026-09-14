@@ -33,8 +33,9 @@ static IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
 }); // rxe device IP; override via $HORD_TEST_IP (see CLAUDE.md)
 const PORT: u16 = 18523; // distinct from the other device tests (18520-18522)
 const WATCHDOG: Duration = Duration::from_secs(30); // generous; loopback is ~instant
-                                                    // Way past any device's max_qp_wr / max_cqe, so Endpoint::build is guaranteed to
-                                                    // fail at CQ/QP creation — a per-connection setup failure after the ack.
+
+// Way past any device's max_qp_wr / max_cqe, so Endpoint::build is guaranteed to
+// fail at CQ/QP creation — a per-connection setup failure after the ack.
 const IMPOSSIBLE_WR: usize = 1 << 28;
 
 #[test]

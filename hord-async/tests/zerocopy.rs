@@ -449,11 +449,13 @@ fn gather_write_lands_fragments_contiguously() {
 fn over_cap_async_gather_batches_and_lands_contiguously() {
     const PORT_BATCH: u16 = 18824; // distinct from the plain gather test (18823)
     const SEG: usize = 256 * 1024; // per-fragment size
-                                   // 40 fragments => >=3 WRs for any max_send_sge in 1..=16, comfortably above the
-                                   // send_pool of 2 below, so the gather always spans several drained batches.
+
+    // 40 fragments => >=3 WRs for any max_send_sge in 1..=16, comfortably above the
+    // send_pool of 2 below, so the gather always spans several drained batches.
     const N: usize = 40;
     const TOTAL: usize = SEG * N; // 10 MiB contiguous object
-                                  // send_pool below the gather's WR count -> forces batching.
+
+    // send_pool below the gather's WR count -> forces batching.
     let config = HordConfig {
         send_pool_size: 2,
         ..HordConfig::default()
