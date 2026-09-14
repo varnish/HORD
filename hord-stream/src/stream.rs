@@ -999,9 +999,13 @@ impl HordStream {
     pub fn max_send_sge(&self) -> usize {
         self.conn.max_send_sge()
     }
+}
 
-    // ---- completion engine -------------------------------------------------
-
+/// Completion processing, credit accounting and the recv/send pools.
+///
+/// Almost entirely private: this is the machinery the two public surfaces —
+/// the byte stream and the one-sided writes — are built out of.
+impl HordStream {
     /// Poll for and process exactly one completion. With `block`, busy-waits
     /// until a completion is available; otherwise returns `Ok(false)` when the
     /// CQ is empty. Returns `Ok(true)` if a completion was processed.
@@ -1371,14 +1375,16 @@ impl HordStream {
     fn proactive_threshold(&self) -> u32 {
         (self.recv_pool as u32 / 4).max(1)
     }
+}
 
-    // ---- non-blocking API --------------------------------------------------
-    //
-    // These are the state machine without the wait. The blocking `Read`/`Write`
-    // impls below drive them by busy-polling (`pump(true)`); an async wrapper
-    // drives the *same* methods off the CQ completion-channel fd. Neither path
-    // duplicates the credit / control-lane logic.
-
+/// Non-blocking API: two-sided send/recv (spec §6) under credit-based flow
+/// control (§9) — the state machine without the wait.
+///
+/// The blocking [`Read`]/[`Write`] impls at the bottom of this file drive these
+/// by busy-polling (`pump(true)`); an async wrapper drives the *same* methods off
+/// the CQ completion-channel fd. Neither path duplicates the credit /
+/// control-lane logic.
+impl HordStream {
     /// Process every completion currently in the CQ, without waiting. Returns
     /// the number handled. The async driver calls this after the CQ fd signals.
     pub fn drain_completions(&mut self) -> io::Result<usize> {
@@ -1388,7 +1394,6 @@ impl HordStream {
         }
         Ok(n)
     }
-
     /// Non-blocking write. Accepts as many bytes of `buf` as it can right now —
     /// sending full messages and staging the sub-`payload_cap` remainder — and
     /// returns the count accepted. A return of `0` for a non-empty `buf` means no
@@ -1521,9 +1526,31 @@ impl HordStream {
     pub fn is_closed(&self) -> bool {
         self.peer_closed
     }
+}
 
-    // ---- zero-copy write driver (spec §7) ----------------------------------
-
+/// One-sided RDMA writes: the zero-copy transport half (spec §7.1–§7.4) and
+/// protocol splitting (§7.7).
+///
+/// Eight public entry points over three independent axes. Rustdoc sorts them
+/// into two separate alphabetical runs (`begin_*` and `rdma_*`), which hides the
+/// shape, so here it is as a table:
+///
+/// |                           | single span                              | gather (multi-SGE)                              |
+/// | ------------------------- | ---------------------------------------- | ----------------------------------------------- |
+/// | post, return immediately  | [`begin_rdma_write`][Self::begin_rdma_write] | [`begin_rdma_write_gather`][Self::begin_rdma_write_gather] |
+/// |                           | [`begin_rdma_write_with_imm`][Self::begin_rdma_write_with_imm] | [`begin_rdma_write_gather_with_imm`][Self::begin_rdma_write_gather_with_imm] |
+/// | drive to completion       | [`rdma_write_all`][Self::rdma_write_all] | [`rdma_write_gather_all`][Self::rdma_write_gather_all] |
+/// |                           | [`rdma_write_all_with_imm`][Self::rdma_write_all_with_imm] | [`rdma_write_gather_all_with_imm`][Self::rdma_write_gather_all_with_imm] |
+///
+/// The `begin_*` half posts the work requests and returns, leaving the caller to
+/// reap completions — the async reactor's path. The `*_all` half drives the write
+/// to completion before returning — the sync path. The `_with_imm` variants carry
+/// a 32-bit transfer ID in the write's immediate data (§7.7), which the peer reaps
+/// from its completion queue without parsing HTTP.
+///
+/// Each public method is a thin wrapper over a private `*_inner`, which is where
+/// the shared logic lives.
+impl HordStream {
     /// Post a one-sided RDMA write of `src[src_off .. src_off+len]` into the
     /// peer's memory at `peer_addr`, authorized by `peer_rkey` (which the peer
     /// registered with `ACCESS_REMOTE_WRITE` and advertised via
@@ -2081,7 +2108,14 @@ impl HordStream {
             s.begin_rdma_write_inner(src, src_off, peer_addr, peer_rkey, len, imm)
         })
     }
+}
 
+/// Event-loop integration and teardown.
+///
+/// These exist for `hord-async`'s reactor, and for any embedder bringing its own
+/// accept/poll loop. An application driving the stream through [`Read`]/[`Write`]
+/// never needs them.
+impl HordStream {
     /// Mark the stream closed — e.g. when the async layer observes a CM
     /// `DISCONNECTED` event (half-close). Subsequent reads see EOF.
     pub fn mark_closed(&mut self) {
